@@ -17,3 +17,5 @@ Snapshots use canonical little-endian version 5 encoding. They include allocator
 ## Consequences
 
 Integer state, ordered collections, monotonic time, and fixed ordering make snapshot continuation match uninterrupted execution. Hot work is O(active cells × clock segments), not an all-soldier scan. Server and benchmarks submit commands through the same boundary. Combat, full living needs, graphics, lore, prediction, and authenticated multiplayer remain outside M0.
+
+The HTTP adapter is deliberately constrained to a loopback, single-authoritative-writer M0 protocol. Mutation commits precede response delivery, so an ambiguous POST must not be retried automatically. Submission stops while an operator reconciles `/health` and the authoritative `/snapshot` against state, pending queue, clock, and digest; the digest alone is not a command receipt. Durable request IDs, persistent idempotent receipts/logging, restart persistence, and multi-writer conflict control are required before any public or multi-client deployment. One fixed per-connection deadline covers all reads and writes, and peer failures remain contained.

@@ -504,115 +504,165 @@ fn allocator_reuse_keeps_live_ids_unique_and_stale_ids_dead() {
 }
 
 #[test]
-fn fidelity_cycles_preserve_tracked_soldier_records_and_continuation() {
-    let mut world = World::new(11);
-    ok(&mut world, Command::CreateSquad { id: 4 });
-    let specs = [
-        SoldierSpec {
-            position: Position {
-                x_mm: 10,
-                y_mm: 20,
-                cell: 7,
+fn fidelity_cycles_preserve_complete_soldier_and_relationship_state() {
+    fn fixture() -> (World, Vec<EntityId>) {
+        let mut world = World::new(11);
+        ok(&mut world, Command::CreateSquad { id: 4 });
+        ok(&mut world, Command::CreateSquad { id: 9 });
+        let specs = [
+            SoldierSpec {
+                faction: 3,
+                position: Position {
+                    x_mm: 10,
+                    y_mm: 20,
+                    cell: 7,
+                },
+                squad: Some(4),
+                role: Role::Officer,
+                rank: 6,
+                health: 777,
+                ammunition: 31,
+                inventory: Inventory {
+                    food: 2,
+                    water: 3,
+                    medical: 4,
+                },
             },
-            ammunition: 31,
-            inventory: Inventory {
-                food: 2,
-                water: 3,
-                medical: 4,
+            SoldierSpec {
+                faction: 4,
+                position: Position {
+                    x_mm: -5,
+                    y_mm: 8,
+                    cell: 7,
+                },
+                squad: Some(4),
+                role: Role::Medic,
+                rank: 3,
+                health: 654,
+                ammunition: 19,
+                inventory: Inventory {
+                    food: 8,
+                    water: 7,
+                    medical: 6,
+                },
             },
-            ..SoldierSpec::default()
-        },
-        SoldierSpec {
-            position: Position {
-                x_mm: -5,
-                y_mm: 8,
-                cell: 7,
+            SoldierSpec {
+                faction: 5,
+                position: Position {
+                    x_mm: 99,
+                    y_mm: -2,
+                    cell: 8,
+                },
+                squad: Some(9),
+                role: Role::Officer,
+                rank: 9,
+                health: 432,
+                ammunition: 11,
+                inventory: Inventory {
+                    food: 5,
+                    water: 4,
+                    medical: 3,
+                },
             },
-            rank: 3,
-            ..SoldierSpec::default()
-        },
-        SoldierSpec {
-            position: Position {
-                x_mm: 99,
-                y_mm: -2,
-                cell: 8,
+            SoldierSpec {
+                faction: 6,
+                position: Position {
+                    x_mm: 101,
+                    y_mm: -3,
+                    cell: 8,
+                },
+                squad: Some(9),
+                role: Role::Logistics,
+                rank: 2,
+                health: 321,
+                ammunition: 7,
+                inventory: Inventory {
+                    food: 9,
+                    water: 10,
+                    medical: 11,
+                },
             },
-            role: Role::Officer,
-            ..SoldierSpec::default()
-        },
-    ];
-    let ids: Vec<_> = specs
-        .iter()
-        .map(
-            |spec| match ok(&mut world, Command::SpawnSoldier { spec: *spec })[0].event {
-                Event::SoldierSpawned { id, .. } => id,
-                _ => unreachable!(),
-            },
-        )
-        .collect();
-    ok(
-        &mut world,
-        Command::AssignOfficer {
-            squad: 4,
-            officer: ids[2],
-        },
-    );
-    ok(&mut world, Command::SetRegionHot { cell: 7, hot: true });
-    ok(
-        &mut world,
-        Command::Schedule {
-            at: 4,
-            command: ScheduledCommand::SetRegionHot {
-                cell: 7,
-                hot: false,
-            },
-        },
-    );
-    ok(&mut world, Command::AdvanceTo { target: 6 });
-    ok(&mut world, Command::SetRegionHot { cell: 7, hot: true });
-    ok(&mut world, Command::AdvanceTo { target: 9 });
-    ok(
-        &mut world,
-        Command::SetRegionHot {
-            cell: 7,
-            hot: false,
-        },
-    );
-    assert_eq!(world.soldier_count(), ids.len());
-    for (id, expected) in ids.iter().zip(specs) {
-        let actual = world.soldier(*id).unwrap();
-        assert_eq!(actual.id, *id);
-        assert_eq!(
-            (
-                actual.position,
-                actual.role,
-                actual.rank,
-                actual.ammunition,
-                actual.inventory
-            ),
-            (
-                expected.position,
-                expected.role,
-                expected.rank,
-                expected.ammunition,
-                expected.inventory
+        ];
+        let ids = specs
+            .into_iter()
+            .map(
+                |spec| match ok(&mut world, Command::SpawnSoldier { spec })[0].event {
+                    Event::SoldierSpawned { id, .. } => id,
+                    _ => unreachable!(),
+                },
             )
+            .collect::<Vec<_>>();
+        ok(
+            &mut world,
+            Command::AssignOfficer {
+                squad: 4,
+                officer: ids[0],
+            },
         );
+        ok(
+            &mut world,
+            Command::AssignOfficer {
+                squad: 9,
+                officer: ids[2],
+            },
+        );
+        (world, ids)
     }
-    assert_eq!(world.soldier(ids[2]).unwrap().squad, Some(4));
-    let mut restored = World::from_snapshot(&world.snapshot()).unwrap();
-    for world in [&mut world, &mut restored] {
-        ok(world, Command::SetRegionHot { cell: 8, hot: true });
-        ok(world, Command::AdvanceTo { target: 12 });
+    fn cycle(world: &mut World, cell: u32) {
+        let start = world.clock();
+        ok(world, Command::SetRegionHot { cell, hot: true });
         ok(
             world,
-            Command::SetRegionHot {
-                cell: 8,
-                hot: false,
+            Command::Schedule {
+                at: start + 4,
+                command: ScheduledCommand::SetRegionHot { cell, hot: false },
             },
         );
+        ok(world, Command::AdvanceTo { target: start + 6 });
+        ok(world, Command::SetRegionHot { cell, hot: true });
+        ok(world, Command::AdvanceTo { target: start + 9 });
+        ok(world, Command::SetRegionHot { cell, hot: false });
     }
-    assert_eq!(world.state_digest(), restored.state_digest());
+    let (mut fidelity, ids) = fixture();
+    let (mut control, control_ids) = fixture();
+    assert_eq!(ids, control_ids);
+    cycle(&mut fidelity, 7);
+    cycle(&mut control, 99);
+    assert_eq!(fidelity.soldier_count(), 4);
+    for id in &ids {
+        assert_eq!(fidelity.soldier(*id), control.soldier(*id));
+        assert_ne!(fidelity.soldier(*id).unwrap().needs, Needs::default());
+    }
+    assert_eq!(fidelity.squad(4), control.squad(4));
+    assert_eq!(fidelity.squad(9), control.squad(9));
+    assert_eq!(fidelity.state_digest(), control.state_digest());
+
+    let mut fidelity_restored = World::from_snapshot(&fidelity.snapshot()).unwrap();
+    let mut control_restored = World::from_snapshot(&control.snapshot()).unwrap();
+    for world in [&mut fidelity, &mut fidelity_restored] {
+        cycle(world, 8);
+        ok(world, Command::AdvanceTo { target: 18 });
+    }
+    for world in [&mut control, &mut control_restored] {
+        cycle(world, 98);
+        ok(world, Command::AdvanceTo { target: 18 });
+    }
+    for id in &ids {
+        let expected = control.soldier(*id).unwrap();
+        assert_eq!(fidelity.soldier(*id), Some(expected));
+        assert_eq!(fidelity_restored.soldier(*id), Some(expected));
+        assert_eq!(control_restored.soldier(*id), Some(expected));
+    }
+    for squad in [4, 9] {
+        assert_eq!(fidelity.squad(squad), control.squad(squad));
+        assert_eq!(
+            fidelity_restored.squad(squad),
+            control_restored.squad(squad)
+        );
+    }
+    assert_eq!(fidelity.state_digest(), control.state_digest());
+    assert_eq!(fidelity.state_digest(), fidelity_restored.state_digest());
+    assert_eq!(control.state_digest(), control_restored.state_digest());
 }
 
 #[test]

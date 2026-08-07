@@ -12,7 +12,11 @@ Hot cells have a deterministic one-second fixed-step counter. Clock segments adv
 
 ## Server wire format
 
-The single-process server owns one mutable world. It retains `GET /health` and `GET /snapshot`, and accepts `POST /v1/command` with `Content-Length` and JSON no larger than 64 KiB. The body has `version: 1`, a `command` (`advance_to`, `create_stockpile`, `transfer`, `set_region_hot`, `schedule_hot`, `schedule_transfer`, or `cancel_scheduled`), the command's named fields, and `null` for the remaining optional fields. Unsupported, malformed, oversized, or length-mismatched requests are rejected before mutation. Responses contain version, clock, ordered timestamped events, nullable terminal error, and resulting digest.
+The server is an M0 **loopback-only, single-authoritative-writer boundary**, not a production multi-client transport. It retains `GET /health` and `GET /snapshot`, and accepts `POST /v1/command` with `Content-Length` and JSON no larger than 64 KiB. The body has `version: 1`, a `command` (`advance_to`, `create_stockpile`, `transfer`, `set_region_hot`, `schedule_hot`, `schedule_transfer`, or `cancel_scheduled`), the command's named fields, and `null` for the remaining optional fields. Unsupported, malformed, oversized, or length-mismatched requests are rejected before mutation. Responses contain version, clock, ordered timestamped events, nullable terminal error, and resulting digest.
+
+Commands commit before their HTTP response is written. A POST may therefore commit even when its response is lost, and a client **must never automatically retry an ambiguously delivered mutation**. Recovery is: stop all command submission; fetch `/health` and the authoritative `/snapshot`; reconcile the intended command against the complete state, pending queue, clock, and digest; and require operator recovery when the result cannot be proved. The digest detects state equality but does not identify which command produced that state. Durable client request IDs, a persistent idempotent command receipt/log, restart persistence, and multi-writer conflict control are mandatory before public or multi-client deployment and are intentionally outside M0.
+
+Each accepted connection has one absolute deadline covering header and body reads plus response-header and response-body writes, including incremental snapshot delivery. A timed-out or otherwise failed peer is closed without terminating the authoritative listener.
 
 ## Verification
 

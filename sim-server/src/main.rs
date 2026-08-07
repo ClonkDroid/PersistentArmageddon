@@ -7,11 +7,14 @@ use sim_core::{
 use std::env;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::thread;
 use std::time::{Duration, Instant};
 
 const MAX_REQUEST: usize = 64 * 1024;
 const MAX_HEADER: usize = 16 * 1024;
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_CONSECUTIVE_ACCEPT_ERRORS: u32 = 3;
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(25);
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     if env::args().any(|a| a == "--benchmark") {
@@ -26,7 +29,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         CONNECTION_TIMEOUT,
         None,
         serve_connection,
-    );
+    )?;
     Ok(())
 }
 
@@ -36,44 +39,109 @@ fn serve_listener<F>(
     timeout: Duration,
     limit: Option<usize>,
     mut handler: F,
-) where
-    F: FnMut(TcpStream, &mut World, Duration) -> std::io::Result<()>,
+) -> std::io::Result<()>
+where
+    F: FnMut(TcpStream, &mut World, Instant) -> std::io::Result<()>,
+{
+    serve_listener_with(listener, world, timeout, limit, &mut handler, thread::sleep)
+}
+
+fn serve_listener_with<F, B>(
+    listener: &TcpListener,
+    world: &mut World,
+    timeout: Duration,
+    limit: Option<usize>,
+    handler: &mut F,
+    mut backoff: B,
+) -> std::io::Result<()>
+where
+    F: FnMut(TcpStream, &mut World, Instant) -> std::io::Result<()>,
+    B: FnMut(Duration),
 {
     let mut accepted = 0;
+    let mut consecutive_errors = 0;
     while limit.is_none_or(|limit| accepted < limit) {
         match listener.accept() {
             Ok((stream, _)) => {
+                consecutive_errors = 0;
                 accepted += 1;
-                if let Err(error) = handler(stream, world, timeout) {
+                if let Err(error) = handler(stream, world, connection_deadline(timeout)) {
                     eprintln!("contained connection failure: {error}");
                 }
             }
-            Err(error) => eprintln!("contained accept failure: {error}"),
+            Err(error) if retryable_accept_error(&error) => {
+                let Some(delay) = retry_accept(&mut consecutive_errors) else {
+                    return Err(error);
+                };
+                eprintln!("retryable accept failure {consecutive_errors}: {error}");
+                backoff(delay);
+            }
+            Err(error) => return Err(error),
         }
     }
+    Ok(())
+}
+
+fn retryable_accept_error(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::Interrupted
+            | std::io::ErrorKind::WouldBlock
+            | std::io::ErrorKind::ConnectionAborted
+    )
+}
+
+fn retry_accept(consecutive_errors: &mut u32) -> Option<Duration> {
+    *consecutive_errors += 1;
+    (*consecutive_errors < MAX_CONSECUTIVE_ACCEPT_ERRORS)
+        .then(|| ACCEPT_BACKOFF.saturating_mul(*consecutive_errors))
 }
 
 fn serve_connection(
     mut stream: TcpStream,
     world: &mut World,
-    timeout: Duration,
+    deadline: Instant,
 ) -> std::io::Result<()> {
-    stream.set_read_timeout(Some(timeout))?;
-    stream.set_write_timeout(Some(timeout))?;
-    let (status, kind, body) = read_and_handle(&mut stream, world);
-    write!(stream,"HTTP/1.1 {status}\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",body.len())?;
-    stream.write_all(&body)
+    let (status, kind, body) = read_and_handle_deadline(&mut stream, world, deadline);
+    let header = format!("HTTP/1.1 {status}\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",body.len());
+    write_all_deadline(&mut stream, header.as_bytes(), deadline)?;
+    write_all_deadline(&mut stream, &body, deadline)
 }
 
+#[cfg(test)]
 fn read_and_handle(r: &mut impl Read, w: &mut World) -> (&'static str, &'static str, Vec<u8>) {
+    read_and_handle_with(r, w, || Ok(()))
+}
+
+fn read_and_handle_deadline(
+    r: &mut TcpStream,
+    w: &mut World,
+    deadline: Instant,
+) -> (&'static str, &'static str, Vec<u8>) {
+    let stream = r.try_clone();
+    match stream {
+        Ok(stream) => read_and_handle_with(r, w, || set_remaining_read(&stream, deadline)),
+        Err(_) => bad(),
+    }
+}
+
+fn read_and_handle_with(
+    r: &mut impl Read,
+    w: &mut World,
+    mut before_read: impl FnMut() -> std::io::Result<()>,
+) -> (&'static str, &'static str, Vec<u8>) {
     let mut header = Vec::new();
     let mut byte = [0];
     while !header.ends_with(b"\r\n\r\n") {
         if header.len() == MAX_HEADER {
             return too_large();
         }
+        if before_read().is_err() {
+            return timeout_response();
+        }
         match r.read(&mut byte) {
             Ok(1) => header.push(byte[0]),
+            Err(error) if is_timeout(&error) => return timeout_response(),
             _ => return bad(),
         }
     }
@@ -140,8 +208,17 @@ fn read_and_handle(r: &mut impl Read, w: &mut World) -> (&'static str, &'static 
         return too_large();
     }
     let mut body = vec![0; declared];
-    if r.read_exact(&mut body).is_err() {
-        return bad();
+    let mut offset = 0;
+    while offset < declared {
+        if before_read().is_err() {
+            return timeout_response();
+        }
+        match r.read(&mut body[offset..]) {
+            Ok(0) => return bad(),
+            Ok(n) => offset += n,
+            Err(error) if is_timeout(&error) => return timeout_response(),
+            Err(_) => return bad(),
+        }
     }
     let wire: Wire = match serde_json::from_slice(&body) {
         Ok(x) => x,
@@ -163,6 +240,65 @@ fn read_and_handle(r: &mut impl Read, w: &mut World) -> (&'static str, &'static 
             w.state_digest(),
         )
         .into_bytes(),
+    )
+}
+fn connection_deadline(timeout: Duration) -> Instant {
+    Instant::now()
+        .checked_add(timeout)
+        .unwrap_or_else(Instant::now)
+}
+fn remaining(deadline: Instant) -> std::io::Result<Duration> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|duration| !duration.is_zero())
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::TimedOut, "connection deadline expired")
+        })
+}
+fn set_remaining_read(stream: &TcpStream, deadline: Instant) -> std::io::Result<()> {
+    stream.set_read_timeout(Some(remaining(deadline)?))
+}
+fn write_all_deadline(
+    stream: &mut TcpStream,
+    bytes: &[u8],
+    deadline: Instant,
+) -> std::io::Result<()> {
+    write_all_bounded(stream, bytes, |stream| {
+        stream.set_write_timeout(Some(remaining(deadline)?))
+    })
+}
+fn write_all_bounded<W: Write>(
+    stream: &mut W,
+    mut bytes: &[u8],
+    mut before_write: impl FnMut(&mut W) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    while !bytes.is_empty() {
+        before_write(stream)?;
+        match stream.write(bytes) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "failed to write response",
+                ))
+            }
+            Ok(n) => bytes = &bytes[n..],
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+fn is_timeout(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+    )
+}
+fn timeout_response() -> (&'static str, &'static str, Vec<u8>) {
+    (
+        "408 Request Timeout",
+        "application/json",
+        b"{\"error\":\"connection_deadline_expired\"}".to_vec(),
     )
 }
 fn too_large() -> (&'static str, &'static str, Vec<u8>) {
@@ -458,7 +594,12 @@ mod tests {
         let server = thread::spawn(move || {
             let mut world = world;
             let (stream, _) = listener.accept().unwrap();
-            serve_connection(stream, &mut world, Duration::from_secs(2)).unwrap();
+            serve_connection(
+                stream,
+                &mut world,
+                connection_deadline(Duration::from_secs(2)),
+            )
+            .unwrap();
             world
         });
         let mut client = TcpStream::connect(address).unwrap();
@@ -579,27 +720,46 @@ mod tests {
         let server = thread::spawn(move || {
             let mut first = true;
             let mut world = World::new(0);
+            apply_ok(
+                &mut world,
+                Command::CreateStockpile {
+                    id: 1,
+                    initial: Stock {
+                        ammunition: 10,
+                        supplies: 4,
+                    },
+                },
+            );
+            apply_ok(
+                &mut world,
+                Command::CreateStockpile {
+                    id: 2,
+                    initial: Stock::default(),
+                },
+            );
             serve_listener(
                 &listener,
                 &mut world,
                 Duration::from_millis(100),
-                Some(2),
-                |mut stream, world, timeout| {
+                Some(3),
+                |mut stream, world, deadline| {
                     if first {
                         first = false;
-                        stream.set_read_timeout(Some(timeout))?;
+                        stream.set_read_timeout(Some(remaining(deadline)?))?;
                         let _committed_response = read_and_handle(&mut stream, world);
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::BrokenPipe,
                             "injected response write failure",
                         ));
                     }
-                    serve_connection(stream, world, timeout)
+                    serve_connection(stream, world, deadline)
                 },
-            );
+            )
+            .unwrap();
             world
         });
-        let body = r#"{"version":1,"command":"set_region_hot","cell":7,"hot":true}"#;
+        let body =
+            r#"{"version":1,"command":"transfer","from":1,"to":2,"ammunition":3,"supplies":2}"#;
         let mut failed = TcpStream::connect(client_listener.local_addr().unwrap()).unwrap();
         failed.write_all(&req(body)).unwrap();
         drop(failed);
@@ -607,7 +767,36 @@ mod tests {
         let mut response = Vec::new();
         healthy.read_to_end(&mut response).unwrap();
         assert_eq!(status(&response), "HTTP/1.1 200 OK");
-        assert!(server.join().unwrap().hot_cell(7).is_some());
+        let health = json_body(&response);
+        let mut snapshot_client =
+            TcpStream::connect(client_listener.local_addr().unwrap()).unwrap();
+        snapshot_client
+            .write_all(b"GET /snapshot HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
+        let mut snapshot_response = Vec::new();
+        snapshot_client.read_to_end(&mut snapshot_response).unwrap();
+        let split = snapshot_response
+            .windows(4)
+            .position(|x| x == b"\r\n\r\n")
+            .unwrap();
+        let restored = World::from_snapshot(&snapshot_response[split + 4..]).unwrap();
+        let world = server.join().unwrap();
+        assert_eq!(
+            world.stockpile(1),
+            Some(Stock {
+                ammunition: 7,
+                supplies: 2
+            })
+        );
+        assert_eq!(
+            world.stockpile(2),
+            Some(Stock {
+                ammunition: 3,
+                supplies: 2
+            })
+        );
+        assert_eq!(restored.state_digest(), world.state_digest());
+        assert_eq!(health["digest"], format!("{:016x}", world.state_digest()));
     }
 
     fn stalled_peer_does_not_wedge_listener(request: &[u8]) {
@@ -621,7 +810,8 @@ mod tests {
                 Duration::from_millis(40),
                 Some(2),
                 serve_connection,
-            );
+            )
+            .unwrap();
         });
         let mut stalled = TcpStream::connect(client_listener.local_addr().unwrap()).unwrap();
         stalled.write_all(request).unwrap();
@@ -646,5 +836,126 @@ mod tests {
         stalled_peer_does_not_wedge_listener(
             b"POST /v1/command HTTP/1.1\r\nContent-Length: 100\r\n\r\n{}",
         );
+    }
+
+    #[test]
+    fn trickling_header_cannot_extend_absolute_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client_listener = listener.try_clone().unwrap();
+        let server = thread::spawn(move || {
+            let mut world = World::new(0);
+            serve_listener(
+                &listener,
+                &mut world,
+                Duration::from_millis(45),
+                Some(2),
+                serve_connection,
+            )
+            .unwrap();
+        });
+        let mut trickle = TcpStream::connect(client_listener.local_addr().unwrap()).unwrap();
+        let sender = thread::spawn(move || {
+            for byte in b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n" {
+                if trickle.write_all(&[*byte]).is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        });
+        thread::sleep(Duration::from_millis(70));
+        let mut healthy = later_health(&client_listener);
+        healthy
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let mut response = Vec::new();
+        healthy.read_to_end(&mut response).unwrap();
+        assert_eq!(status(&response), "HTTP/1.1 200 OK");
+        sender.join().unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn trickling_body_cannot_extend_absolute_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client_listener = listener.try_clone().unwrap();
+        let server = thread::spawn(move || {
+            let mut world = World::new(0);
+            serve_listener(
+                &listener,
+                &mut world,
+                Duration::from_millis(45),
+                Some(2),
+                serve_connection,
+            )
+            .unwrap();
+        });
+        let mut trickle = TcpStream::connect(client_listener.local_addr().unwrap()).unwrap();
+        trickle
+            .write_all(b"POST /v1/command HTTP/1.1\r\nContent-Length: 100\r\n\r\n")
+            .unwrap();
+        let sender = thread::spawn(move || {
+            for byte in [b'{'; 20] {
+                if trickle.write_all(&[byte]).is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        });
+        thread::sleep(Duration::from_millis(70));
+        let mut healthy = later_health(&client_listener);
+        healthy
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let mut response = Vec::new();
+        healthy.read_to_end(&mut response).unwrap();
+        assert_eq!(status(&response), "HTTP/1.1 200 OK");
+        sender.join().unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn deadline_aware_write_stops_incremental_progress() {
+        struct OneByteWriter(Vec<u8>);
+        impl Write for OneByteWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.push(bytes[0]);
+                Ok(1)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut writer = OneByteWriter(Vec::new());
+        let mut budget_checks = 0;
+        let error = write_all_bounded(&mut writer, b"snapshot-body", |_| {
+            budget_checks += 1;
+            if budget_checks > 4 {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "connection deadline expired",
+                ))
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(writer.0, b"snap");
+    }
+
+    #[test]
+    fn accept_error_policy_backs_off_and_escapes() {
+        assert!(retryable_accept_error(&std::io::Error::from(
+            std::io::ErrorKind::Interrupted
+        )));
+        assert!(!retryable_accept_error(&std::io::Error::from(
+            std::io::ErrorKind::InvalidInput
+        )));
+        let mut consecutive = 0;
+        assert_eq!(retry_accept(&mut consecutive), Some(ACCEPT_BACKOFF));
+        consecutive = 0; // a successful accept resets the counter
+        assert_eq!(retry_accept(&mut consecutive), Some(ACCEPT_BACKOFF));
+        assert_eq!(retry_accept(&mut consecutive), Some(ACCEPT_BACKOFF * 2));
+        assert_eq!(retry_accept(&mut consecutive), None);
     }
 }

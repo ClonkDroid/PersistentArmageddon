@@ -1297,4 +1297,80 @@ mod private_invariants {
             Err(SimError::Snapshot("invalid free slot"))
         ));
     }
+
+    #[test]
+    fn snapshot_preserves_lifo_allocator_with_retirement_and_stale_ids() {
+        let mut world = World::new(17);
+        world.soldiers.generation.push(u32::MAX - 1);
+        world.soldiers.alive.push(true);
+        world.soldiers.data.push(SoldierSpec::default());
+        world.soldiers.needs_at.push(0);
+        world.soldiers.live = 1;
+        let near_retirement = EntityId::from_parts(0, u32::MAX - 1);
+        assert!(world
+            .apply(Command::DespawnSoldier {
+                id: near_retirement
+            })
+            .error
+            .is_none());
+        let final_generation = match world
+            .apply(Command::SpawnSoldier {
+                spec: SoldierSpec::default(),
+            })
+            .events[0]
+            .event
+        {
+            Event::SoldierSpawned { id, .. } => id,
+            _ => unreachable!(),
+        };
+        assert_eq!(final_generation, EntityId::from_parts(0, u32::MAX));
+        assert!(world
+            .apply(Command::DespawnSoldier {
+                id: final_generation
+            })
+            .error
+            .is_none());
+
+        let live: Vec<_> = (0..6)
+            .map(|rank| {
+                let outcome = world.apply(Command::SpawnSoldier {
+                    spec: SoldierSpec {
+                        rank,
+                        ..SoldierSpec::default()
+                    },
+                });
+                match outcome.events[0].event {
+                    Event::SoldierSpawned { id, .. } => id,
+                    _ => unreachable!(),
+                }
+            })
+            .collect();
+        let mut stale = vec![near_retirement, final_generation];
+        for index in [1usize, 4, 2] {
+            stale.push(live[index]);
+            assert!(world
+                .apply(Command::DespawnSoldier { id: live[index] })
+                .error
+                .is_none());
+        }
+        let mut restored = World::from_snapshot(&world.snapshot()).unwrap();
+        assert!(stale
+            .iter()
+            .all(|id| world.soldier(*id).is_none() && restored.soldier(*id).is_none()));
+        for rank in 20..24 {
+            let command = Command::SpawnSoldier {
+                spec: SoldierSpec {
+                    rank,
+                    ..SoldierSpec::default()
+                },
+            };
+            let a = world.apply(command);
+            let b = restored.apply(command);
+            assert_eq!(a, b);
+            assert!(stale
+                .iter()
+                .all(|id| world.soldier(*id).is_none() && restored.soldier(*id).is_none()));
+        }
+        assert_eq!(world.state_digest(), restored.state_digest());
+    }
 }
