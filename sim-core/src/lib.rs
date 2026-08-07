@@ -2535,6 +2535,300 @@ mod private_invariants {
     }
 
     #[test]
+    fn independent_transition_oracle_threshold_matrix() {
+        struct Case {
+            name: &'static str,
+            living: LivingState,
+            inventory: Inventory,
+            expected: LivingState,
+            expected_inventory: Inventory,
+            consumed: (u128, u128),
+            events: Vec<Event>,
+        }
+        let id = EntityId::from_parts(4, 1);
+        let state = |activity, hunger, thirst, fatigue, health| LivingState {
+            activity,
+            hunger,
+            thirst,
+            fatigue,
+            health,
+            ..LivingState::default()
+        };
+        let expected =
+            |activity, hunger, thirst, fatigue, sleep_debt, morale, health, life| LivingState {
+                activity,
+                hunger,
+                thirst,
+                fatigue,
+                sleep_debt,
+                morale,
+                health,
+                life,
+                materialized_at: 1,
+            };
+        let inv = |food, water| Inventory {
+            food,
+            water,
+            medical: 0,
+        };
+        let cases = vec![
+            Case {
+                name: "rest",
+                living: state(Activity::Rest, 0, 0, 0, 1000),
+                inventory: inv(0, 0),
+                expected: expected(Activity::Rest, 1, 1, 0, 0, 1000, 1000, LifeState::Alive),
+                expected_inventory: inv(0, 0),
+                consumed: (0, 0),
+                events: vec![],
+            },
+            Case {
+                name: "idle",
+                living: state(Activity::Idle, 0, 0, 0, 1000),
+                inventory: inv(0, 0),
+                expected: expected(Activity::Idle, 1, 2, 1, 1, 1000, 1000, LifeState::Alive),
+                expected_inventory: inv(0, 0),
+                consumed: (0, 0),
+                events: vec![],
+            },
+            Case {
+                name: "march",
+                living: state(Activity::March, 0, 0, 0, 1000),
+                inventory: inv(0, 0),
+                expected: expected(Activity::March, 2, 3, 3, 2, 1000, 1000, LifeState::Alive),
+                expected_inventory: inv(0, 0),
+                consumed: (0, 0),
+                events: vec![],
+            },
+            Case {
+                name: "food-ration",
+                living: state(Activity::Idle, 99, 0, 0, 1000),
+                inventory: inv(1, 0),
+                expected: expected(Activity::Idle, 0, 2, 1, 1, 1000, 1000, LifeState::Alive),
+                expected_inventory: inv(0, 0),
+                consumed: (1, 0),
+                events: vec![Event::RationConsumed {
+                    id,
+                    food: 1,
+                    water: 0,
+                    hunger_before: 100,
+                    hunger_after: 0,
+                    thirst_before: 2,
+                    thirst_after: 2,
+                }],
+            },
+            Case {
+                name: "water-ration",
+                living: state(Activity::Idle, 0, 98, 0, 1000),
+                inventory: inv(0, 1),
+                expected: expected(Activity::Idle, 1, 0, 1, 1, 1000, 1000, LifeState::Alive),
+                expected_inventory: inv(0, 0),
+                consumed: (0, 1),
+                events: vec![Event::RationConsumed {
+                    id,
+                    food: 0,
+                    water: 1,
+                    hunger_before: 1,
+                    hunger_after: 1,
+                    thirst_before: 100,
+                    thirst_after: 0,
+                }],
+            },
+            Case {
+                name: "both-rations",
+                living: state(Activity::Idle, 99, 98, 0, 1000),
+                inventory: inv(1, 1),
+                expected: expected(Activity::Idle, 0, 0, 1, 1, 1000, 1000, LifeState::Alive),
+                expected_inventory: inv(0, 0),
+                consumed: (1, 1),
+                events: vec![Event::RationConsumed {
+                    id,
+                    food: 1,
+                    water: 1,
+                    hunger_before: 100,
+                    hunger_after: 0,
+                    thirst_before: 100,
+                    thirst_after: 0,
+                }],
+            },
+            Case {
+                name: "hunger-before",
+                living: state(Activity::Idle, 798, 0, 0, 1000),
+                inventory: inv(0, 0),
+                expected: expected(Activity::Idle, 799, 2, 1, 1, 1000, 1000, LifeState::Alive),
+                expected_inventory: inv(0, 0),
+                consumed: (0, 0),
+                events: vec![],
+            },
+            Case {
+                name: "hunger-at",
+                living: state(Activity::Idle, 799, 0, 0, 1000),
+                inventory: inv(0, 0),
+                expected: expected(Activity::Idle, 800, 2, 1, 1, 999, 996, LifeState::Alive),
+                expected_inventory: inv(0, 0),
+                consumed: (0, 0),
+                events: vec![Event::LivingDeteriorated {
+                    id,
+                    morale_before: 1000,
+                    morale_after: 999,
+                    health_before: 1000,
+                    health_after: 996,
+                }],
+            },
+            Case {
+                name: "thirst-before",
+                living: state(Activity::Idle, 0, 797, 0, 1000),
+                inventory: inv(0, 0),
+                expected: expected(Activity::Idle, 1, 799, 1, 1, 1000, 1000, LifeState::Alive),
+                expected_inventory: inv(0, 0),
+                consumed: (0, 0),
+                events: vec![],
+            },
+            Case {
+                name: "thirst-at",
+                living: state(Activity::Idle, 0, 798, 0, 1000),
+                inventory: inv(0, 0),
+                expected: expected(Activity::Idle, 1, 800, 1, 1, 999, 990, LifeState::Alive),
+                expected_inventory: inv(0, 0),
+                consumed: (0, 0),
+                events: vec![Event::LivingDeteriorated {
+                    id,
+                    morale_before: 1000,
+                    morale_after: 999,
+                    health_before: 1000,
+                    health_after: 990,
+                }],
+            },
+            Case {
+                name: "forced-before",
+                living: state(Activity::March, 0, 0, 896, 1000),
+                inventory: inv(0, 0),
+                expected: expected(Activity::March, 2, 3, 899, 2, 1000, 1000, LifeState::Alive),
+                expected_inventory: inv(0, 0),
+                consumed: (0, 0),
+                events: vec![],
+            },
+            Case {
+                name: "forced-at",
+                living: state(Activity::March, 0, 0, 897, 1000),
+                inventory: inv(0, 0),
+                expected: expected(Activity::Idle, 2, 3, 900, 2, 1000, 1000, LifeState::Alive),
+                expected_inventory: inv(0, 0),
+                consumed: (0, 0),
+                events: vec![Event::ActivityChanged {
+                    id,
+                    before: Activity::March,
+                    after: Activity::Idle,
+                    forced: true,
+                }],
+            },
+            Case {
+                name: "forced-after",
+                living: state(Activity::March, 0, 0, 898, 1000),
+                inventory: inv(0, 0),
+                expected: expected(Activity::Idle, 2, 3, 901, 2, 1000, 1000, LifeState::Alive),
+                expected_inventory: inv(0, 0),
+                consumed: (0, 0),
+                events: vec![Event::ActivityChanged {
+                    id,
+                    before: Activity::March,
+                    after: Activity::Idle,
+                    forced: true,
+                }],
+            },
+            Case {
+                name: "starvation-death",
+                living: state(Activity::Idle, 799, 0, 0, 4),
+                inventory: inv(0, 1),
+                expected: expected(
+                    Activity::Idle,
+                    800,
+                    2,
+                    1,
+                    1,
+                    999,
+                    0,
+                    LifeState::Dead {
+                        at: 1,
+                        cause: DeathCause::Starvation,
+                    },
+                ),
+                expected_inventory: inv(0, 1),
+                consumed: (0, 0),
+                events: vec![
+                    Event::LivingDeteriorated {
+                        id,
+                        morale_before: 1000,
+                        morale_after: 999,
+                        health_before: 4,
+                        health_after: 0,
+                    },
+                    Event::SoldierDied {
+                        id,
+                        cause: DeathCause::Starvation,
+                        health_before: 4,
+                    },
+                ],
+            },
+            Case {
+                name: "dehydration-death",
+                living: state(Activity::Idle, 0, 798, 0, 10),
+                inventory: inv(1, 0),
+                expected: expected(
+                    Activity::Idle,
+                    1,
+                    800,
+                    1,
+                    1,
+                    999,
+                    0,
+                    LifeState::Dead {
+                        at: 1,
+                        cause: DeathCause::Dehydration,
+                    },
+                ),
+                expected_inventory: inv(1, 0),
+                consumed: (0, 0),
+                events: vec![
+                    Event::LivingDeteriorated {
+                        id,
+                        morale_before: 1000,
+                        morale_after: 999,
+                        health_before: 10,
+                        health_after: 0,
+                    },
+                    Event::SoldierDied {
+                        id,
+                        cause: DeathCause::Dehydration,
+                        health_before: 10,
+                    },
+                ],
+            },
+        ];
+        assert_eq!(cases.len(), 15);
+        for case in cases {
+            let actual = World::transition_second(case.living, case.inventory, id, 1).unwrap();
+            assert_eq!(actual.living, case.expected, "{} living", case.name);
+            assert_eq!(
+                actual.inventory, case.expected_inventory,
+                "{} inventory",
+                case.name
+            );
+            assert_eq!(
+                (actual.consumed_food, actual.consumed_water),
+                case.consumed,
+                "{} ledger",
+                case.name
+            );
+            assert_eq!(
+                actual.events.iter().map(|e| e.event).collect::<Vec<_>>(),
+                case.events,
+                "{} events",
+                case.name
+            );
+        }
+    }
+
+    #[test]
     fn generation_exhaustion_retires_slot_permanently() {
         let mut soldiers = Soldiers::default();
         soldiers.generation.push(u32::MAX - 1);

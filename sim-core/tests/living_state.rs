@@ -374,3 +374,206 @@ fn cluster_12_hot_processing_touches_exact_indexed_membership() {
     assert!(world.soldier(removed).is_none());
     assert!(World::from_snapshot(&world.snapshot()).is_ok());
 }
+
+#[test]
+fn oracle_matrix_duration_zero_is_an_exact_noop() {
+    for activity in [Activity::Rest, Activity::Idle, Activity::March] {
+        let mut world = World::new(44);
+        let id = spawn(&mut world, 1, 2, 2);
+        apply(&mut world, Command::SetActivity { id, activity });
+        let before = world.snapshot();
+        let events = apply(&mut world, Command::AdvanceTo { target: 0 });
+        assert!(events.is_empty());
+        assert_eq!(world.soldier(id).unwrap().living.materialized_at, 0);
+        assert_eq!(world.snapshot(), before);
+    }
+}
+
+#[test]
+fn exhaustion_causes_have_exact_independent_times() {
+    let cases = [
+        (20, 0, 499, DeathCause::Dehydration),
+        (0, 20, 1_049, DeathCause::Starvation),
+        (0, 0, 499, DeathCause::Dehydration),
+    ];
+    for (food, water, death_at, cause) in cases {
+        let mut world = World::new(0);
+        let id = spawn(&mut world, 1, food, water);
+        let events = apply(&mut world, Command::AdvanceTo { target: 2_000 });
+        assert_eq!(
+            world.soldier(id).unwrap().living.life,
+            LifeState::Dead {
+                at: death_at,
+                cause
+            }
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e.event, Event::SoldierDied { id: got, .. } if got == id))
+                .count(),
+            1
+        );
+        let work = world.living_work_counters();
+        assert!(apply(&mut world, Command::AdvanceTo { target: 3_000 })
+            .iter()
+            .all(|e| !matches!(
+                e.event,
+                Event::SoldierDied { .. }
+                    | Event::LivingDeteriorated { .. }
+                    | Event::RationConsumed { .. }
+            )));
+        assert_eq!(world.living_work_counters(), work);
+    }
+}
+
+#[test]
+fn repeated_restore_bytes_are_identical() {
+    let mut world = World::new(123);
+    let id = spawn(&mut world, 3, 3, 4);
+    apply(
+        &mut world,
+        Command::SetActivity {
+            id,
+            activity: Activity::March,
+        },
+    );
+    apply(&mut world, Command::AdvanceTo { target: 137 });
+    let bytes = world.snapshot();
+    for _ in 0..8 {
+        let restored = World::from_snapshot(&bytes).unwrap();
+        assert_eq!(restored.snapshot(), bytes);
+        assert_eq!(restored.state_digest(), world.state_digest());
+    }
+}
+
+#[test]
+fn multiple_hot_cells_step_only_living_indexed_members_in_id_order() {
+    let mut world = World::new(0);
+    let a = spawn(&mut world, 10, 1, 1);
+    let b = spawn(&mut world, 20, 1, 1);
+    let cold = spawn(&mut world, 30, 1, 1);
+    apply(
+        &mut world,
+        Command::SetRegionHot {
+            cell: 20,
+            hot: true,
+        },
+    );
+    apply(
+        &mut world,
+        Command::SetRegionHot {
+            cell: 10,
+            hot: true,
+        },
+    );
+    let events = apply(&mut world, Command::AdvanceTo { target: 50 });
+    assert_eq!(world.living_work_counters(), (1, 100));
+    let ration_ids: Vec<_> = automatic(&events)
+        .into_iter()
+        .filter_map(|e| match e.event {
+            Event::RationConsumed { id, .. } => Some(id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ration_ids, vec![a, b, cold]);
+}
+
+#[test]
+fn removal_loss_survives_snapshot_restore_conservation() {
+    let mut world = World::new(0);
+    let id = spawn(&mut world, 1, 4, 5);
+    apply(&mut world, Command::AdvanceTo { target: 100 });
+    apply(&mut world, Command::DespawnSoldier { id });
+    let totals = world.resource_totals();
+    assert_eq!(
+        totals.sourced_food,
+        totals.carried_food + totals.consumed_food + totals.lost_food
+    );
+    assert_eq!(
+        totals.sourced_water,
+        totals.carried_water + totals.consumed_water + totals.lost_water
+    );
+    let restored = World::from_snapshot(&world.snapshot()).unwrap();
+    assert_eq!(restored.resource_totals(), totals);
+}
+
+#[test]
+fn scheduled_commands_with_same_time_keep_schedule_id_order() {
+    let mut world = World::new(0);
+    apply(
+        &mut world,
+        Command::Schedule {
+            at: 10,
+            command: ScheduledCommand::CreateStockpile {
+                id: 9,
+                initial: Stock::default(),
+            },
+        },
+    );
+    apply(
+        &mut world,
+        Command::Schedule {
+            at: 10,
+            command: ScheduledCommand::CreateStockpile {
+                id: 8,
+                initial: Stock::default(),
+            },
+        },
+    );
+    let events = apply(&mut world, Command::AdvanceTo { target: 10 });
+    let ids: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e.event {
+            Event::StockpileCreated { id, .. } => Some(id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ids, vec![9, 8]);
+}
+
+#[test]
+fn query_permutations_are_snapshot_and_digest_pure() {
+    let mut world = World::new(8);
+    let a = spawn(&mut world, 1, 1, 1);
+    let b = spawn(&mut world, 2, 2, 2);
+    apply(&mut world, Command::AdvanceTo { target: 49 });
+    let bytes = world.snapshot();
+    let digest = world.state_digest();
+    for ids in [[a, b], [b, a], [a, a], [b, b]] {
+        for id in ids {
+            let _ = world.soldier(id);
+        }
+        let _ = world.resource_totals();
+        let _ = world.living_work_counters();
+        assert_eq!(world.snapshot(), bytes);
+        assert_eq!(world.state_digest(), digest);
+    }
+}
+
+#[test]
+fn fidelity_cycles_through_death_never_resurrect_or_double_work() {
+    let mut world = World::new(0);
+    let id = spawn(&mut world, 7, 0, 0);
+    for at in [1, 99, 100, 398, 499, 500, 700] {
+        apply(
+            &mut world,
+            Command::SetRegionHot {
+                cell: 7,
+                hot: at % 2 == 1,
+            },
+        );
+        apply(&mut world, Command::AdvanceTo { target: at });
+        world = World::from_snapshot(&world.snapshot()).unwrap();
+    }
+    assert_eq!(
+        world.soldier(id).unwrap().living.life,
+        LifeState::Dead {
+            at: 499,
+            cause: DeathCause::Dehydration
+        }
+    );
+    let before = world.living_work_counters();
+    apply(&mut world, Command::AdvanceTo { target: 900 });
+    assert_eq!(world.living_work_counters(), before);
+}
