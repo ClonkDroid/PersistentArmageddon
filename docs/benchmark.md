@@ -1,50 +1,61 @@
-# M0 release benchmark — Codex cloud environment
+# M0 execution-skeleton benchmark
 
 ## Full manual run
 
-Measured on 2026-08-07 from this change's working tree. The full command and output were:
+Measured on 2026-08-07 with:
 
 ```text
 $ time cargo run --release -p sim-server -- --benchmark
 soldiers=2410000
-initialization_seconds=0.913441
+initialization_seconds=0.675641
 dense_scheduler_commands=100000
-dense_scheduler_seconds=0.017802
-sparse_scheduler_advance_seconds=0.000003
-needs_full_pass_seconds=0.172850
+advance_simulated_seconds=60
+advance_events=100001
+hot_cell_steps_included=true
+full_needs_pass_included=true
+combined_advance_wall_seconds=0.213009
+simulated_seconds_per_wall_second=281.678
+design_goal_simulated_seconds_per_wall_second=1.000
+design_goal_met=true
 needs_checksum=3399153494c8c265
-snapshot_seconds=0.975316
-snapshot_bytes=154640092
-digest_seconds=1.274194
-digest=724c4c221796dc90
-current_rss_kib=325760
-peak_rss_kib=476504
+snapshot_seconds=0.621268
+snapshot_bytes=118480100
+digest_seconds=1.003303
+digest=73af73890470b3e9
+current_rss_kib=265916
+peak_rss_kib=381408
 
-real    0m3.455s
-user    0m1.552s
-sys     0m1.898s
+real    0m2.662s
+user    0m1.489s
+sys     0m1.169s
 ```
 
-Initialization creates 2,410,000 individually addressable authoritative records. The dense scheduler phase executes 100,000 `SetRegionHot` commands queued at one timestamp; the separately reported sparse phase advances to second 60 and processes one transfer. Neither is described as million-soldier simulation throughput. The separately timed complete needs pass visits every live record and hashes each ID and field's unambiguous bytes. Snapshot creation and digest computation each scan authoritative state. Current RSS (`VmRSS`) and peak RSS (`VmHWM`) come from `/proc/self/status` after these phases; allocations freed or retained by the allocator and transient snapshot/digest buffers affect them.
+Initialization, snapshot, and digest are separately timed and excluded from advance throughput. The defined advance workload combines ordered execution of 100,000 same-time hot-cell activations and one transfer across 60 simulated seconds with the complete derived-needs pass over all 2,410,000 live records. Hot-cell fixed-step counters are advanced across clock segments. Its measured 281.678 simulated-seconds per wall-second exceeds the design goal of 1, but this is evidence only for the M0 skeleton.
 
-## Reproduction and CI
+It does **not** measure or predict full warfare, combat, AI, pathfinding, graphics, networking, or M1 needs consumption. The hot work updates exact per-cell step counters; it does not scan soldiers or execute combat.
 
-```sh
-cargo run --release -p sim-server -- --benchmark
-PA_SOLDIERS=10000 PA_DENSE_COMMANDS=1000 cargo run --release -p sim-server -- --benchmark
-```
-
-The first command is the manual full benchmark, including at least 100,000 dense commands. CI uses the second bounded smoke workload. The environment variables change work size, so checksums, snapshot size, memory, and timings differ. Unit tests assert state and order, never wall time.
-
-## Environment and limitations
+## Bounded CI run
 
 ```text
-CPU: 3 vCPU, Intel Xeon Platinum 8370C @ 2.80 GHz (KVM)
-RAM: 17 GiB available, no swap
-OS architecture: x86_64
-rustc: 1.95.0 (59807616e 2026-04-14), LLVM 22.1.2
-cargo: 1.95.0 (f2d3ce0bd 2026-03-21)
-profile: release (optimized)
+$ PA_SOLDIERS=10000 PA_DENSE_COMMANDS=1000 cargo run --release -p sim-server -- --benchmark
+soldiers=10000
+initialization_seconds=0.003215
+dense_scheduler_commands=1000
+advance_simulated_seconds=60
+advance_events=1001
+hot_cell_steps_included=true
+full_needs_pass_included=true
+combined_advance_wall_seconds=0.000929
+simulated_seconds_per_wall_second=64602.961
+design_goal_simulated_seconds_per_wall_second=1.000
+design_goal_met=true
+needs_checksum=c6a9060f4fc58285
+snapshot_seconds=0.003551
+snapshot_bytes=508100
+digest_seconds=0.003890
+digest=3c84dc6afe1df948
+current_rss_kib=3620
+peak_rss_kib=4104
 ```
 
-This measures only implemented M0 initialization, sparse scheduling, needs derivation, snapshots, and digests. It contains no combat, pathfinding, graphics, living-world M1 processing, persistence I/O, or network load. Future features require independent representative benchmarks rather than extrapolation from the sparse-clock time.
+Timings use `Instant`; RSS and peak RSS use Linux `/proc/self/status`. Unit tests assert deterministic state and event order, never timing.

@@ -1,16 +1,18 @@
 # Persistent Armageddon deterministic kernel (M0)
 
-This Rust workspace implements **M0 kernel behavior**: one authoritative record per soldier ID, a monotonic linear-time scheduler, explicit stockpile source events and conserved transfers, integer derived needs, relationship integrity, and versioned validated snapshots. It is not a living-world or combat simulation.
+This workspace implements the M0 deterministic execution skeleton, not combat or M1 living-world behavior.
 
-## Architecture
+## Authoritative boundary
 
-- `sim-core`: generational IDs, structure-of-arrays records, squads/officers, logistics ledger, ordered scheduler, snapshots/replay digests, and lazy needs.
-- `sim-server`: minimal `GET /health` and `GET /snapshot` boundary plus the manual benchmark.
-- `sim-wasm`: dependency-free adapter suitable for the optional WASM target.
+`sim-core::World::apply` is the sole public mutation boundary. Typed commands cover soldier source/loss lifecycle, squads and officers, stockpiles and transfers, fidelity, scheduling/cancellation, time, and RNG. Every accepted mutation emits a timestamped event. An advance outcome retains committed-prefix events together with a terminal error; the failing scheduled command and exact suffix remain queued at the failure timestamp. Intrinsically invalid scheduled commands are rejected immediately, while stable schedule IDs allow state-dependent failures to be cancelled.
 
-Only `Role::Officer` soldiers may be assigned as officers. A soldier has at most one squad; reassignment removes the old squad's membership and officer pointer. Scheduled commands exclude time advancement at the Rust type level. When scheduled work fails, the clock remains at that event time and the failing and unattempted commands remain pending for explicit operator correction/recovery.
+Soldier spawn is an explicit scenario-loadout source and removal is an explicit loadout loss. Their events identify the soldier and exact ammunition, food, water, and medical quantities. These are M0 scenario/casualty accounting events, not production or consumption.
 
-Stockpiles can only be introduced with `CreateStockpile`, which emits `StockpileCreated` and rejects duplicate IDs atomically. There is no arbitrary resource setter or generic production/loss operation. Allocator slots whose generation reaches `u32::MAX` are retired permanently.
+Hot cells have a deterministic one-second fixed-step counter. Clock segments advance only active cells; cold cells remain sparse. This is a queryable execution skeleton and does not claim tactical combat.
+
+## Server wire format
+
+The single-process server owns one mutable world. It retains `GET /health` and `GET /snapshot`, and accepts `POST /v1/command` with `Content-Length` and JSON no larger than 64 KiB. The body has `version: 1`, a `command` (`advance_to`, `create_stockpile`, `transfer`, `set_region_hot`, `schedule_hot`, `schedule_transfer`, or `cancel_scheduled`), the command's named fields, and `null` for the remaining optional fields. Unsupported, malformed, oversized, or length-mismatched requests are rejected before mutation. Responses contain version, clock, ordered timestamped events, nullable terminal error, and resulting digest.
 
 ## Verification
 
@@ -19,11 +21,8 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cargo build --workspace --release
+PA_SOLDIERS=10000 PA_DENSE_COMMANDS=1000 cargo run --release -p sim-server -- --benchmark
 cargo run --release -p sim-server -- --benchmark
 ```
 
-`PA_SOLDIERS` and `PA_DENSE_COMMANDS` bound the benchmark for CI; their manual defaults are 2,410,000 records and 100,000 same-timestamp commands. See [benchmark evidence](docs/benchmark.md) and [ADR 0001](docs/adr/0001-authoritative-state-and-lod.md).
-
-## Not implemented (M1 and later)
-
-Combat, tactical fixed steps, living-world behavior, graphics, pathfinding, lore systems, authenticated networking, and persistence migrations are not implemented. Hot cells are metadata scaffolding only and must not be presented as a combat/LOD implementation.
+Snapshot version 4 includes schedule IDs and hot-cell execution state and is decoded strictly. The manual benchmark defaults to 2,410,000 records and 100,000 dense commands. See [benchmark evidence](docs/benchmark.md) and [ADR 0001](docs/adr/0001-authoritative-state-and-lod.md).

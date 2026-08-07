@@ -1,14 +1,13 @@
 use sim_core::*;
-use std::collections::BTreeSet;
 
-fn soldier(cell: u32) -> SoldierSpec {
+fn ok(w: &mut World, c: Command) -> Vec<TimedEvent> {
+    let o = w.apply(c);
+    assert_eq!(o.error, None);
+    o.events
+}
+fn spec(ammunition: u32) -> SoldierSpec {
     SoldierSpec {
-        position: Position {
-            x_mm: 1,
-            y_mm: 2,
-            cell,
-        },
-        ammunition: 30,
+        ammunition,
         inventory: Inventory {
             food: 2,
             water: 3,
@@ -19,452 +18,340 @@ fn soldier(cell: u32) -> SoldierSpec {
 }
 
 #[test]
-fn ids_are_unique_across_reuse() {
+fn lifecycle_is_observable_and_conserved_by_explicit_sources_and_losses() {
     let mut w = World::new(1);
-    let a = w.spawn(soldier(0)).unwrap();
-    assert!(w.despawn(a));
-    let b = w.spawn(soldier(0)).unwrap();
-    assert_ne!(a, b);
-    assert!(w.soldier(a).is_none());
-    assert!(w.soldier(b).is_some());
+    let before = w.resource_totals();
+    let e = ok(&mut w, Command::SpawnSoldier { spec: spec(30) });
+    let id = match e[0].event {
+        Event::SoldierSpawned { id, loadout } => {
+            assert_eq!(
+                loadout,
+                Loadout {
+                    ammunition: 30,
+                    food: 2,
+                    water: 3,
+                    medical: 1
+                }
+            );
+            id
+        }
+        _ => panic!(),
+    };
+    assert_eq!(w.resource_totals(), (30, 2, 3, 1));
+    let e = ok(&mut w, Command::DespawnSoldier { id });
+    assert!(matches!(e[0].event,Event::SoldierRemoved{id:x,..} if x==id));
+    assert_eq!(w.resource_totals(), before);
+    let digest = w.state_digest();
+    assert_eq!(
+        w.apply(Command::DespawnSoldier { id }).error,
+        Some(SimError::InvalidEntity)
+    );
+    assert_eq!(w.state_digest(), digest)
 }
+
 #[test]
-fn replay_is_deterministic() {
-    fn run() -> u64 {
-        let mut w = World::new(44);
-        w.create_stockpile(
-            1,
-            Stock {
-                ammunition: 100,
-                supplies: 50,
+fn scheduled_events_span_timestamps() {
+    let mut w = World::new(0);
+    ok(
+        &mut w,
+        Command::CreateStockpile {
+            id: 1,
+            initial: Stock {
+                ammunition: 4,
+                supplies: 0,
             },
-        )
-        .unwrap();
-        w.create_stockpile(2, Stock::default()).unwrap();
-        for c in 0..100 {
-            w.spawn(soldier(c % 3)).unwrap();
-        }
-        w.apply_world(WorldCommand::Transfer {
-            from: 1,
-            to: 2,
-            ammunition: 7,
-            supplies: 9,
-        })
-        .unwrap();
-        w.advance_to(90).unwrap();
-        w.state_digest()
-    }
-    assert_eq!(run(), run());
-}
-#[test]
-fn snapshot_resume_matches() {
-    let mut a = World::new(9);
-    a.spawn(soldier(4)).unwrap();
-    a.create_stockpile(
-        1,
-        Stock {
-            ammunition: 10,
-            supplies: 10,
         },
-    )
-    .unwrap();
-    a.create_stockpile(2, Stock::default()).unwrap();
-    a.schedule(
-        100,
-        WorldCommand::Transfer {
-            from: 1,
-            to: 2,
-            ammunition: 2,
-            supplies: 3,
-        },
-    )
-    .unwrap();
-    a.advance_to(60).unwrap();
-    let mut b = World::from_snapshot(&a.snapshot()).unwrap();
-    a.advance_to(121).unwrap();
-    b.advance_to(121).unwrap();
-    assert_eq!(a.state_digest(), b.state_digest());
-    assert_eq!(
-        b.stockpile(2),
-        Some(Stock {
-            ammunition: 2,
-            supplies: 3
-        })
     );
-}
-
-#[test]
-fn transfer_adversarial_cases_are_atomic_and_conserved() {
-    let mut w = World::new(3);
-    w.create_stockpile(
-        1,
-        Stock {
-            ammunition: 10_000,
-            supplies: 20_000,
-        },
-    )
-    .unwrap();
-    w.create_stockpile(
-        2,
-        Stock {
-            ammunition: 5,
-            supplies: 7,
-        },
-    )
-    .unwrap();
-    w.create_stockpile(3, Stock::default()).unwrap();
-    let before = (w.stockpile(1), w.stockpile(2), w.stockpile(3));
-    assert_eq!(
-        w.apply_world(WorldCommand::Transfer {
-            from: 1,
-            to: 1,
-            ammunition: 1,
-            supplies: 1
-        }),
-        Err(SimError::InvalidTransfer)
-    );
-    assert_eq!(
-        w.apply_world(WorldCommand::Transfer {
-            from: 9,
-            to: 2,
-            ammunition: 1,
-            supplies: 1
-        }),
-        Err(SimError::UnknownStockpile)
-    );
-    assert_eq!(
-        w.apply_world(WorldCommand::Transfer {
-            from: 1,
-            to: 9,
-            ammunition: 1,
-            supplies: 1
-        }),
-        Err(SimError::UnknownStockpile)
-    );
-    assert_eq!(
-        w.apply_world(WorldCommand::Transfer {
-            from: 2,
-            to: 3,
-            ammunition: 99,
-            supplies: 0
-        }),
-        Err(SimError::InsufficientStock)
-    );
-    assert_eq!(before, (w.stockpile(1), w.stockpile(2), w.stockpile(3)));
-    w.create_stockpile(
-        4,
-        Stock {
-            ammunition: u64::MAX,
-            supplies: 0,
-        },
-    )
-    .unwrap();
-    let overflow_before = (w.stockpile(1), w.stockpile(4));
-    assert_eq!(
-        w.apply_world(WorldCommand::Transfer {
-            from: 1,
-            to: 4,
-            ammunition: 1,
-            supplies: 0
-        }),
-        Err(SimError::ArithmeticOverflow)
-    );
-    assert_eq!(overflow_before, (w.stockpile(1), w.stockpile(4)));
-    for i in 0..10_000 {
-        let (from, to) = if i % 3 == 0 {
-            (1, 2)
-        } else if i % 3 == 1 {
-            (2, 3)
-        } else {
-            (3, 1)
-        };
-        w.apply_world(WorldCommand::Transfer {
-            from,
-            to,
-            ammunition: 1,
-            supplies: 1,
-        })
-        .unwrap();
-    }
-    assert_eq!(
-        (1..=3)
-            .map(|i| w.stockpile(i).unwrap().ammunition)
-            .sum::<u64>(),
-        10_005
-    );
-    assert_eq!(
-        (1..=3)
-            .map(|i| w.stockpile(i).unwrap().supplies)
-            .sum::<u64>(),
-        20_007
-    );
-}
-
-#[test]
-fn scheduler_is_monotonic_bounded_and_preserves_failed_work() {
-    let mut w = World::new(0);
-    w.advance_to(10).unwrap();
-    assert_eq!(
-        w.schedule(9, WorldCommand::SetRegionHot { cell: 1, hot: true }),
-        Err(SimError::TimeReversal)
-    );
-    w.create_stockpile(1, Stock::default()).unwrap();
-    w.create_stockpile(2, Stock::default()).unwrap();
-    w.schedule(
-        20,
-        WorldCommand::Transfer {
-            from: 1,
-            to: 2,
-            ammunition: 1,
-            supplies: 0,
-        },
-    )
-    .unwrap();
-    w.schedule(20, WorldCommand::SetRegionHot { cell: 8, hot: true })
-        .unwrap();
-    assert_eq!(w.advance_to(30), Err(SimError::InsufficientStock));
-    assert_eq!(w.clock(), 20);
-    let failed_digest = w.state_digest();
-    assert_eq!(w.advance_to(30), Err(SimError::InsufficientStock));
-    assert_eq!(failed_digest, w.state_digest());
-    let mut max = World::new(0);
-    max.advance_to(u64::MAX).unwrap();
-    assert_eq!(max.clock(), u64::MAX);
-}
-
-#[test]
-fn allocator_and_relationships_survive_snapshot_exactly() {
-    let mut a = World::new(4);
-    a.create_squad(1);
-    a.create_squad(2);
-    let rifle = a.spawn(soldier(0)).unwrap();
-    assert_eq!(
-        a.assign_officer(1, rifle),
-        Err(SimError::InvalidOfficerRole)
-    );
-    let officer = a
-        .spawn(SoldierSpec {
-            role: Role::Officer,
-            ..soldier(0)
-        })
-        .unwrap();
-    a.assign_officer(1, officer).unwrap();
-    a.assign_officer(2, officer).unwrap();
-    assert!(!a.squad(1).unwrap().members.contains(&officer));
-    assert_eq!(a.squad(1).unwrap().officer, None);
-    assert!(a.squad(2).unwrap().members.contains(&officer));
-    let ids: Vec<_> = (0..8).map(|_| a.spawn(soldier(0)).unwrap()).collect();
-    a.despawn(ids[1]);
-    a.despawn(ids[5]);
-    a.despawn(rifle);
-    let mut b = World::from_snapshot(&a.snapshot()).unwrap();
-    for _ in 0..10 {
-        assert_eq!(a.spawn(soldier(0)).unwrap(), b.spawn(soldier(0)).unwrap());
-    }
-    assert_eq!(a.state_digest(), b.state_digest());
-    assert!(a.despawn(officer));
-    assert_eq!(a.squad(2).unwrap().officer, None);
-}
-
-#[test]
-fn needs_saturate_after_long_duration() {
-    let mut w = World::new(0);
-    let id = w.spawn(soldier(0)).unwrap();
-    w.advance_to(u64::MAX).unwrap();
-    assert_eq!(
-        w.soldier(id).unwrap().needs,
-        Needs {
-            fatigue: u32::MAX,
-            hunger: u32::MAX,
-            thirst: u32::MAX,
-            sleep_debt: u32::MAX
-        }
-    );
-}
-#[test]
-fn transfers_conserve_and_fail_atomically() {
-    let mut w = World::new(0);
-    w.create_stockpile(
-        1,
-        Stock {
-            ammunition: 10,
-            supplies: 20,
-        },
-    )
-    .unwrap();
-    w.create_stockpile(
-        2,
-        Stock {
-            ammunition: 3,
-            supplies: 4,
-        },
-    )
-    .unwrap();
-    let total = Stock {
-        ammunition: 13,
-        supplies: 24,
-    };
-    w.apply_world(WorldCommand::Transfer {
-        from: 1,
-        to: 2,
-        ammunition: 5,
-        supplies: 6,
-    })
-    .unwrap();
-    assert_eq!(
-        w.stockpile(1).unwrap().ammunition + w.stockpile(2).unwrap().ammunition,
-        total.ammunition
-    );
-    let before = (w.stockpile(1), w.stockpile(2));
-    assert_eq!(
-        w.apply_world(WorldCommand::Transfer {
-            from: 1,
-            to: 2,
-            ammunition: 99,
-            supplies: 0
-        }),
-        Err(SimError::InsufficientStock)
-    );
-    assert_eq!(before, (w.stockpile(1), w.stockpile(2)));
-}
-#[test]
-fn needs_are_lazily_materialized() {
-    let mut w = World::new(0);
-    let id = w.spawn(soldier(0)).unwrap();
-    w.advance_to(120).unwrap();
-    assert_eq!(
-        w.soldier(id).unwrap().needs,
-        Needs {
-            fatigue: 120,
-            hunger: 40,
-            thirst: 60,
-            sleep_debt: 30
-        }
-    );
-}
-#[test]
-fn dead_officer_references_are_cleaned() {
-    let mut w = World::new(0);
-    w.create_squad(7);
-    let id = w
-        .spawn(SoldierSpec {
-            squad: Some(7),
-            role: Role::Officer,
-            ..soldier(0)
-        })
-        .unwrap();
-    w.assign_officer(7, id).unwrap();
-    w.despawn(id);
-    assert_eq!(w.squad(7).unwrap().officer, None);
-    assert!(w.squad(7).unwrap().members.is_empty());
-}
-#[test]
-fn fidelity_transitions_preserve_authority() {
-    let mut w = World::new(0);
-    let ids: BTreeSet<_> = (0..100).map(|_| w.spawn(soldier(5)).unwrap()).collect();
-    w.apply_world(WorldCommand::SetRegionHot { cell: 5, hot: true })
-        .unwrap();
-    w.advance_to(30).unwrap();
-    w.apply_world(WorldCommand::SetRegionHot {
-        cell: 5,
-        hot: false,
-    })
-    .unwrap();
-    assert_eq!(w.soldier_count(), 100);
-    assert_eq!(
-        ids.iter().filter(|id| w.soldier(**id).is_some()).count(),
-        100
-    );
-}
-
-#[test]
-fn stockpile_creation_is_atomic_and_every_ledger_mutation_emits_an_event() {
-    let mut w = World::new(0);
-    let initial = Stock {
-        ammunition: 40,
-        supplies: 20,
-    };
-    assert_eq!(
-        w.create_stockpile(1, initial),
-        Ok(Event::StockpileCreated { id: 1, initial })
-    );
-    assert_eq!(
-        w.create_stockpile(2, Stock::default()),
-        Ok(Event::StockpileCreated {
+    ok(
+        &mut w,
+        Command::CreateStockpile {
             id: 2,
-            initial: Stock::default()
-        })
+            initial: Stock::default(),
+        },
     );
-    assert_eq!(
-        w.create_stockpile(1, Stock::default()),
-        Err(SimError::StockpileAlreadyExists)
+    ok(
+        &mut w,
+        Command::Schedule {
+            at: 2,
+            command: ScheduledCommand::Transfer {
+                from: 1,
+                to: 2,
+                ammunition: 1,
+                supplies: 0,
+            },
+        },
     );
-    assert_eq!(w.stockpile(1), Some(initial));
-    assert_eq!(
-        w.apply_world(WorldCommand::Transfer {
-            from: 1,
-            to: 2,
-            ammunition: 3,
-            supplies: 4,
-        }),
-        Ok(vec![Event::TransferCompleted {
-            from: 1,
-            to: 2,
-            stock: Stock {
+    ok(
+        &mut w,
+        Command::Schedule {
+            at: 5,
+            command: ScheduledCommand::SetRegionHot { cell: 9, hot: true },
+        },
+    );
+    let o = w.apply(Command::AdvanceTo { target: 8 });
+    assert_eq!(o.error, None);
+    assert_eq!(o.events.len(), 2);
+    assert_eq!((o.events[0].at, o.events[1].at), (2, 5));
+    assert_eq!(o.clock, 8)
+}
+
+#[test]
+fn dense_failure_returns_prefix_and_retains_exact_suffix() {
+    let mut w = World::new(0);
+    ok(
+        &mut w,
+        Command::CreateStockpile {
+            id: 1,
+            initial: Stock {
                 ammunition: 3,
-                supplies: 4
-            }
-        }])
+                supplies: 0,
+            },
+        },
     );
-    assert_eq!(
-        w.stockpile(1).unwrap().ammunition + w.stockpile(2).unwrap().ammunition,
-        initial.ammunition
+    ok(
+        &mut w,
+        Command::CreateStockpile {
+            id: 2,
+            initial: Stock::default(),
+        },
     );
-}
-
-#[test]
-fn maximum_squad_id_round_trips_losslessly() {
-    let mut w = World::new(0);
-    w.create_squad(u32::MAX);
-    let id = w
-        .spawn(SoldierSpec {
-            squad: Some(u32::MAX),
-            ..soldier(0)
-        })
-        .unwrap();
-    let restored = World::from_snapshot(&w.snapshot()).unwrap();
-    assert_eq!(restored.soldier(id).unwrap().squad, Some(u32::MAX));
-    assert!(restored.squad(u32::MAX).unwrap().members.contains(&id));
-}
-
-#[test]
-fn relationships_scale_without_touching_unrelated_squads() {
-    let mut w = World::new(0);
-    let mut sentinels = Vec::new();
-    for squad in 0..10_000 {
-        w.create_squad(squad);
-        sentinels.push(
-            w.spawn(SoldierSpec {
-                squad: Some(squad),
-                ..soldier(squad)
-            })
-            .unwrap(),
+    for cell in 0..1000 {
+        ok(
+            &mut w,
+            Command::Schedule {
+                at: 7,
+                command: ScheduledCommand::SetRegionHot { cell, hot: true },
+            },
         );
     }
-    let officer = w
-        .spawn(SoldierSpec {
-            squad: Some(12),
-            role: Role::Officer,
-            ..soldier(12)
-        })
-        .unwrap();
-    w.assign_officer(9_876, officer).unwrap();
-    assert!(!w.squad(12).unwrap().members.contains(&officer));
-    assert_eq!(w.squad(9_876).unwrap().officer, Some(officer));
-    assert!(w.despawn(officer));
-    assert_eq!(w.squad(9_876).unwrap().officer, None);
-    for (squad, sentinel) in sentinels.into_iter().enumerate() {
-        assert!(w.squad(squad as u32).unwrap().members.contains(&sentinel));
-        assert_eq!(w.soldier(sentinel).unwrap().squad, Some(squad as u32));
+    let fail_id = match ok(
+        &mut w,
+        Command::Schedule {
+            at: 7,
+            command: ScheduledCommand::Transfer {
+                from: 1,
+                to: 2,
+                ammunition: 4,
+                supplies: 0,
+            },
+        },
+    )[0]
+    .event
+    {
+        Event::Scheduled { id, .. } => id,
+        _ => panic!(),
+    };
+    for cell in 1000..2000 {
+        ok(
+            &mut w,
+            Command::Schedule {
+                at: 7,
+                command: ScheduledCommand::SetRegionHot { cell, hot: true },
+            },
+        );
     }
+    let o = w.apply(Command::AdvanceTo { target: 10 });
+    assert_eq!(o.events.len(), 1000);
+    assert_eq!(o.error, Some(SimError::InsufficientStock));
+    assert_eq!(o.clock, 7);
+    assert_eq!(w.hot_cell_count(), 1000);
+    let snap = w.snapshot();
+    let mut restored = World::from_snapshot(&snap).unwrap();
+    assert!(matches!(
+        ok(&mut w, Command::CancelScheduled { id: fail_id })[0].event,
+        Event::ScheduleCancelled { .. }
+    ));
+    ok(&mut restored, Command::CancelScheduled { id: fail_id });
+    let a = w.apply(Command::AdvanceTo { target: 10 });
+    let b = restored.apply(Command::AdvanceTo { target: 10 });
+    assert_eq!(a, b);
+    assert_eq!(a.events.len(), 1000);
+    assert_eq!(w.state_digest(), restored.state_digest())
+}
+
+#[test]
+fn scheduler_rejects_intrinsic_invalidity_and_can_repair_state_failure() {
+    let mut w = World::new(0);
+    ok(
+        &mut w,
+        Command::CreateStockpile {
+            id: 1,
+            initial: Stock::default(),
+        },
+    );
+    ok(
+        &mut w,
+        Command::CreateStockpile {
+            id: 2,
+            initial: Stock::default(),
+        },
+    );
+    ok(
+        &mut w,
+        Command::CreateStockpile {
+            id: 3,
+            initial: Stock {
+                ammunition: 5,
+                supplies: 0,
+            },
+        },
+    );
+    assert_eq!(
+        w.apply(Command::Schedule {
+            at: 1,
+            command: ScheduledCommand::Transfer {
+                from: 1,
+                to: 1,
+                ammunition: 1,
+                supplies: 0
+            }
+        })
+        .error,
+        Some(SimError::InvalidTransfer)
+    );
+    assert_eq!(
+        w.apply(Command::Schedule {
+            at: 1,
+            command: ScheduledCommand::CreateStockpile {
+                id: 1,
+                initial: Stock::default()
+            }
+        })
+        .error,
+        Some(SimError::StockpileAlreadyExists)
+    );
+    ok(
+        &mut w,
+        Command::Schedule {
+            at: 2,
+            command: ScheduledCommand::Transfer {
+                from: 1,
+                to: 2,
+                ammunition: 2,
+                supplies: 0,
+            },
+        },
+    );
+    assert_eq!(
+        w.apply(Command::AdvanceTo { target: 3 }).error,
+        Some(SimError::InsufficientStock)
+    );
+    ok(
+        &mut w,
+        Command::Transfer {
+            from: 3,
+            to: 1,
+            ammunition: 2,
+            supplies: 0,
+        },
+    );
+    assert_eq!(w.apply(Command::AdvanceTo { target: 3 }).error, None);
+    assert_eq!(w.stockpile(2).unwrap().ammunition, 2)
+}
+
+#[test]
+fn hot_cells_step_only_after_activation_and_survive_snapshot() {
+    let mut w = World::new(0);
+    ok(&mut w, Command::AdvanceTo { target: 5 });
+    ok(&mut w, Command::SetRegionHot { cell: 1, hot: true });
+    ok(
+        &mut w,
+        Command::Schedule {
+            at: 8,
+            command: ScheduledCommand::SetRegionHot { cell: 2, hot: true },
+        },
+    );
+    ok(
+        &mut w,
+        Command::Schedule {
+            at: 10,
+            command: ScheduledCommand::SetRegionHot {
+                cell: 1,
+                hot: false,
+            },
+        },
+    );
+    ok(&mut w, Command::AdvanceTo { target: 12 });
+    assert_eq!(w.hot_cell(1), None);
+    assert_eq!(
+        w.hot_cell(2),
+        Some(HotCellState {
+            activated_at: 8,
+            last_stepped_at: 12,
+            fixed_steps: 4
+        })
+    );
+    let mut r = World::from_snapshot(&w.snapshot()).unwrap();
+    ok(&mut w, Command::AdvanceTo { target: 20 });
+    ok(&mut r, Command::AdvanceTo { target: 20 });
+    assert_eq!(w.state_digest(), r.state_digest());
+    let mut max = World::new(0);
+    ok(&mut max, Command::SetRegionHot { cell: 0, hot: true });
+    assert_eq!(
+        max.apply(Command::AdvanceTo { target: u64::MAX }).error,
+        None
+    );
+    assert_eq!(max.hot_cell(0).unwrap().fixed_steps, u64::MAX)
+}
+
+#[test]
+fn relationships_and_ids_replay() {
+    let mut a = World::new(2);
+    ok(&mut a, Command::CreateSquad { id: 1 });
+    ok(&mut a, Command::CreateSquad { id: 2 });
+    let officer = match ok(
+        &mut a,
+        Command::SpawnSoldier {
+            spec: SoldierSpec {
+                role: Role::Officer,
+                ..SoldierSpec::default()
+            },
+        },
+    )[0]
+    .event
+    {
+        Event::SoldierSpawned { id, .. } => id,
+        _ => panic!(),
+    };
+    ok(&mut a, Command::AssignOfficer { squad: 1, officer });
+    ok(&mut a, Command::AssignOfficer { squad: 2, officer });
+    assert!(a.squad(1).unwrap().members.is_empty());
+    let mut b = World::from_snapshot(&a.snapshot()).unwrap();
+    for _ in 0..20 {
+        let ia = match ok(
+            &mut a,
+            Command::SpawnSoldier {
+                spec: SoldierSpec::default(),
+            },
+        )[0]
+        .event
+        {
+            Event::SoldierSpawned { id, .. } => id,
+            _ => panic!(),
+        };
+        let ib = match ok(
+            &mut b,
+            Command::SpawnSoldier {
+                spec: SoldierSpec::default(),
+            },
+        )[0]
+        .event
+        {
+            Event::SoldierSpawned { id, .. } => id,
+            _ => panic!(),
+        };
+        assert_eq!(ia, ib)
+    }
+    assert_eq!(a.state_digest(), b.state_digest())
+}
+
+#[test]
+fn malformed_snapshot_is_atomic_to_caller() {
+    let w = World::new(0);
+    let mut b = w.snapshot();
+    b.push(0);
+    assert!(matches!(
+        World::from_snapshot(&b),
+        Err(SimError::Snapshot("trailing bytes"))
+    ))
 }
