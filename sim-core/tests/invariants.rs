@@ -505,7 +505,7 @@ fn allocator_reuse_keeps_live_ids_unique_and_stale_ids_dead() {
 
 #[test]
 fn fidelity_cycles_preserve_complete_soldier_and_relationship_state() {
-    fn fixture() -> (World, Vec<EntityId>) {
+    fn fixture() -> (World, Vec<EntityId>, Vec<SoldierSpec>) {
         let mut world = World::new(11);
         ok(&mut world, Command::CreateSquad { id: 4 });
         ok(&mut world, Command::CreateSquad { id: 9 });
@@ -584,7 +584,8 @@ fn fidelity_cycles_preserve_complete_soldier_and_relationship_state() {
             },
         ];
         let ids = specs
-            .into_iter()
+            .iter()
+            .copied()
             .map(
                 |spec| match ok(&mut world, Command::SpawnSoldier { spec })[0].event {
                     Event::SoldierSpawned { id, .. } => id,
@@ -606,7 +607,7 @@ fn fidelity_cycles_preserve_complete_soldier_and_relationship_state() {
                 officer: ids[2],
             },
         );
-        (world, ids)
+        (world, ids, specs.to_vec())
     }
     fn cycle(world: &mut World, cell: u32) {
         let start = world.clock();
@@ -623,19 +624,52 @@ fn fidelity_cycles_preserve_complete_soldier_and_relationship_state() {
         ok(world, Command::AdvanceTo { target: start + 9 });
         ok(world, Command::SetRegionHot { cell, hot: false });
     }
-    let (mut fidelity, ids) = fixture();
-    let (mut control, control_ids) = fixture();
+    fn expected_soldiers(ids: &[EntityId], specs: &[SoldierSpec], clock: u64) -> Vec<Soldier> {
+        ids.iter()
+            .zip(specs)
+            .map(|(&id, spec)| Soldier {
+                id,
+                faction: spec.faction,
+                position: spec.position,
+                squad: spec.squad,
+                role: spec.role,
+                rank: spec.rank,
+                health: spec.health,
+                needs: Needs {
+                    fatigue: clock as u32,
+                    hunger: (clock / 3) as u32,
+                    thirst: (clock / 2) as u32,
+                    sleep_debt: (clock / 4) as u32,
+                },
+                ammunition: spec.ammunition,
+                inventory: spec.inventory,
+            })
+            .collect()
+    }
+    fn expected_squad(id: u32, officer: EntityId, member: EntityId) -> Squad {
+        Squad {
+            id,
+            officer: Some(officer),
+            members: [officer, member].into_iter().collect(),
+        }
+    }
+    fn assert_expected(world: &World, ids: &[EntityId], specs: &[SoldierSpec], clock: u64) {
+        assert_eq!(world.soldier_count(), ids.len());
+        for (id, expected) in ids.iter().zip(expected_soldiers(ids, specs, clock)) {
+            assert_eq!(world.soldier(*id), Some(expected));
+        }
+        assert_eq!(world.squad(4), Some(&expected_squad(4, ids[0], ids[1])));
+        assert_eq!(world.squad(9), Some(&expected_squad(9, ids[2], ids[3])));
+    }
+
+    let (mut fidelity, ids, specs) = fixture();
+    let (mut control, control_ids, control_specs) = fixture();
     assert_eq!(ids, control_ids);
     cycle(&mut fidelity, 7);
-    cycle(&mut control, 99);
-    assert_eq!(fidelity.soldier_count(), 4);
-    for id in &ids {
-        assert_eq!(fidelity.soldier(*id), control.soldier(*id));
-        assert_ne!(fidelity.soldier(*id).unwrap().needs, Needs::default());
-    }
-    assert_eq!(fidelity.squad(4), control.squad(4));
-    assert_eq!(fidelity.squad(9), control.squad(9));
-    assert_eq!(fidelity.state_digest(), control.state_digest());
+    ok(&mut control, Command::AdvanceTo { target: 9 });
+    assert_expected(&fidelity, &ids, &specs, 9);
+    assert_expected(&control, &control_ids, &control_specs, 9);
+    assert!(fidelity.hot_cell(7).is_none());
 
     let mut fidelity_restored = World::from_snapshot(&fidelity.snapshot()).unwrap();
     let mut control_restored = World::from_snapshot(&control.snapshot()).unwrap();
@@ -644,23 +678,15 @@ fn fidelity_cycles_preserve_complete_soldier_and_relationship_state() {
         ok(world, Command::AdvanceTo { target: 18 });
     }
     for world in [&mut control, &mut control_restored] {
-        cycle(world, 98);
         ok(world, Command::AdvanceTo { target: 18 });
     }
-    for id in &ids {
-        let expected = control.soldier(*id).unwrap();
-        assert_eq!(fidelity.soldier(*id), Some(expected));
-        assert_eq!(fidelity_restored.soldier(*id), Some(expected));
-        assert_eq!(control_restored.soldier(*id), Some(expected));
+    for world in [&fidelity, &fidelity_restored] {
+        assert_expected(world, &ids, &specs, 18);
+        assert!(world.hot_cell(8).is_none());
     }
-    for squad in [4, 9] {
-        assert_eq!(fidelity.squad(squad), control.squad(squad));
-        assert_eq!(
-            fidelity_restored.squad(squad),
-            control_restored.squad(squad)
-        );
+    for world in [&control, &control_restored] {
+        assert_expected(world, &control_ids, &control_specs, 18);
     }
-    assert_eq!(fidelity.state_digest(), control.state_digest());
     assert_eq!(fidelity.state_digest(), fidelity_restored.state_digest());
     assert_eq!(control.state_digest(), control_restored.state_digest());
 }

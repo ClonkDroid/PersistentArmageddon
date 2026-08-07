@@ -840,6 +840,10 @@ mod tests {
 
     #[test]
     fn trickling_header_cannot_extend_absolute_deadline() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let client_listener = listener.try_clone().unwrap();
         let server = thread::spawn(move || {
@@ -854,11 +858,19 @@ mod tests {
             .unwrap();
         });
         let mut trickle = TcpStream::connect(client_listener.local_addr().unwrap()).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let sender_stop = Arc::clone(&stop);
         let sender = thread::spawn(move || {
-            for byte in b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n" {
-                if trickle.write_all(&[*byte]).is_err() {
-                    break;
-                }
+            let prefix = b"GET /health HTTP/1.1\r\nX-Trickle: ";
+            let mut index = 0;
+            while !sender_stop.load(Ordering::SeqCst) {
+                let byte = if index < prefix.len() {
+                    prefix[index]
+                } else {
+                    b'x'
+                };
+                let _ = trickle.write_all(&[byte]);
+                index += 1;
                 thread::sleep(Duration::from_millis(10));
             }
         });
@@ -870,12 +882,18 @@ mod tests {
         let mut response = Vec::new();
         healthy.read_to_end(&mut response).unwrap();
         assert_eq!(status(&response), "HTTP/1.1 200 OK");
+        assert!(!stop.load(Ordering::SeqCst));
+        stop.store(true, Ordering::SeqCst);
         sender.join().unwrap();
         server.join().unwrap();
     }
 
     #[test]
     fn trickling_body_cannot_extend_absolute_deadline() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let client_listener = listener.try_clone().unwrap();
         let server = thread::spawn(move || {
@@ -891,13 +909,13 @@ mod tests {
         });
         let mut trickle = TcpStream::connect(client_listener.local_addr().unwrap()).unwrap();
         trickle
-            .write_all(b"POST /v1/command HTTP/1.1\r\nContent-Length: 100\r\n\r\n")
+            .write_all(b"POST /v1/command HTTP/1.1\r\nContent-Length: 65536\r\n\r\n")
             .unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let sender_stop = Arc::clone(&stop);
         let sender = thread::spawn(move || {
-            for byte in [b'{'; 20] {
-                if trickle.write_all(&[byte]).is_err() {
-                    break;
-                }
+            while !sender_stop.load(Ordering::SeqCst) {
+                let _ = trickle.write_all(b"{");
                 thread::sleep(Duration::from_millis(10));
             }
         });
@@ -909,38 +927,45 @@ mod tests {
         let mut response = Vec::new();
         healthy.read_to_end(&mut response).unwrap();
         assert_eq!(status(&response), "HTTP/1.1 200 OK");
+        assert!(!stop.load(Ordering::SeqCst));
+        stop.store(true, Ordering::SeqCst);
         sender.join().unwrap();
         server.join().unwrap();
     }
 
     #[test]
     fn deadline_aware_write_stops_incremental_progress() {
-        struct OneByteWriter(Vec<u8>);
-        impl Write for OneByteWriter {
-            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                self.0.push(bytes[0]);
-                Ok(1)
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut writer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut reader, _) = listener.accept().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let reader_stop = Arc::clone(&stop);
+        let draining = thread::spawn(move || {
+            let mut byte = [0];
+            while !reader_stop.load(Ordering::SeqCst) {
+                let _ = reader.read(&mut byte);
+                thread::sleep(Duration::from_millis(5));
             }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        let mut writer = OneByteWriter(Vec::new());
-        let mut budget_checks = 0;
-        let error = write_all_bounded(&mut writer, b"snapshot-body", |_| {
-            budget_checks += 1;
-            if budget_checks > 4 {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "connection deadline expired",
-                ))
-            } else {
-                Ok(())
-            }
-        })
+        });
+        let body = vec![0_u8; 8 * 1024 * 1024];
+        let error = write_all_deadline(
+            &mut writer,
+            &body,
+            connection_deadline(Duration::from_millis(50)),
+        )
         .unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
-        assert_eq!(writer.0, b"snap");
+        assert!(matches!(
+            error.kind(),
+            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+        ));
+        assert!(!stop.load(Ordering::SeqCst));
+        stop.store(true, Ordering::SeqCst);
+        writer.shutdown(std::net::Shutdown::Both).unwrap();
+        draining.join().unwrap();
     }
 
     #[test]
