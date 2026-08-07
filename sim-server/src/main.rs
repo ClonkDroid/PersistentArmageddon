@@ -466,6 +466,7 @@ fn error_code(e: &SimError) -> &'static str {
         SimError::UnknownScheduledCommand => "unknown_scheduled_command",
         SimError::Snapshot(_) => "snapshot_invalid",
         SimError::DeadEntity => "dead_entity",
+        SimError::InvalidHealth => "invalid_health",
     }
 }
 fn event_json(x: &TimedEvent) -> Value {
@@ -783,8 +784,8 @@ mod tests {
             parsed["blocked"],
             json!({"id":0,"at":2,"command":{"type":"transfer","from":7,"to":8,"ammunition":40,"supplies":2}})
         );
-        assert_eq!(parsed["clock"], 2);
-        assert_eq!(parsed["events"][0]["event"]["type"], "time_advanced");
+        assert_eq!(parsed["clock"], 0);
+        assert_eq!(parsed["events"], json!([]));
         assert_eq!(parsed["digest"], format!("{:016x}", world.state_digest()));
         let digest = world.state_digest();
         let malformed =

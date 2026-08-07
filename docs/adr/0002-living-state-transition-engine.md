@@ -12,13 +12,13 @@ With no matching ration, hunger or thirst at 800 is severe. Each severe transiti
 
 ## Execution and ordering
 
-The one-second transition defines semantics. A cold entity has one reverse-indexed due time. The cold path uses integer rate multiplication between consumption, threshold, forced-activity, deterioration, and death boundaries; it never scans every soldier for every second. Due entities at the same timestamp are processed by stable ID. Hot cells use a cell-membership index and apply the same transition once per elapsed second to actual members in stable ID order. Fidelity changes materialize the boundary, remove or install the due entry, and never advance a member twice.
+The one-second transition defines semantics. A cold entity has one reverse-indexed due time. The cold path uses integer rate multiplication between consumption, threshold, forced-activity, deterioration, and death boundaries; unrelated command timestamps do not visit cold records. Queries project a private copy to the world clock, so they remain exact and cannot change snapshots, digests, indexes, or counters. Due entities and hot members at the same timestamp emit automatic work in one stable entity-ID order. Hot cells use a cell-membership index and apply the same transition once per elapsed second to actual living members. Fidelity changes materialize the boundary, remove or install the due entry, and never advance a member twice.
 
-For a timestamp shared with scheduled commands, all living transitions through that timestamp complete first. Scheduled commands then execute by stable schedule ID. A failed scheduled command retains the committed living prefix and exact command suffix, preserving M0 monotonic-clock semantics.
+For a timestamp shared with scheduled commands, all living transitions through that timestamp complete first. Scheduled commands then execute by stable schedule ID. Advances are transactionally staged: any arithmetic or scheduled-command failure publishes no state, clock, event, counter, or queue mutation.
 
 ## Persistence and accounting
 
-Snapshot v6 records every living field, death time/cause, materialization time, food/water ledger, and canonical due index. Restore reconstructs cell membership and reverse indexes and rejects bad ranges, future timestamps, dead due entries, missing live cold entries, noncanonical order, conservation failures, and trailing bytes. Sources equal carried plus consumed plus explicit losses.
+Snapshot v6 records every living field, death time/cause, materialization time, food/water ledger, and canonical due index. Restore recomputes the exact next boundary and rejects altered, stale, duplicate, hot, dead, or impossible entries, conflicting health projections, bad ranges, future/death timestamps, noncanonical order, checked-ledger failures, and trailing bytes. Sources equal carried plus consumed plus explicit losses. `u64::MAX` is a closed terminal instant: a zero-delta advance is a no-op and an alive cold entity at that instant has no representable future due entry.
 
 ## Limitations
 

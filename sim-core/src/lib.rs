@@ -362,6 +362,7 @@ pub enum SimError {
     UnknownScheduledCommand,
     Snapshot(&'static str),
     DeadEntity,
+    InvalidHealth,
 }
 impl fmt::Display for SimError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -479,6 +480,15 @@ impl World {
         {
             return Ok(());
         }
+        if let Some(at) = self.canonical_due(id)? {
+            self.living_due.entry(at).or_default().insert(id);
+            self.due_by_entity.insert(id, at);
+        }
+        Ok(())
+    }
+    /// `None` means that the entity is alive at the terminal instant and no
+    /// representable future transition exists. Time is closed at `u64::MAX`.
+    fn canonical_due(&self, id: EntityId) -> Result<Option<u64>, SimError> {
         let l = self.soldiers.living[id.index()];
         let inv = self.soldiers.data[id.index()].inventory;
         let (_, hr, tr, _) = Self::rates(l.activity);
@@ -501,17 +511,13 @@ impl World {
         if l.activity == Activity::March && l.fatigue < FORCED_IDLE_FATIGUE {
             d = d.min(ceil(FORCED_IDLE_FATIGUE - l.fatigue, 3));
         }
-        let at = l
-            .materialized_at
-            .checked_add(d)
-            .ok_or(SimError::ArithmeticOverflow)?;
-        self.living_due.entry(at).or_default().insert(id);
-        self.due_by_entity.insert(id, at);
-        Ok(())
+        Ok(l.materialized_at.checked_add(d))
     }
     fn analytical(&mut self, id: EntityId, to: u64) -> Result<(), SimError> {
         let i = id.index();
-        let l = &mut self.soldiers.living[i];
+        Self::project(&mut self.soldiers.living[i], to)
+    }
+    fn project(l: &mut LivingState, to: u64) -> Result<(), SimError> {
         let n = to
             .checked_sub(l.materialized_at)
             .ok_or(SimError::TimeReversal)?;
@@ -569,13 +575,19 @@ impl World {
             inv.food -= FOOD_RATION;
             food = FOOD_RATION;
             l.hunger -= RATION_THRESHOLD;
-            self.consumed_food += 1;
+            self.consumed_food = self
+                .consumed_food
+                .checked_add(1)
+                .ok_or(SimError::ArithmeticOverflow)?;
         }
         if l.thirst >= RATION_THRESHOLD && inv.water > 0 {
             inv.water -= WATER_RATION;
             water = WATER_RATION;
             l.thirst -= RATION_THRESHOLD;
-            self.consumed_water += 1;
+            self.consumed_water = self
+                .consumed_water
+                .checked_add(1)
+                .ok_or(SimError::ArithmeticOverflow)?;
         }
         if food != 0 || water != 0 {
             out.push(TimedEvent {
@@ -644,6 +656,7 @@ impl World {
             }
         }
         self.soldiers.living[i] = l;
+        self.soldiers.data[i].health = l.health;
         Ok(())
     }
     fn advance_cold_to(&mut self, t: u64, out: &mut Vec<TimedEvent>) -> Result<(), SimError> {
@@ -663,12 +676,6 @@ impl World {
                         .ok_or(SimError::ArithmeticOverflow)?;
                     self.schedule_due(id)?;
                 }
-            }
-        }
-        let ids: Vec<_> = self.due_by_entity.keys().copied().collect();
-        for id in ids {
-            if self.soldiers.valid(id) {
-                self.analytical(id, t)?;
             }
         }
         Ok(())
@@ -723,6 +730,10 @@ impl World {
         }
         let i = id.index();
         let s = self.soldiers.data[i];
+        let mut living = self.soldiers.living[i];
+        if living.life == LifeState::Alive {
+            Self::project(&mut living, self.clock).ok()?;
+        }
         Some(Soldier {
             id,
             faction: s.faction,
@@ -730,23 +741,35 @@ impl World {
             squad: s.squad,
             role: s.role,
             rank: s.rank,
-            health: s.health,
+            health: living.health,
             needs: Needs {
-                fatigue: self.soldiers.living[i].fatigue,
-                hunger: self.soldiers.living[i].hunger,
-                thirst: self.soldiers.living[i].thirst,
-                sleep_debt: self.soldiers.living[i].sleep_debt,
+                fatigue: living.fatigue,
+                hunger: living.hunger,
+                thirst: living.thirst,
+                sleep_debt: living.sleep_debt,
             },
             ammunition: s.ammunition,
             inventory: s.inventory,
-            living: self.soldiers.living[i],
+            living,
         })
     }
     pub fn apply(&mut self, c: Command) -> ApplyOutcome {
         let mut events = Vec::new();
         let mut blocked = None;
         let error = match c {
-            Command::AdvanceTo { target } => self.advance(target, &mut events, &mut blocked),
+            Command::AdvanceTo { target } => {
+                let mut staged = self.clone();
+                match staged.advance(target, &mut events, &mut blocked) {
+                    Ok(()) => {
+                        *self = staged;
+                        Ok(())
+                    }
+                    Err(error) => {
+                        events.clear();
+                        Err(error)
+                    }
+                }
+            }
             _ => self.apply_one(c).map(|e| {
                 events.push(TimedEvent {
                     at: self.clock,
@@ -765,14 +788,32 @@ impl World {
     fn apply_one(&mut self, c: Command) -> Result<Event, SimError> {
         match c {
             Command::SpawnSoldier { spec } => {
+                if spec.health == 0 || spec.health > 1000 {
+                    return Err(SimError::InvalidHealth);
+                }
                 if let Some(s) = spec.squad {
                     if !self.squads.contains_key(&s) {
                         return Err(SimError::InvalidSquad);
                     }
                 }
+                let new_food = self
+                    .sourced_food
+                    .checked_add(u128::from(spec.inventory.food))
+                    .ok_or(SimError::ArithmeticOverflow)?;
+                let new_water = self
+                    .sourced_water
+                    .checked_add(u128::from(spec.inventory.water))
+                    .ok_or(SimError::ArithmeticOverflow)?;
+                // A cold spawn must have either a representable first boundary
+                // or be at the terminal instant, where no future instant exists.
+                if !self.hot_cells.contains_key(&spec.position.cell) && self.clock != u64::MAX {
+                    self.clock
+                        .checked_add(1)
+                        .ok_or(SimError::ArithmeticOverflow)?;
+                }
                 let id = self.soldiers.spawn(spec, self.clock);
-                self.sourced_food += u128::from(spec.inventory.food);
-                self.sourced_water += u128::from(spec.inventory.water);
+                self.sourced_food = new_food;
+                self.sourced_water = new_water;
                 self.cell_members
                     .entry(spec.position.cell)
                     .or_default()
@@ -793,6 +834,14 @@ impl World {
                     .get(id.index())
                     .filter(|_| self.soldiers.valid(id))
                     .ok_or(SimError::InvalidEntity)?;
+                let lost_food = self
+                    .lost_food
+                    .checked_add(u128::from(spec.inventory.food))
+                    .ok_or(SimError::ArithmeticOverflow)?;
+                let lost_water = self
+                    .lost_water
+                    .checked_add(u128::from(spec.inventory.water))
+                    .ok_or(SimError::ArithmeticOverflow)?;
                 if let Some(s) = spec.squad {
                     let q = self.squads.get_mut(&s).expect("valid relationship");
                     q.members.remove(&id);
@@ -804,8 +853,8 @@ impl World {
                 if let Some(members) = self.cell_members.get_mut(&spec.position.cell) {
                     members.remove(&id);
                 }
-                self.lost_food += u128::from(spec.inventory.food);
-                self.lost_water += u128::from(spec.inventory.water);
+                self.lost_food = lost_food;
+                self.lost_water = lost_water;
                 self.soldiers.remove(id);
                 Ok(Event::SoldierRemoved {
                     id,
@@ -867,7 +916,10 @@ impl World {
                 supplies,
             }),
             Command::SetRegionHot { cell, hot } => {
-                self.apply_scheduled(ScheduledCommand::SetRegionHot { cell, hot })
+                let mut staged = self.clone();
+                let event = staged.apply_scheduled(ScheduledCommand::SetRegionHot { cell, hot })?;
+                *self = staged;
+                Ok(event)
             }
             Command::Schedule { at, command } => {
                 if at < self.clock {
@@ -919,9 +971,21 @@ impl World {
                 if self.soldiers.living[id.index()].life != LifeState::Alive {
                     return Err(SimError::DeadEntity);
                 }
-                let before = self.soldiers.living[id.index()].activity;
-                self.soldiers.living[id.index()].activity = activity;
-                self.schedule_due(id)?;
+                let old = self.soldiers.living[id.index()];
+                let before = old.activity;
+                let mut replacement = old;
+                Self::project(&mut replacement, self.clock)?;
+                replacement.activity = activity;
+                self.soldiers.living[id.index()] = replacement;
+                let due = self.canonical_due(id);
+                self.soldiers.living[id.index()] = old;
+                let due = due?;
+                self.unschedule_due(id);
+                self.soldiers.living[id.index()] = replacement;
+                if let Some(at) = due {
+                    self.living_due.entry(at).or_default().insert(id);
+                    self.due_by_entity.insert(id, at);
+                }
                 Ok(Event::ActivityChanged {
                     id,
                     before,
@@ -1036,11 +1100,37 @@ impl World {
         }
     }
     fn step_hot_to(&mut self, t: u64, out: &mut Vec<TimedEvent>) -> Result<(u64, u64), SimError> {
+        let mut required = 0_u64;
         for h in self.hot_cells.values() {
+            let elapsed = t
+                .checked_sub(h.last_stepped_at)
+                .ok_or(SimError::TimeReversal)?;
             h.fixed_steps
-                .checked_add(t - h.last_stepped_at)
+                .checked_add(elapsed)
                 .ok_or(SimError::ArithmeticOverflow)?;
         }
+        for (cell, h) in &self.hot_cells {
+            let alive = self
+                .cell_members
+                .get(cell)
+                .into_iter()
+                .flat_map(|x| x.iter())
+                .filter(|id| {
+                    self.soldiers.valid(**id)
+                        && self.soldiers.living[id.index()].life == LifeState::Alive
+                })
+                .count() as u64;
+            required = required
+                .checked_add(
+                    alive
+                        .checked_mul(t - h.last_stepped_at)
+                        .ok_or(SimError::ArithmeticOverflow)?,
+                )
+                .ok_or(SimError::ArithmeticOverflow)?;
+        }
+        self.hot_member_steps
+            .checked_add(required)
+            .ok_or(SimError::ArithmeticOverflow)?;
         let cells: Vec<_> = self.hot_cells.keys().copied().collect();
         for cell in cells {
             let start = self.hot_cells[&cell].last_stepped_at;
@@ -1051,10 +1141,12 @@ impl World {
                 .flat_map(|x| x.iter())
                 .copied()
                 .collect();
-            if !members.is_empty() {
-                for at in start + 1..=t {
+            if start < t && !members.is_empty() {
+                for at in start.checked_add(1).ok_or(SimError::ArithmeticOverflow)?..=t {
                     for id in &members {
-                        if self.soldiers.valid(*id) {
+                        if self.soldiers.valid(*id)
+                            && self.soldiers.living[id.index()].life == LifeState::Alive
+                        {
                             self.reference_second(*id, at, out)?;
                             self.hot_member_steps = self
                                 .hot_member_steps
@@ -1088,8 +1180,10 @@ impl World {
         let times: Vec<_> = self.scheduled.range(..=target).map(|(t, _)| *t).collect();
         for t in times {
             let from = self.clock;
+            let event_start = out.len();
             self.advance_cold_to(t, out)?;
             let (hot_cells_stepped, fixed_steps_per_hot_cell) = self.step_hot_to(t, out)?;
+            Self::order_automatic(&mut out[event_start..]);
             self.clock = t;
             if t != from {
                 out.push(TimedEvent {
@@ -1123,8 +1217,10 @@ impl World {
             }
         }
         let from = self.clock;
+        let event_start = out.len();
         self.advance_cold_to(target, out)?;
         let (hot_cells_stepped, fixed_steps_per_hot_cell) = self.step_hot_to(target, out)?;
+        Self::order_automatic(&mut out[event_start..]);
         self.clock = target;
         if target != from {
             out.push(TimedEvent {
@@ -1139,6 +1235,18 @@ impl World {
         }
         Ok(())
     }
+    fn order_automatic(events: &mut [TimedEvent]) {
+        fn id(event: &Event) -> u64 {
+            match *event {
+                Event::ActivityChanged { id, .. }
+                | Event::RationConsumed { id, .. }
+                | Event::LivingDeteriorated { id, .. }
+                | Event::SoldierDied { id, .. } => id.raw(),
+                _ => u64::MAX,
+            }
+        }
+        events.sort_by_key(|event| (event.at, id(&event.event)));
+    }
     pub fn state_digest(&self) -> u64 {
         fnv1a(&self.snapshot())
     }
@@ -1147,16 +1255,15 @@ impl World {
         for i in 0..self.soldiers.alive.len() {
             if self.soldiers.alive[i] {
                 let id = EntityId::from_parts(i as u32, self.soldiers.generation[i]);
-                let n = self.soldiers.living[i];
-                for b in id
-                    .raw()
-                    .to_le_bytes()
-                    .into_iter()
-                    .chain(n.fatigue.to_le_bytes())
-                    .chain(n.hunger.to_le_bytes())
-                    .chain(n.thirst.to_le_bytes())
-                    .chain(n.sleep_debt.to_le_bytes())
-                {
+                let soldier = self.soldier(id).expect("allocated soldier");
+                let mut bytes = W::default();
+                bytes.u64(id.raw());
+                bytes.living(soldier.living);
+                bytes.u32(soldier.inventory.food);
+                bytes.u32(soldier.inventory.water);
+                bytes.u32(soldier.inventory.medical);
+                bytes.u16(soldier.health);
+                for b in bytes.0 {
                     h = (h ^ u64::from(b)).wrapping_mul(0x100000001b3)
                 }
             }
@@ -1523,9 +1630,11 @@ impl World {
         }
         for i in 0..self.soldiers.alive.len() {
             if self.soldiers.alive[i] {
-                if self.soldiers.living[i].materialized_at > self.clock
-                    || (self.soldiers.living[i].life == LifeState::Alive
-                        && self.soldiers.living[i].materialized_at != self.clock)
+                let living = self.soldiers.living[i];
+                if living.materialized_at > self.clock
+                    || self.soldiers.data[i].health != living.health
+                    || (living.life == LifeState::Alive && living.health == 0)
+                    || matches!(living.life, LifeState::Dead { at, .. } if at != living.materialized_at || at > self.clock || living.health != 0)
                 {
                     return Err(SimError::Snapshot("living timestamp"));
                 }
@@ -1538,8 +1647,15 @@ impl World {
             }
         }
         let carried = self.resource_totals();
-        if self.sourced_food != carried.carried_food + self.consumed_food + self.lost_food
-            || self.sourced_water != carried.carried_water + self.consumed_water + self.lost_water
+        let accounted_food = carried
+            .carried_food
+            .checked_add(self.consumed_food)
+            .and_then(|x| x.checked_add(self.lost_food));
+        let accounted_water = carried
+            .carried_water
+            .checked_add(self.consumed_water)
+            .and_then(|x| x.checked_add(self.lost_water));
+        if Some(self.sourced_food) != accounted_food || Some(self.sourced_water) != accounted_water
         {
             return Err(SimError::Snapshot("resource ledger"));
         }
@@ -1559,7 +1675,12 @@ impl World {
                     .hot_cells
                     .contains_key(&self.soldiers.data[i].position.cell);
                 let alive = self.soldiers.living[i].life == LifeState::Alive;
-                if self.due_by_entity.contains_key(&id) != (alive && !hot) {
+                let expected = if alive && !hot {
+                    self.canonical_due(id)?
+                } else {
+                    None
+                };
+                if self.due_by_entity.get(&id).copied() != expected {
                     return Err(SimError::Snapshot("living due coverage"));
                 }
             }
@@ -1835,6 +1956,204 @@ impl R<'_> {
 #[cfg(test)]
 mod private_invariants {
     use super::*;
+
+    fn spawn(world: &mut World, spec: SoldierSpec) -> EntityId {
+        match world.apply(Command::SpawnSoldier { spec }).events[0].event {
+            Event::SoldierSpawned { id, .. } => id,
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn health_is_one_projection_and_impossible_health_is_rejected() {
+        let mut world = World::new(0);
+        assert_eq!(
+            world
+                .apply(Command::SpawnSoldier {
+                    spec: SoldierSpec {
+                        health: 0,
+                        ..SoldierSpec::default()
+                    }
+                })
+                .error,
+            Some(SimError::InvalidHealth)
+        );
+        let id = spawn(
+            &mut world,
+            SoldierSpec {
+                health: 10,
+                inventory: Inventory::default(),
+                ..SoldierSpec::default()
+            },
+        );
+        world.soldiers.living[id.index()].hunger = SEVERE_HUNGER;
+        world.soldiers.living[id.index()].thirst = SEVERE_THIRST;
+        world.schedule_due(id).unwrap();
+        assert!(world
+            .apply(Command::AdvanceTo { target: 1 })
+            .error
+            .is_none());
+        let soldier = world.soldier(id).unwrap();
+        assert_eq!(soldier.health, soldier.living.health);
+        assert!(matches!(
+            soldier.living.life,
+            LifeState::Dead {
+                at: 1,
+                cause: DeathCause::Dehydration
+            }
+        ));
+        let mut corrupt = world.clone();
+        corrupt.soldiers.data[id.index()].health = 1;
+        assert!(World::from_snapshot(&corrupt.snapshot()).is_err());
+        corrupt = world.clone();
+        corrupt.soldiers.living[id.index()].life = LifeState::Alive;
+        assert!(World::from_snapshot(&corrupt.snapshot()).is_err());
+    }
+
+    #[test]
+    fn canonical_due_sparse_queries_and_corruption_are_proven() {
+        let mut world = World::new(0);
+        let id = spawn(
+            &mut world,
+            SoldierSpec {
+                inventory: Inventory {
+                    food: 3,
+                    water: 3,
+                    medical: 7,
+                },
+                ..SoldierSpec::default()
+            },
+        );
+        for at in 1..200 {
+            world.apply(Command::Schedule {
+                at,
+                command: ScheduledCommand::SetRegionHot {
+                    cell: at as u32 + 10,
+                    hot: true,
+                },
+            });
+        }
+        let before = world.snapshot();
+        assert_eq!(world.soldier(id).unwrap().living.materialized_at, 0);
+        assert_eq!(world.snapshot(), before);
+        world.apply(Command::AdvanceTo { target: 49 });
+        assert_eq!(world.living_work_counters().0, 0);
+        assert_eq!(world.soldier(id).unwrap().living.hunger, 49);
+        let mut corrupt = world.clone();
+        let due = corrupt.due_by_entity[&id];
+        corrupt.living_due.get_mut(&due).unwrap().remove(&id);
+        corrupt.living_due.entry(due + 1).or_default().insert(id);
+        corrupt.due_by_entity.insert(id, due + 1);
+        assert!(World::from_snapshot(&corrupt.snapshot()).is_err());
+    }
+
+    #[test]
+    fn terminal_time_and_all_authoritative_overflows_are_atomic() {
+        let mut world = World::new(0);
+        world.clock = u64::MAX;
+        world.sourced_food = u128::MAX;
+        let digest = world.state_digest();
+        assert_eq!(
+            world
+                .apply(Command::SpawnSoldier {
+                    spec: SoldierSpec {
+                        inventory: Inventory {
+                            food: 1,
+                            ..Inventory::default()
+                        },
+                        ..SoldierSpec::default()
+                    }
+                })
+                .error,
+            Some(SimError::ArithmeticOverflow)
+        );
+        assert_eq!(world.state_digest(), digest);
+        world.sourced_food = 0;
+        world.hot_cells.insert(
+            1,
+            HotCellState {
+                activated_at: u64::MAX,
+                last_stepped_at: u64::MAX,
+                fixed_steps: 0,
+            },
+        );
+        let id = spawn(
+            &mut world,
+            SoldierSpec {
+                position: Position {
+                    cell: 1,
+                    ..Position::default()
+                },
+                ..SoldierSpec::default()
+            },
+        );
+        assert!(world
+            .apply(Command::AdvanceTo { target: u64::MAX })
+            .error
+            .is_none());
+        assert_eq!(world.soldier(id).unwrap().living.materialized_at, u64::MAX);
+        world.hot_member_steps = u64::MAX;
+        let digest = world.state_digest();
+        assert_eq!(
+            world.apply(Command::AdvanceTo { target: u64::MAX }).error,
+            None
+        );
+        assert_eq!(world.state_digest(), digest);
+    }
+
+    #[test]
+    fn automatic_events_are_globally_entity_ordered_and_dead_hot_members_are_not_work() {
+        let mut world = World::new(0);
+        let hot = spawn(
+            &mut world,
+            SoldierSpec {
+                position: Position {
+                    cell: 1,
+                    ..Position::default()
+                },
+                inventory: Inventory {
+                    food: 1,
+                    water: 1,
+                    medical: 0,
+                },
+                ..SoldierSpec::default()
+            },
+        );
+        let cold = spawn(
+            &mut world,
+            SoldierSpec {
+                position: Position {
+                    cell: 2,
+                    ..Position::default()
+                },
+                inventory: Inventory {
+                    food: 1,
+                    water: 1,
+                    medical: 0,
+                },
+                ..SoldierSpec::default()
+            },
+        );
+        world.apply(Command::SetRegionHot { cell: 1, hot: true });
+        let events = world.apply(Command::AdvanceTo { target: 100 }).events;
+        let ration_ids: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e.event {
+                Event::RationConsumed { id, .. } => Some(id),
+                _ => None,
+            })
+            .collect();
+        assert!(ration_ids.chunks(2).all(|ids| ids == [hot, cold]));
+        world.soldiers.living[hot.index()].life = LifeState::Dead {
+            at: 100,
+            cause: DeathCause::Starvation,
+        };
+        world.soldiers.living[hot.index()].health = 0;
+        world.soldiers.data[hot.index()].health = 0;
+        let steps = world.hot_member_steps;
+        world.apply(Command::AdvanceTo { target: 101 });
+        assert_eq!(world.hot_member_steps, steps);
+    }
 
     #[test]
     fn generation_exhaustion_retires_slot_permanently() {

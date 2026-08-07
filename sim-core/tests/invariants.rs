@@ -181,16 +181,10 @@ fn dense_failure_returns_prefix_and_retains_exact_suffix() {
         );
     }
     let o = w.apply(Command::AdvanceTo { target: 10 });
-    assert_eq!(
-        o.events
-            .iter()
-            .filter(|event| matches!(event.event, Event::RegionFidelityChanged { .. }))
-            .count(),
-        1000
-    );
+    assert!(o.events.is_empty());
     assert_eq!(o.error, Some(SimError::InsufficientStock));
-    assert_eq!(o.clock, 7);
-    assert_eq!(w.hot_cell_count(), 1000);
+    assert_eq!(o.clock, 0);
+    assert_eq!(w.hot_cell_count(), 0);
     let snap = w.snapshot();
     let mut restored = World::from_snapshot(&snap).unwrap();
     assert!(matches!(
@@ -206,7 +200,7 @@ fn dense_failure_returns_prefix_and_retains_exact_suffix() {
             .iter()
             .filter(|event| matches!(event.event, Event::RegionFidelityChanged { .. }))
             .count(),
-        1000
+        2000
     );
     assert_eq!(w.state_digest(), restored.state_digest())
 }
@@ -396,14 +390,8 @@ fn time_advanced_reports_exact_segment_hot_work() {
     );
     let partial = world.apply(Command::AdvanceTo { target: 20 });
     assert_eq!(partial.error, Some(SimError::InsufficientStock));
-    assert!(matches!(
-        partial.events[0].event,
-        Event::TimeAdvanced {
-            hot_cells_stepped: 2,
-            fixed_steps_per_hot_cell: 3,
-            ..
-        }
-    ));
+    assert!(partial.events.is_empty());
+    assert_eq!(world.clock(), 9);
     assert!(world
         .apply(Command::AdvanceTo { target: 12 })
         .events
