@@ -2,7 +2,7 @@
 
 Tracking issue: #3  
 Parent roadmap: #2  
-Required starting commit: `ff9bd2dfeb91305cc90bd5dc5b05886b28cf97ce`
+M0 base commit: `ff9bd2dfeb91305cc90bd5dc5b05886b28cf97ce`
 
 ## Objective
 
@@ -32,7 +32,7 @@ Define and document compact public types equivalent to:
 
 You may choose exact names, units, and balanced constants, but the rules must be simple, documented, deterministic, and exercised at every boundary. Food and water must actually be removed from each soldier's carried inventory when consumed. Rest must actually reduce fatigue/sleep debt. Severe unmet needs must cause observable deterioration and eventually death. Dead soldiers cannot eat, drink, recover, march, or produce repeated death events.
 
-Add an authoritative command for changing a living soldier's activity. Reject invalid/dead targets atomically and emit a complete typed event. Automatic consumption, forced activity changes, deterioration, morale/health changes, and death must emit typed events containing the affected `EntityId) and exact before/after or delta data needed for auditing.
+Add an authoritative command for changing a living soldier's activity. Reject invalid/dead targets atomically and emit a complete typed event. Automatic consumption, forced activity changes, deterioration, morale/health changes, and death must emit typed events containing the affected `EntityId` and exact before/after or delta data needed for auditing.
 
 ### One-second reference and sparse cold advancement
 
@@ -43,7 +43,7 @@ Implement one canonical one-second living transition and a sparse/event-driven c
 - Its work must be bounded by actual state-transition boundaries (ration consumption, threshold crossing, activity change, damage/death, etc.), not raw elapsed duration.
 - Maintain a deterministic due-transition index (or a rigorously equivalent structure) so `AdvanceTo(T)` executes every world-affecting transition due by T without scanning all cold soldiers every second and without leaving overdue deaths or consumption latent until query.
 - Maintain a reverse due-time entry per live soldier. Spawn, explicit removal, activity change, inventory-changing interaction, fidelity transition, and restore must update the index without stale/duplicate entries.
-- At a timestamp shared by automatic living transitions and scheduled commands, preserve M0's segment semantics: complete living work through T first, ordered by stable `EntityId), then execute scheduled commands at T in schedule-ID order. Document and test this rule.
+- At a timestamp shared by automatic living transitions and scheduled commands, preserve M0's segment semantics: complete living work through T first, ordered by stable `EntityId`, then execute scheduled commands at T in schedule-ID order. Document and test this rule.
 - Very large cold time advances must terminate in work proportional to actual boundaries and must not overflow or silently wrap.
 
 ### Hot cells and cell membership
@@ -51,7 +51,7 @@ Implement one canonical one-second living transition and a sparse/event-driven c
 The current hot-cell counter is not sufficient.
 
 - Maintain an authoritative cell-membership index kept consistent on spawn and explicit removal. Do not find hot members by scanning every soldier.
-- Each elapsed hot-cell second executes the one-second reference living transition for each actual living member in stable `EntityId) order.
+- Each elapsed hot-cell second executes the one-second reference living transition for each actual living member in stable `EntityId` order.
 - Prevent double advancement: a soldier is advanced by either the hot stepped path or cold due-transition path for a segment, never both.
 - On cold→hot and hot→cold boundaries, materialize exact state at the boundary and preserve all fields, inventory, life state, due scheduling, and identity.
 - Retain the useful hot-cell counters/telemetry, but they are no longer the claimed work.
