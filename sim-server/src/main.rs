@@ -53,14 +53,31 @@ fn benchmark() -> Result<(), Box<dyn std::error::Error>> {
         })?;
     }
     let init = start.elapsed();
-    w.set_stockpile(
+    w.create_stockpile(
         1,
         Stock {
             ammunition: count as u64 * 30,
             supplies: count as u64 * 2,
         },
-    );
-    w.set_stockpile(2, Stock::default());
+    )
+    .unwrap();
+    w.create_stockpile(2, Stock::default()).unwrap();
+    let dense_count: usize = env::var("PA_DENSE_COMMANDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(100_000);
+    for cell in 0..dense_count {
+        w.schedule(
+            20,
+            WorldCommand::SetRegionHot {
+                cell: cell as u32,
+                hot: true,
+            },
+        )?;
+    }
+    let dense_start = Instant::now();
+    w.advance_to(20)?;
+    let dense_scheduler = dense_start.elapsed();
     w.schedule(
         30,
         WorldCommand::Transfer {
@@ -70,9 +87,9 @@ fn benchmark() -> Result<(), Box<dyn std::error::Error>> {
             supplies: 500,
         },
     )?;
-    let advance = Instant::now();
+    let sparse_start = Instant::now();
     w.advance_to(60)?;
-    let sparse_advance = advance.elapsed();
+    let sparse_scheduler = sparse_start.elapsed();
     let needs_start = Instant::now();
     let needs_checksum = w.needs_checksum();
     let needs_pass = needs_start.elapsed();
@@ -83,7 +100,7 @@ fn benchmark() -> Result<(), Box<dyn std::error::Error>> {
     let digest = w.state_digest();
     let digest_time = digest_start.elapsed();
     let (rss, peak_rss) = memory_kib();
-    println!("soldiers={count}\ninitialization_seconds={:.6}\nsparse_scheduler_advance_seconds={:.6}\nneeds_full_pass_seconds={:.6}\nneeds_checksum={needs_checksum:016x}\nsnapshot_seconds={:.6}\nsnapshot_bytes={}\ndigest_seconds={:.6}\ndigest={digest:016x}\ncurrent_rss_kib={rss}\npeak_rss_kib={peak_rss}", init.as_secs_f64(), sparse_advance.as_secs_f64(), needs_pass.as_secs_f64(), snapshot_time.as_secs_f64(), snapshot.len(), digest_time.as_secs_f64());
+    println!("soldiers={count}\ninitialization_seconds={:.6}\ndense_scheduler_commands={dense_count}\ndense_scheduler_seconds={:.6}\nsparse_scheduler_advance_seconds={:.6}\nneeds_full_pass_seconds={:.6}\nneeds_checksum={needs_checksum:016x}\nsnapshot_seconds={:.6}\nsnapshot_bytes={}\ndigest_seconds={:.6}\ndigest={digest:016x}\ncurrent_rss_kib={rss}\npeak_rss_kib={peak_rss}", init.as_secs_f64(), dense_scheduler.as_secs_f64(), sparse_scheduler.as_secs_f64(), needs_pass.as_secs_f64(), snapshot_time.as_secs_f64(), snapshot.len(), digest_time.as_secs_f64());
     Ok(())
 }
 fn memory_kib() -> (u64, u64) {

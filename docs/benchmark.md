@@ -7,32 +7,34 @@ Measured on 2026-08-07 from this change's working tree. The full command and out
 ```text
 $ time cargo run --release -p sim-server -- --benchmark
 soldiers=2410000
-initialization_seconds=0.855468
-sparse_scheduler_advance_seconds=0.000005
-needs_full_pass_seconds=0.043325
-needs_checksum=d3e48bb593d02e40
-snapshot_seconds=1.003688
-snapshot_bytes=161470100
-digest_seconds=1.253976
-digest=d3f107a8f849764a
-current_rss_kib=327228
-peak_rss_kib=484760
+initialization_seconds=0.913441
+dense_scheduler_commands=100000
+dense_scheduler_seconds=0.017802
+sparse_scheduler_advance_seconds=0.000003
+needs_full_pass_seconds=0.172850
+needs_checksum=3399153494c8c265
+snapshot_seconds=0.975316
+snapshot_bytes=154640092
+digest_seconds=1.274194
+digest=724c4c221796dc90
+current_rss_kib=325760
+peak_rss_kib=476504
 
-real    0m3.241s
-user    0m1.394s
-sys     0m1.844s
+real    0m3.455s
+user    0m1.552s
+sys     0m1.898s
 ```
 
-Initialization creates 2,410,000 individually addressable authoritative records. The sparse scheduler measurement advances to second 60 and processes one transfer; it is **not** described as million-soldier simulation throughput. The separately timed complete needs pass visits every live record and materializes/checks derived needs into the reported deterministic checksum. Snapshot creation and digest computation each scan authoritative state. Current RSS (`VmRSS`) and peak RSS (`VmHWM`) come from `/proc/self/status` after these phases; allocations freed or retained by the allocator and transient snapshot/digest buffers affect them.
+Initialization creates 2,410,000 individually addressable authoritative records. The dense scheduler phase executes 100,000 `SetRegionHot` commands queued at one timestamp; the separately reported sparse phase advances to second 60 and processes one transfer. Neither is described as million-soldier simulation throughput. The separately timed complete needs pass visits every live record and hashes each ID and field's unambiguous bytes. Snapshot creation and digest computation each scan authoritative state. Current RSS (`VmRSS`) and peak RSS (`VmHWM`) come from `/proc/self/status` after these phases; allocations freed or retained by the allocator and transient snapshot/digest buffers affect them.
 
 ## Reproduction and CI
 
 ```sh
 cargo run --release -p sim-server -- --benchmark
-PA_SOLDIERS=10000 cargo run --release -p sim-server -- --benchmark
+PA_SOLDIERS=10000 PA_DENSE_COMMANDS=1000 cargo run --release -p sim-server -- --benchmark
 ```
 
-The first command is the manual full benchmark. CI uses the second bounded smoke workload. `PA_SOLDIERS` changes record count, so checksums, snapshot size, memory, and timings differ.
+The first command is the manual full benchmark, including at least 100,000 dense commands. CI uses the second bounded smoke workload. The environment variables change work size, so checksums, snapshot size, memory, and timings differ. Unit tests assert state and order, never wall time.
 
 ## Environment and limitations
 

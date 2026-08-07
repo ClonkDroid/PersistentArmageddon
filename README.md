@@ -1,6 +1,6 @@
 # Persistent Armageddon deterministic kernel (M0)
 
-This Rust workspace implements **M0 kernel behavior**: one authoritative record per soldier ID, a monotonic clock, deterministic schedulable world commands, conserved stock transfers, integer derived needs, relationship integrity, and versioned validated snapshots. It is not a living-world or combat simulation.
+This Rust workspace implements **M0 kernel behavior**: one authoritative record per soldier ID, a monotonic linear-time scheduler, explicit stockpile source events and conserved transfers, integer derived needs, relationship integrity, and versioned validated snapshots. It is not a living-world or combat simulation.
 
 ## Architecture
 
@@ -9,6 +9,8 @@ This Rust workspace implements **M0 kernel behavior**: one authoritative record 
 - `sim-wasm`: dependency-free adapter suitable for the optional WASM target.
 
 Only `Role::Officer` soldiers may be assigned as officers. A soldier has at most one squad; reassignment removes the old squad's membership and officer pointer. Scheduled commands exclude time advancement at the Rust type level. When scheduled work fails, the clock remains at that event time and the failing and unattempted commands remain pending for explicit operator correction/recovery.
+
+Stockpiles can only be introduced with `CreateStockpile`, which emits `StockpileCreated` and rejects duplicate IDs atomically. There is no arbitrary resource setter or generic production/loss operation. Allocator slots whose generation reaches `u32::MAX` are retired permanently.
 
 ## Verification
 
@@ -20,7 +22,7 @@ cargo build --workspace --release
 cargo run --release -p sim-server -- --benchmark
 ```
 
-`PA_SOLDIERS` bounds the benchmark for CI; its manual default is 2,410,000. See [benchmark evidence](docs/benchmark.md) and [ADR 0001](docs/adr/0001-authoritative-state-and-lod.md).
+`PA_SOLDIERS` and `PA_DENSE_COMMANDS` bound the benchmark for CI; their manual defaults are 2,410,000 records and 100,000 same-timestamp commands. See [benchmark evidence](docs/benchmark.md) and [ADR 0001](docs/adr/0001-authoritative-state-and-lod.md).
 
 ## Not implemented (M1 and later)
 

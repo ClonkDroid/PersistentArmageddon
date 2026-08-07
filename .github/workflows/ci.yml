@@ -12,4 +12,4 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
       - run: cargo build --workspace --release
-      - run: PA_SOLDIERS=10000 cargo run --release -p sim-server -- --benchmark
+      - run: PA_SOLDIERS=10000 PA_DENSE_COMMANDS=1000 cargo run --release -p sim-server -- --benchmark
