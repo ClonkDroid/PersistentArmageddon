@@ -1,16 +1,16 @@
-# Persistent Armageddon simulation foundation
+# Persistent Armageddon deterministic kernel (M0)
 
-This workspace implements deterministic, headless simulation truth for individually addressable soldiers. It is a foundation—not a claim of complete warfare fidelity.
+This Rust workspace implements **M0 kernel behavior**: one authoritative record per soldier ID, a monotonic clock, deterministic schedulable world commands, conserved stock transfers, integer derived needs, relationship integrity, and versioned validated snapshots. It is not a living-world or combat simulation.
 
 ## Architecture
 
-- **`sim-core`** owns the monotonic `u64` clock, generational IDs, structure-of-arrays soldier data, explicit squads/officers, integer needs, deterministic random values, conserved stock transfers, ordered events, versioned snapshots, and replay digests.
-- **`sim-server`** exposes `GET /health` and `GET /snapshot` on `127.0.0.1:8080`. Its `--benchmark` scenario creates persistent soldiers and runs scheduled logistics for 60 simulation seconds.
-- **`sim-wasm`** is a dependency-free adapter that can compile for `wasm32-unknown-unknown` when the target is installed.
+- `sim-core`: generational IDs, structure-of-arrays records, squads/officers, logistics ledger, ordered scheduler, snapshots/replay digests, and lazy needs.
+- `sim-server`: minimal `GET /health` and `GET /snapshot` boundary plus the manual benchmark.
+- `sim-wasm`: dependency-free adapter suitable for the optional WASM target.
 
-Cold soldiers are not scanned per frame or simulation second. Need rates are materialized from a stored base and timestamp only when queried. The timing queue visits due events in stable time/insertion order. Hot cells are marked for a future tactical fixed-step path while retaining the same authoritative records. See [ADR 0001](docs/adr/0001-authoritative-state-and-lod.md).
+Only `Role::Officer` soldiers may be assigned as officers. A soldier has at most one squad; reassignment removes the old squad's membership and officer pointer. Scheduled commands exclude time advancement at the Rust type level. When scheduled work fails, the clock remains at that event time and the failing and unattempted commands remain pending for explicit operator correction/recovery.
 
-## Build and verification
+## Verification
 
 ```sh
 cargo fmt --all -- --check
@@ -18,18 +18,10 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cargo build --workspace --release
 cargo run --release -p sim-server -- --benchmark
-# Optional, after rustup target add wasm32-unknown-unknown:
-cargo build -p sim-wasm --target wasm32-unknown-unknown
 ```
 
-Set `PA_SOLDIERS` to run a smaller diagnostic scenario. The default and acceptance scenario is exactly 2,410,000.
+`PA_SOLDIERS` bounds the benchmark for CI; its manual default is 2,410,000. See [benchmark evidence](docs/benchmark.md) and [ADR 0001](docs/adr/0001-authoritative-state-and-lod.md).
 
-## Benchmark evidence
+## Not implemented (M1 and later)
 
-Run details and measured output from the configured Codex environment are recorded in [`docs/benchmark.md`](docs/benchmark.md). “Throughput” measures this sparse 60-second scenario, not full tactical combat. The real-time design goal is only considered met for this implemented workload; richer combat requires fresh measurement.
-
-## Known limitations
-
-- Hot cells currently retain fidelity metadata but have no combat model.
-- The HTTP boundary is deliberately minimal and single-threaded; authentication, command transport, persistence, and networking prediction are future work.
-- Snapshot encoding is stable and auditable but not compressed.
+Combat, tactical fixed steps, living-world behavior, graphics, pathfinding, lore systems, authenticated networking, and persistence migrations are not implemented. Hot cells are metadata scaffolding only and must not be presented as a combat/LOD implementation.

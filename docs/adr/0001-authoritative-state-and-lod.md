@@ -15,3 +15,9 @@ Commands are applied serially against a monotonic clock. Ordered maps/sets, fixe
 ## Consequences
 
 Queries pay the small cost of materializing one soldier's needs. Global digests and snapshots intentionally scan live storage. The first snapshot format favors auditability over compression. Tactical combat, persistence migration, authenticated networking, and parallel execution require later ADRs without weakening single ownership.
+
+## M0 boundary and correctness details
+
+M0 implements deterministic kernel mechanisms, not M1 living-world behavior. Only `WorldCommand` values can be scheduled; external `Command::AdvanceTo` is excluded from the queue at the type level. A failed event remains queued with later work at that timestamp and leaves the clock at the failure time. Snapshot version 2 serializes free-list order, because its LIFO order is part of future ID allocation, and restore validates allocation, schedule, vector, squad, officer, and soldier back-reference invariants.
+
+Needs use `u64` elapsed seconds and saturate each public `u32` need at `u32::MAX`; therefore every `u64` timestamp, including `u64::MAX`, is supported without truncation or an iterative wakeup loop.

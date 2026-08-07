@@ -1,29 +1,40 @@
-# Release benchmark — Codex cloud environment
+# M0 release benchmark — Codex cloud environment
 
-## Reproduction
+## Full manual run
 
-Measured on 2026-08-07 from commit working tree with:
+Measured on 2026-08-07 from this change's working tree. The full command and output were:
 
 ```text
 $ time cargo run --release -p sim-server -- --benchmark
 soldiers=2410000
-init_seconds=0.865824
-advance_seconds=0.000004
-sim_seconds=60
-throughput_sim_seconds_per_wall_second=17137960.58
-approx_rss_kib=169536
-digest=9aff427b12c7de21
+initialization_seconds=0.855468
+sparse_scheduler_advance_seconds=0.000005
+needs_full_pass_seconds=0.043325
+needs_checksum=d3e48bb593d02e40
+snapshot_seconds=1.003688
+snapshot_bytes=161470100
+digest_seconds=1.253976
+digest=d3f107a8f849764a
+current_rss_kib=327228
+peak_rss_kib=484760
 
-real    0m2.578s
-user    0m1.276s
-sys     0m1.301s
+real    0m3.241s
+user    0m1.394s
+sys     0m1.844s
 ```
 
-This is the required full 2,410,000-soldier run, not an extrapolation. Initialization creates an individually addressable record for every soldier. The advance processes a scheduled ammunition/supply transfer at second 30 and advances lazy needs bookkeeping through second 60. Approximate resident memory is read from Linux `/proc/self/status` immediately before the digest. Digest generation occurs after the reported advance time.
+Initialization creates 2,410,000 individually addressable authoritative records. The sparse scheduler measurement advances to second 60 and processes one transfer; it is **not** described as million-soldier simulation throughput. The separately timed complete needs pass visits every live record and materializes/checks derived needs into the reported deterministic checksum. Snapshot creation and digest computation each scan authoritative state. Current RSS (`VmRSS`) and peak RSS (`VmHWM`) come from `/proc/self/status` after these phases; allocations freed or retained by the allocator and transient snapshot/digest buffers affect them.
 
-For this implemented sparse workload, the measured simulation throughput exceeds the design goal of one simulated second per wall-clock second. It must not be interpreted as evidence that future hot-cell combat will meet that goal.
+## Reproduction and CI
 
-## Environment
+```sh
+cargo run --release -p sim-server -- --benchmark
+PA_SOLDIERS=10000 cargo run --release -p sim-server -- --benchmark
+```
+
+The first command is the manual full benchmark. CI uses the second bounded smoke workload. `PA_SOLDIERS` changes record count, so checksums, snapshot size, memory, and timings differ.
+
+## Environment and limitations
 
 ```text
 CPU: 3 vCPU, Intel Xeon Platinum 8370C @ 2.80 GHz (KVM)
@@ -34,8 +45,4 @@ cargo: 1.95.0 (f2d3ce0bd 2026-03-21)
 profile: release (optimized)
 ```
 
-The container did not include `/usr/bin/time`; the shell's `time` keyword supplied total process timings. The benchmark's own `Instant` measurements and Linux resident-memory reading were unaffected.
-
-## Next measurements
-
-When tactical fixed-step behavior is implemented, benchmark representative hot-cell populations separately, record percentile step latency, and profile digest/snapshot allocation independently from advancing the world.
+This measures only implemented M0 initialization, sparse scheduling, needs derivation, snapshots, and digests. It contains no combat, pathfinding, graphics, living-world M1 processing, persistence I/O, or network load. Future features require independent representative benchmarks rather than extrapolation from the sparse-clock time.

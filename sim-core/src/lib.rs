@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-pub const SNAPSHOT_VERSION: u32 = 1;
+pub const SNAPSHOT_VERSION: u32 = 2;
 const NEEDS_INTERVAL: u64 = 60;
 
 /// A stable handle. Reused slots receive a new generation.
@@ -114,6 +114,13 @@ pub struct Stock {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Command {
     AdvanceTo(u64),
+    World(WorldCommand),
+}
+
+/// Commands which may be placed on the scheduler. Time advancement is deliberately
+/// absent: scheduled work cannot recursively move the clock.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WorldCommand {
     Transfer {
         from: u32,
         to: u32,
@@ -138,7 +145,10 @@ pub enum SimError {
     TimeReversal,
     UnknownStockpile,
     InsufficientStock,
+    InvalidTransfer,
+    ArithmeticOverflow,
     InvalidSquad,
+    InvalidOfficerRole,
     Snapshot(&'static str),
 }
 
@@ -221,10 +231,18 @@ impl Soldiers {
     fn needs(&self, i: usize, now: u64) -> Needs {
         let elapsed = now - self.needs_at[i];
         let mut n = self.needs_base[i];
-        n.fatigue = n.fatigue.saturating_add(elapsed as u32);
-        n.hunger = n.hunger.saturating_add((elapsed / 3) as u32);
-        n.thirst = n.thirst.saturating_add((elapsed / 2) as u32);
-        n.sleep_debt = n.sleep_debt.saturating_add((elapsed / 4) as u32);
+        n.fatigue = n
+            .fatigue
+            .saturating_add(u32::try_from(elapsed).unwrap_or(u32::MAX));
+        n.hunger = n
+            .hunger
+            .saturating_add(u32::try_from(elapsed / 3).unwrap_or(u32::MAX));
+        n.thirst = n
+            .thirst
+            .saturating_add(u32::try_from(elapsed / 2).unwrap_or(u32::MAX));
+        n.sleep_debt = n
+            .sleep_debt
+            .saturating_add(u32::try_from(elapsed / 4).unwrap_or(u32::MAX));
         n
     }
 }
@@ -239,7 +257,7 @@ pub struct World {
     squads: BTreeMap<u32, Squad>,
     stockpiles: BTreeMap<u32, Stock>,
     hot_cells: BTreeSet<u32>,
-    scheduled: BTreeMap<u64, Vec<Command>>,
+    scheduled: BTreeMap<u64, Vec<WorldCommand>>,
     next_needs_wakeup: u64,
 }
 
@@ -313,10 +331,23 @@ impl World {
         });
     }
     pub fn assign_officer(&mut self, squad: u32, officer: EntityId) -> Result<(), SimError> {
-        let s = self.squads.get_mut(&squad).ok_or(SimError::InvalidSquad)?;
+        if !self.squads.contains_key(&squad) {
+            return Err(SimError::InvalidSquad);
+        }
         if !self.soldiers.valid(officer) {
             return Err(SimError::InvalidEntity);
         }
+        if self.soldiers.role[officer.index()] != Role::Officer {
+            return Err(SimError::InvalidOfficerRole);
+        }
+        // Membership is one-to-one. Reassignment removes every stale relationship.
+        for s in self.squads.values_mut() {
+            s.members.remove(&officer);
+            if s.officer == Some(officer) {
+                s.officer = None;
+            }
+        }
+        let s = self.squads.get_mut(&squad).expect("checked");
         s.members.insert(officer);
         s.officer = Some(officer);
         self.soldiers.squad[officer.index()] = Some(squad);
@@ -331,8 +362,12 @@ impl World {
     pub fn stockpile(&self, id: u32) -> Option<Stock> {
         self.stockpiles.get(&id).copied()
     }
-    pub fn schedule(&mut self, at: u64, command: Command) {
+    pub fn schedule(&mut self, at: u64, command: WorldCommand) -> Result<(), SimError> {
+        if at < self.clock {
+            return Err(SimError::TimeReversal);
+        }
         self.scheduled.entry(at).or_default().push(command);
+        Ok(())
     }
     pub fn apply(&mut self, command: Command) -> Result<Vec<Event>, SimError> {
         match command {
@@ -340,7 +375,12 @@ impl World {
                 self.advance_to(t)?;
                 Ok(Vec::new())
             }
-            Command::SetRegionHot { cell, hot } => {
+            Command::World(command) => self.apply_world(command),
+        }
+    }
+    pub fn apply_world(&mut self, command: WorldCommand) -> Result<Vec<Event>, SimError> {
+        match command {
+            WorldCommand::SetRegionHot { cell, hot } => {
                 if hot {
                     self.hot_cells.insert(cell);
                 } else {
@@ -348,12 +388,15 @@ impl World {
                 }
                 Ok(vec![Event::RegionFidelityChanged { cell, hot }])
             }
-            Command::Transfer {
+            WorldCommand::Transfer {
                 from,
                 to,
                 ammunition,
                 supplies,
             } => {
+                if from == to {
+                    return Err(SimError::InvalidTransfer);
+                }
                 let amount = Stock {
                     ammunition,
                     supplies,
@@ -370,6 +413,14 @@ impl World {
                     return Err(SimError::InsufficientStock);
                 }
                 let dst = self.stockpiles[&to];
+                let dst_ammunition = dst
+                    .ammunition
+                    .checked_add(ammunition)
+                    .ok_or(SimError::ArithmeticOverflow)?;
+                let dst_supplies = dst
+                    .supplies
+                    .checked_add(supplies)
+                    .ok_or(SimError::ArithmeticOverflow)?;
                 self.stockpiles.insert(
                     from,
                     Stock {
@@ -380,8 +431,8 @@ impl World {
                 self.stockpiles.insert(
                     to,
                     Stock {
-                        ammunition: dst.ammunition + ammunition,
-                        supplies: dst.supplies + supplies,
+                        ammunition: dst_ammunition,
+                        supplies: dst_supplies,
                     },
                 );
                 Ok(vec![Event::TransferCompleted {
@@ -399,15 +450,24 @@ impl World {
         let times: Vec<u64> = self.scheduled.range(..=target).map(|(t, _)| *t).collect();
         for t in times {
             self.clock = t;
-            if let Some(commands) = self.scheduled.remove(&t) {
-                for c in commands {
-                    self.apply(c)?;
+            if let Some(mut commands) = self.scheduled.remove(&t) {
+                while !commands.is_empty() {
+                    let c = commands[0];
+                    if let Err(error) = self.apply_world(c) {
+                        // The failing command and every unattempted command remain pending.
+                        self.scheduled.insert(t, commands);
+                        return Err(error);
+                    }
+                    commands.remove(0);
                 }
             }
         }
         self.clock = target;
-        while self.next_needs_wakeup <= target {
-            self.next_needs_wakeup = self.next_needs_wakeup.saturating_add(NEEDS_INTERVAL);
+        if self.next_needs_wakeup <= target {
+            let intervals = (target - self.next_needs_wakeup) / NEEDS_INTERVAL;
+            self.next_needs_wakeup = self
+                .next_needs_wakeup
+                .saturating_add(intervals.saturating_add(1).saturating_mul(NEEDS_INTERVAL));
         }
         Ok(())
     }
@@ -461,6 +521,10 @@ impl World {
                 w.u32(v.medical);
             }
         }
+        w.u32(self.soldiers.free.len() as u32);
+        for index in &self.soldiers.free {
+            w.u32(*index);
+        }
         w.u32(self.squads.len() as u32);
         for s in self.squads.values() {
             w.u32(s.id);
@@ -485,7 +549,7 @@ impl World {
             w.u64(*at);
             w.u32(commands.len() as u32);
             for command in commands {
-                w.command(*command);
+                w.world_command(*command);
             }
         }
         w.0
@@ -546,9 +610,20 @@ impl World {
                     water: r.u32()?,
                     medical: r.u32()?,
                 };
-            } else {
-                soldiers.free.push(i as u32);
             }
+        }
+        let free_len = r.u32()? as usize;
+        let mut seen_free = BTreeSet::new();
+        for _ in 0..free_len {
+            let index = r.u32()?;
+            if index as usize >= slots || soldiers.alive[index as usize] || !seen_free.insert(index)
+            {
+                return Err(SimError::Snapshot("invalid free slot"));
+            }
+            soldiers.free.push(index);
+        }
+        if free_len != slots - soldiers.live {
+            return Err(SimError::Snapshot("incomplete free list"));
         }
         let mut squads = BTreeMap::new();
         for _ in 0..r.u32()? {
@@ -558,42 +633,56 @@ impl World {
             for _ in 0..r.u32()? {
                 members.insert(EntityId(r.u64()?));
             }
-            squads.insert(
-                id,
-                Squad {
+            if squads
+                .insert(
                     id,
-                    officer,
-                    members,
-                },
-            );
+                    Squad {
+                        id,
+                        officer,
+                        members,
+                    },
+                )
+                .is_some()
+            {
+                return Err(SimError::Snapshot("duplicate squad"));
+            }
         }
         let mut stockpiles = BTreeMap::new();
         for _ in 0..r.u32()? {
-            stockpiles.insert(
-                r.u32()?,
-                Stock {
-                    ammunition: r.u64()?,
-                    supplies: r.u64()?,
-                },
-            );
+            if stockpiles
+                .insert(
+                    r.u32()?,
+                    Stock {
+                        ammunition: r.u64()?,
+                        supplies: r.u64()?,
+                    },
+                )
+                .is_some()
+            {
+                return Err(SimError::Snapshot("duplicate stockpile"));
+            }
         }
         let mut hot_cells = BTreeSet::new();
         for _ in 0..r.u32()? {
-            hot_cells.insert(r.u32()?);
+            if !hot_cells.insert(r.u32()?) {
+                return Err(SimError::Snapshot("duplicate hot cell"));
+            }
         }
         let mut scheduled = BTreeMap::new();
         for _ in 0..r.u32()? {
             let at = r.u64()?;
             let mut commands = Vec::new();
             for _ in 0..r.u32()? {
-                commands.push(r.command()?);
+                commands.push(r.world_command()?);
             }
-            scheduled.insert(at, commands);
+            if at < clock || scheduled.insert(at, commands).is_some() {
+                return Err(SimError::Snapshot("invalid scheduled time"));
+            }
         }
         if r.p != bytes.len() {
             return Err(SimError::Snapshot("trailing bytes"));
         }
-        Ok(Self {
+        let world = Self {
             clock,
             seed,
             rng_counter,
@@ -603,7 +692,87 @@ impl World {
             hot_cells,
             scheduled,
             next_needs_wakeup,
-        })
+        };
+        world.validate()?;
+        Ok(world)
+    }
+
+    fn validate(&self) -> Result<(), SimError> {
+        let n = self.soldiers.alive.len();
+        let lengths = [
+            self.soldiers.generation.len(),
+            self.soldiers.faction.len(),
+            self.soldiers.position.len(),
+            self.soldiers.squad.len(),
+            self.soldiers.role.len(),
+            self.soldiers.rank.len(),
+            self.soldiers.health.len(),
+            self.soldiers.needs_base.len(),
+            self.soldiers.needs_at.len(),
+            self.soldiers.ammunition.len(),
+            self.soldiers.inventory.len(),
+        ];
+        if lengths.iter().any(|length| *length != n)
+            || self.soldiers.live != self.soldiers.alive.iter().filter(|v| **v).count()
+        {
+            return Err(SimError::Snapshot("soldier vectors"));
+        }
+        let mut memberships = BTreeSet::new();
+        for (squad_id, squad) in &self.squads {
+            if squad.id != *squad_id {
+                return Err(SimError::Snapshot("squad id"));
+            }
+            for member in &squad.members {
+                if !self.soldiers.valid(*member)
+                    || !memberships.insert(*member)
+                    || self.soldiers.squad[member.index()] != Some(*squad_id)
+                {
+                    return Err(SimError::Snapshot("squad member"));
+                }
+            }
+            if let Some(officer) = squad.officer {
+                if !squad.members.contains(&officer)
+                    || self.soldiers.role[officer.index()] != Role::Officer
+                {
+                    return Err(SimError::Snapshot("officer"));
+                }
+            }
+        }
+        for i in 0..n {
+            if self.soldiers.alive[i] {
+                if let Some(squad) = self.soldiers.squad[i] {
+                    let id = EntityId::from_parts(i as u32, self.soldiers.generation[i]);
+                    if !self
+                        .squads
+                        .get(&squad)
+                        .is_some_and(|s| s.members.contains(&id))
+                    {
+                        return Err(SimError::Snapshot("soldier squad"));
+                    }
+                }
+                if self.soldiers.needs_at[i] > self.clock {
+                    return Err(SimError::Snapshot("future needs"));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Materializes every live soldier's derived needs and returns a deterministic checksum.
+    pub fn needs_checksum(&self) -> u64 {
+        let mut checksum = 0u64;
+        for i in 0..self.soldiers.alive.len() {
+            if self.soldiers.alive[i] {
+                let n = self.soldiers.needs(i, self.clock);
+                checksum = checksum.wrapping_mul(0x100000001b3).wrapping_add(
+                    u64::from(n.fatigue)
+                        ^ (u64::from(n.hunger) << 32)
+                        ^ u64::from(n.thirst)
+                        ^ (u64::from(n.sleep_debt) << 32),
+                );
+            }
+        }
+        checksum
     }
 }
 
@@ -636,26 +805,22 @@ impl Writer {
     fn opt_id(&mut self, v: Option<EntityId>) {
         self.u64(v.map_or(u64::MAX, EntityId::raw))
     }
-    fn command(&mut self, command: Command) {
+    fn world_command(&mut self, command: WorldCommand) {
         match command {
-            Command::AdvanceTo(t) => {
-                self.u8(0);
-                self.u64(t);
-            }
-            Command::Transfer {
+            WorldCommand::Transfer {
                 from,
                 to,
                 ammunition,
                 supplies,
             } => {
-                self.u8(1);
+                self.u8(0);
                 self.u32(from);
                 self.u32(to);
                 self.u64(ammunition);
                 self.u64(supplies);
             }
-            Command::SetRegionHot { cell, hot } => {
-                self.u8(2);
+            WorldCommand::SetRegionHot { cell, hot } => {
+                self.u8(1);
                 self.u32(cell);
                 self.u8(hot as u8);
             }
@@ -702,20 +867,63 @@ impl Reader<'_> {
         let v = self.u64()?;
         Ok((v != u64::MAX).then_some(EntityId(v)))
     }
-    fn command(&mut self) -> Result<Command, SimError> {
+    fn world_command(&mut self) -> Result<WorldCommand, SimError> {
         match self.u8()? {
-            0 => Ok(Command::AdvanceTo(self.u64()?)),
-            1 => Ok(Command::Transfer {
+            0 => Ok(WorldCommand::Transfer {
                 from: self.u32()?,
                 to: self.u32()?,
                 ammunition: self.u64()?,
                 supplies: self.u64()?,
             }),
-            2 => Ok(Command::SetRegionHot {
+            1 => Ok(WorldCommand::SetRegionHot {
                 cell: self.u32()?,
                 hot: self.u8()? != 0,
             }),
             _ => Err(SimError::Snapshot("command")),
         }
+    }
+}
+
+#[cfg(test)]
+mod snapshot_validation_tests {
+    use super::*;
+
+    #[test]
+    fn validation_rejects_broken_relationships_and_allocator_state() {
+        let mut world = World::new(1);
+        world.create_squad(7);
+        let id = world
+            .spawn(SoldierSpec {
+                squad: Some(7),
+                ..SoldierSpec::default()
+            })
+            .unwrap();
+        world.squads.get_mut(&7).unwrap().members.clear();
+        assert_eq!(world.validate(), Err(SimError::Snapshot("soldier squad")));
+        world.squads.get_mut(&7).unwrap().members.insert(id);
+        world.soldiers.free.push(id.index() as u32);
+        assert_eq!(world.validate(), Ok(())); // Encoding carries the corruption to strict restore validation.
+        assert!(matches!(
+            World::from_snapshot(&world.snapshot()),
+            Err(SimError::Snapshot("invalid free slot"))
+        ));
+    }
+
+    #[test]
+    fn validation_rejects_invalid_officer_and_duplicate_membership() {
+        let mut world = World::new(1);
+        world.create_squad(1);
+        world.create_squad(2);
+        let id = world
+            .spawn(SoldierSpec {
+                squad: Some(1),
+                ..SoldierSpec::default()
+            })
+            .unwrap();
+        world.squads.get_mut(&1).unwrap().officer = Some(id);
+        assert_eq!(world.validate(), Err(SimError::Snapshot("officer")));
+        world.squads.get_mut(&1).unwrap().officer = None;
+        world.squads.get_mut(&2).unwrap().members.insert(id);
+        assert_eq!(world.validate(), Err(SimError::Snapshot("squad member")));
     }
 }

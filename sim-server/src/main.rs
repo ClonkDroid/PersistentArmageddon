@@ -1,4 +1,4 @@
-use sim_core::{Command, SoldierSpec, Stock, World};
+use sim_core::{SoldierSpec, Stock, World, WorldCommand};
 use std::env;
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -63,28 +63,41 @@ fn benchmark() -> Result<(), Box<dyn std::error::Error>> {
     w.set_stockpile(2, Stock::default());
     w.schedule(
         30,
-        Command::Transfer {
+        WorldCommand::Transfer {
             from: 1,
             to: 2,
             ammunition: 1000,
             supplies: 500,
         },
-    );
+    )?;
     let advance = Instant::now();
     w.advance_to(60)?;
-    let elapsed = advance.elapsed();
-    let rss = resident_memory_kib();
-    println!("soldiers={count}\ninit_seconds={:.6}\nadvance_seconds={:.6}\nsim_seconds=60\nthroughput_sim_seconds_per_wall_second={:.2}\napprox_rss_kib={}\ndigest={:016x}",init.as_secs_f64(),elapsed.as_secs_f64(),60.0/elapsed.as_secs_f64(),rss,w.state_digest());
+    let sparse_advance = advance.elapsed();
+    let needs_start = Instant::now();
+    let needs_checksum = w.needs_checksum();
+    let needs_pass = needs_start.elapsed();
+    let snapshot_start = Instant::now();
+    let snapshot = w.snapshot();
+    let snapshot_time = snapshot_start.elapsed();
+    let digest_start = Instant::now();
+    let digest = w.state_digest();
+    let digest_time = digest_start.elapsed();
+    let (rss, peak_rss) = memory_kib();
+    println!("soldiers={count}\ninitialization_seconds={:.6}\nsparse_scheduler_advance_seconds={:.6}\nneeds_full_pass_seconds={:.6}\nneeds_checksum={needs_checksum:016x}\nsnapshot_seconds={:.6}\nsnapshot_bytes={}\ndigest_seconds={:.6}\ndigest={digest:016x}\ncurrent_rss_kib={rss}\npeak_rss_kib={peak_rss}", init.as_secs_f64(), sparse_advance.as_secs_f64(), needs_pass.as_secs_f64(), snapshot_time.as_secs_f64(), snapshot.len(), digest_time.as_secs_f64());
     Ok(())
 }
-fn resident_memory_kib() -> u64 {
+fn memory_kib() -> (u64, u64) {
     std::fs::read_to_string("/proc/self/status")
         .ok()
-        .and_then(|s| {
-            s.lines()
-                .find(|l| l.starts_with("VmRSS:"))
-                .and_then(|l| l.split_whitespace().nth(1))
-                .and_then(|v| v.parse().ok())
+        .map(|s| {
+            let value = |name: &str| {
+                s.lines()
+                    .find(|l| l.starts_with(name))
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0)
+            };
+            (value("VmRSS:"), value("VmHWM:"))
         })
-        .unwrap_or(0)
+        .unwrap_or((0, 0))
 }
