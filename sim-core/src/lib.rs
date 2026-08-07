@@ -452,6 +452,15 @@ pub struct World {
     cold_boundaries: u64,
     hot_member_steps: u64,
 }
+
+#[derive(Clone)]
+struct LivingTransition {
+    living: LivingState,
+    inventory: Inventory,
+    consumed_food: u128,
+    consumed_water: u128,
+    events: Vec<TimedEvent>,
+}
 impl World {
     fn rates(a: Activity) -> (i32, u32, u32, i32) {
         match a {
@@ -550,21 +559,26 @@ impl World {
         l.materialized_at = to;
         Ok(())
     }
-    fn reference_second(
-        &mut self,
+    fn transition_second(
+        living: LivingState,
+        inventory: Inventory,
         id: EntityId,
         at: u64,
-        out: &mut Vec<TimedEvent>,
-    ) -> Result<(), SimError> {
-        let i = id.index();
-        if self.soldiers.living[i].life != LifeState::Alive {
-            return Ok(());
+    ) -> Result<LivingTransition, SimError> {
+        if living.life != LifeState::Alive {
+            return Ok(LivingTransition {
+                living,
+                inventory,
+                consumed_food: 0,
+                consumed_water: 0,
+                events: Vec::new(),
+            });
         }
-        let mut l = self.soldiers.living[i];
+        let mut l = living;
         Self::project(&mut l, at)?;
-        let mut inv = self.soldiers.data[i].inventory;
-        let mut consumed_food = self.consumed_food;
-        let mut consumed_water = self.consumed_water;
+        let mut inv = inventory;
+        let mut consumed_food = 0_u128;
+        let mut consumed_water = 0_u128;
         let mut events = Vec::new();
         let hb = l.hunger;
         let tb = l.thirst;
@@ -574,17 +588,13 @@ impl World {
             inv.food -= FOOD_RATION;
             food = FOOD_RATION;
             l.hunger -= RATION_THRESHOLD;
-            consumed_food = consumed_food
-                .checked_add(1)
-                .ok_or(SimError::ArithmeticOverflow)?;
+            consumed_food = 1;
         }
         if l.thirst >= RATION_THRESHOLD && inv.water > 0 {
             inv.water -= WATER_RATION;
             water = WATER_RATION;
             l.thirst -= RATION_THRESHOLD;
-            consumed_water = consumed_water
-                .checked_add(1)
-                .ok_or(SimError::ArithmeticOverflow)?;
+            consumed_water = 1;
         }
         if food != 0 || water != 0 {
             events.push(TimedEvent {
@@ -652,13 +662,27 @@ impl World {
                 });
             }
         }
-        self.soldiers.living[i] = l;
-        self.soldiers.data[i].inventory = inv;
-        self.soldiers.data[i].health = l.health;
-        self.consumed_food = consumed_food;
-        self.consumed_water = consumed_water;
-        out.extend(events);
-        Ok(())
+        Ok(LivingTransition {
+            living: l,
+            inventory: inv,
+            consumed_food,
+            consumed_water,
+            events,
+        })
+    }
+    fn commit_transition(
+        &mut self,
+        id: EntityId,
+        transition: LivingTransition,
+        out: &mut Vec<TimedEvent>,
+    ) {
+        let i = id.index();
+        self.soldiers.living[i] = transition.living;
+        self.soldiers.data[i].inventory = transition.inventory;
+        self.soldiers.data[i].health = transition.living.health;
+        self.consumed_food += transition.consumed_food;
+        self.consumed_water += transition.consumed_water;
+        out.extend(transition.events);
     }
     pub fn new(seed: u64) -> Self {
         Self {
@@ -1095,7 +1119,6 @@ impl World {
         }
     }
     fn preflight_hot_cells(&self, t: u64) -> Result<(), SimError> {
-        let mut required = 0_u64;
         for h in self.hot_cells.values() {
             let elapsed = t
                 .checked_sub(h.last_stepped_at)
@@ -1104,57 +1127,6 @@ impl World {
                 .checked_add(elapsed)
                 .ok_or(SimError::ArithmeticOverflow)?;
         }
-        for (cell, h) in &self.hot_cells {
-            for id in self.cell_members.get(cell).into_iter().flatten() {
-                if !self.soldiers.valid(*id) {
-                    continue;
-                }
-                let mut living = self.soldiers.living[id.index()];
-                let mut inventory = self.soldiers.data[id.index()].inventory;
-                let mut at = h.last_stepped_at;
-                while at < t && living.life == LifeState::Alive {
-                    at += 1;
-                    Self::project(&mut living, at)?;
-                    if living.hunger >= RATION_THRESHOLD && inventory.food > 0 {
-                        inventory.food -= FOOD_RATION;
-                        living.hunger -= RATION_THRESHOLD;
-                    }
-                    if living.thirst >= RATION_THRESHOLD && inventory.water > 0 {
-                        inventory.water -= WATER_RATION;
-                        living.thirst -= RATION_THRESHOLD;
-                    }
-                    if living.activity == Activity::March && living.fatigue >= FORCED_IDLE_FATIGUE {
-                        living.activity = Activity::Idle;
-                    }
-                    if (inventory.food == 0 && living.hunger >= SEVERE_HUNGER)
-                        || (inventory.water == 0 && living.thirst >= SEVERE_THIRST)
-                    {
-                        let damage = if inventory.water == 0 && living.thirst >= SEVERE_THIRST {
-                            10
-                        } else {
-                            4
-                        };
-                        living.health = living.health.saturating_sub(damage);
-                        if living.health == 0 {
-                            living.life = LifeState::Dead {
-                                at,
-                                cause: if inventory.water == 0 && living.thirst >= SEVERE_THIRST {
-                                    DeathCause::Dehydration
-                                } else {
-                                    DeathCause::Starvation
-                                },
-                            };
-                        }
-                    }
-                    required = required
-                        .checked_add(1)
-                        .ok_or(SimError::ArithmeticOverflow)?;
-                }
-            }
-        }
-        self.hot_member_steps
-            .checked_add(required)
-            .ok_or(SimError::ArithmeticOverflow)?;
         Ok(())
     }
     fn automatic_to(&mut self, t: u64, out: &mut Vec<TimedEvent>) -> Result<(u64, u64), SimError> {
@@ -1186,11 +1158,16 @@ impl World {
                     ids.extend(self.cell_members.get(cell).into_iter().flatten().copied());
                 }
             }
+            let mut staged = Vec::new();
+            let mut hot_count = 0_u64;
+            let mut cold_count = 0_u64;
+            let mut food_count = 0_u128;
+            let mut water_count = 0_u128;
             for id in ids {
                 if !self.soldiers.valid(id)
                     || self.soldiers.living[id.index()].life != LifeState::Alive
                 {
-                    self.unschedule_due(id);
+                    staged.push((id, false, None));
                     continue;
                 }
                 let cell = self.soldiers.data[id.index()].position.cell;
@@ -1199,27 +1176,70 @@ impl World {
                     .get(&cell)
                     .is_some_and(|h| h.last_stepped_at < at);
                 if is_hot {
-                    let next = self
-                        .hot_member_steps
+                    hot_count = hot_count
                         .checked_add(1)
                         .ok_or(SimError::ArithmeticOverflow)?;
-                    self.reference_second(id, at, out)?;
-                    self.hot_member_steps = next;
+                    let transition = Self::transition_second(
+                        self.soldiers.living[id.index()],
+                        self.soldiers.data[id.index()].inventory,
+                        id,
+                        at,
+                    )?;
+                    food_count = food_count
+                        .checked_add(transition.consumed_food)
+                        .ok_or(SimError::ArithmeticOverflow)?;
+                    water_count = water_count
+                        .checked_add(transition.consumed_water)
+                        .ok_or(SimError::ArithmeticOverflow)?;
+                    staged.push((id, true, Some(transition)));
                 } else if self.due_by_entity.get(&id) == Some(&at) {
-                    let next = self
-                        .cold_boundaries
+                    cold_count = cold_count
                         .checked_add(1)
                         .ok_or(SimError::ArithmeticOverflow)?;
-                    self.unschedule_due(id);
-                    if let Err(error) = self.reference_second(id, at, out) {
-                        self.living_due.entry(at).or_default().insert(id);
-                        self.due_by_entity.insert(id, at);
-                        return Err(error);
-                    }
-                    self.cold_boundaries = next;
-                    self.schedule_due(id)?;
+                    let transition = Self::transition_second(
+                        self.soldiers.living[id.index()],
+                        self.soldiers.data[id.index()].inventory,
+                        id,
+                        at,
+                    )?;
+                    food_count = food_count
+                        .checked_add(transition.consumed_food)
+                        .ok_or(SimError::ArithmeticOverflow)?;
+                    water_count = water_count
+                        .checked_add(transition.consumed_water)
+                        .ok_or(SimError::ArithmeticOverflow)?;
+                    staged.push((id, false, Some(transition)));
                 }
             }
+            let next_hot = self
+                .hot_member_steps
+                .checked_add(hot_count)
+                .ok_or(SimError::ArithmeticOverflow)?;
+            let next_cold = self
+                .cold_boundaries
+                .checked_add(cold_count)
+                .ok_or(SimError::ArithmeticOverflow)?;
+            self.consumed_food
+                .checked_add(food_count)
+                .ok_or(SimError::ArithmeticOverflow)?;
+            self.consumed_water
+                .checked_add(water_count)
+                .ok_or(SimError::ArithmeticOverflow)?;
+            for (id, hot, transition) in staged {
+                if let Some(transition) = transition {
+                    if !hot {
+                        self.unschedule_due(id);
+                    }
+                    self.commit_transition(id, transition, out);
+                    if !hot {
+                        self.schedule_due(id)?;
+                    }
+                } else {
+                    self.unschedule_due(id);
+                }
+            }
+            self.hot_member_steps = next_hot;
+            self.cold_boundaries = next_cold;
             for h in self
                 .hot_cells
                 .values_mut()
@@ -2154,6 +2174,61 @@ mod private_invariants {
             None
         );
         assert_eq!(world.state_digest(), digest);
+    }
+
+    #[test]
+    fn same_timestamp_cold_counter_overflow_commits_nothing() {
+        let mut world = World::new(0);
+        world.apply(Command::SetRegionHot { cell: 1, hot: true });
+        let hot = spawn(
+            &mut world,
+            SoldierSpec {
+                position: Position {
+                    cell: 1,
+                    ..Position::default()
+                },
+                ..SoldierSpec::default()
+            },
+        );
+        let cold = spawn(
+            &mut world,
+            SoldierSpec {
+                position: Position {
+                    cell: 2,
+                    ..Position::default()
+                },
+                ..SoldierSpec::default()
+            },
+        );
+        world.soldiers.living[cold.index()].thirst = SEVERE_THIRST - 2;
+        world.schedule_due(cold).unwrap();
+        assert_eq!(world.due_by_entity[&cold], 1);
+        world.cold_boundaries = u64::MAX;
+        let before = world.snapshot();
+        let outcome = world.apply(Command::AdvanceTo { target: 1 });
+        assert_eq!(outcome.error, Some(SimError::ArithmeticOverflow));
+        assert!(outcome.events.is_empty());
+        assert_eq!(world.clock(), 0);
+        assert_eq!(world.soldier(hot).unwrap().living.materialized_at, 0);
+        assert_eq!(world.snapshot(), before);
+        assert!(World::from_snapshot(&world.snapshot()).is_ok());
+    }
+
+    #[test]
+    fn stale_due_entry_cannot_execute_after_generation_reuse() {
+        let mut world = World::new(0);
+        let stale = spawn(&mut world, SoldierSpec::default());
+        world.apply(Command::DespawnSoldier { id: stale });
+        let current = spawn(&mut world, SoldierSpec::default());
+        assert_ne!(stale, current);
+        world.living_due.entry(1).or_default().insert(stale);
+        world.due_by_entity.insert(stale, 1);
+        let current_before = world.soldiers.living[current.index()];
+        let outcome = world.apply(Command::AdvanceTo { target: 1 });
+        assert_eq!(outcome.error, None);
+        assert!(!world.due_by_entity.contains_key(&stale));
+        assert_eq!(world.soldiers.living[current.index()], current_before);
+        assert_eq!(world.living_work_counters().0, 0);
     }
 
     #[test]

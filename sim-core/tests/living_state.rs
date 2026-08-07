@@ -48,7 +48,7 @@ fn automatic(events: &[TimedEvent]) -> Vec<TimedEvent> {
 }
 
 #[test]
-fn hot_and_cold_use_identical_living_transitions_at_boundaries() {
+fn cluster_02_hot_and_cold_match_independent_boundaries() {
     let mut cold = World::new(7);
     let mut hot = World::new(7);
     let cold_id = spawn(&mut cold, 4, 3, 3);
@@ -78,7 +78,7 @@ fn hot_and_cold_use_identical_living_transitions_at_boundaries() {
 }
 
 #[test]
-fn activities_differ_and_invalid_activity_is_atomic() {
+fn cluster_06_activities_differ_and_invalid_activity_is_atomic() {
     let mut world = World::new(0);
     let rest = spawn(&mut world, 1, 1, 1);
     let idle = spawn(&mut world, 2, 1, 1);
@@ -115,7 +115,7 @@ fn activities_differ_and_invalid_activity_is_atomic() {
 }
 
 #[test]
-fn consumption_death_and_removal_are_conserved_once() {
+fn cluster_04_consumption_removal_and_ledger_are_conserved_once() {
     let mut world = World::new(0);
     let fed = spawn(&mut world, 1, 1, 1);
     let doomed = spawn(&mut world, 2, 0, 0);
@@ -152,7 +152,7 @@ fn consumption_death_and_removal_are_conserved_once() {
 }
 
 #[test]
-fn snapshot_resume_and_fidelity_churn_are_byte_deterministic() {
+fn cluster_03_repeated_fidelity_churn_preserves_state() {
     let mut world = World::new(91);
     let id = spawn(&mut world, 8, 4, 5);
     apply(&mut world, Command::AdvanceTo { target: 49 });
@@ -177,7 +177,23 @@ fn snapshot_resume_and_fidelity_churn_are_byte_deterministic() {
 }
 
 #[test]
-fn one_second_activity_oracle_has_independent_expected_values() {
+fn cluster_10_queries_and_snapshot_resume_are_byte_deterministic() {
+    let mut uninterrupted = World::new(91);
+    let id = spawn(&mut uninterrupted, 8, 4, 5);
+    apply(&mut uninterrupted, Command::AdvanceTo { target: 73 });
+    let before_query = uninterrupted.snapshot();
+    let _ = uninterrupted.soldier(id);
+    assert_eq!(uninterrupted.snapshot(), before_query);
+    let mut restored = World::from_snapshot(&before_query).unwrap();
+    let a = apply(&mut uninterrupted, Command::AdvanceTo { target: 210 });
+    let b = apply(&mut restored, Command::AdvanceTo { target: 210 });
+    assert_eq!(a, b);
+    assert_eq!(uninterrupted.state_digest(), restored.state_digest());
+    assert_eq!(uninterrupted.snapshot(), restored.snapshot());
+}
+
+#[test]
+fn cluster_01_one_second_oracle_has_independent_expected_values() {
     let cases = [
         (Activity::Rest, 0, 1, 1, 0),
         (Activity::Idle, 1, 1, 2, 1),
@@ -201,7 +217,7 @@ fn one_second_activity_oracle_has_independent_expected_values() {
 }
 
 #[test]
-fn ration_boundaries_are_exact_and_not_double_consumed() {
+fn cluster_05_ration_and_deterioration_boundaries_are_exact() {
     let mut world = World::new(0);
     let id = spawn(&mut world, 1, 2, 2);
     assert!(automatic(&apply(&mut world, Command::AdvanceTo { target: 49 })).is_empty());
@@ -226,7 +242,7 @@ fn ration_boundaries_are_exact_and_not_double_consumed() {
 }
 
 #[test]
-fn hot_activity_snapshot_and_immediate_cold_transition_are_canonical() {
+fn cluster_09_hot_snapshot_and_canonical_due_are_strict() {
     let mut world = World::new(0);
     apply(&mut world, Command::SetRegionHot { cell: 9, hot: true });
     let id = spawn(&mut world, 9, 1, 1);
@@ -261,7 +277,7 @@ fn hot_activity_snapshot_and_immediate_cold_transition_are_canonical() {
 }
 
 #[test]
-fn stale_generation_cannot_change_reused_soldier_activity() {
+fn cluster_07_stale_generation_cannot_act_on_reused_soldier() {
     let mut world = World::new(0);
     let stale = spawn(&mut world, 1, 0, 0);
     apply(&mut world, Command::DespawnSoldier { id: stale });
@@ -282,4 +298,79 @@ fn stale_generation_cannot_change_reused_soldier_activity() {
         world.soldier(current).unwrap().living.activity,
         Activity::Idle
     );
+}
+
+#[test]
+fn cluster_08_automatic_work_precedes_same_time_scheduled_commands() {
+    let mut world = World::new(0);
+    let id = spawn(&mut world, 1, 1, 1);
+    apply(
+        &mut world,
+        Command::Schedule {
+            at: 50,
+            command: ScheduledCommand::SetRegionHot { cell: 1, hot: true },
+        },
+    );
+    let events = apply(&mut world, Command::AdvanceTo { target: 50 });
+    let ration = events
+        .iter()
+        .position(|event| matches!(event.event, Event::RationConsumed { id: got, .. } if got == id))
+        .unwrap();
+    let command = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event.event,
+                Event::RegionFidelityChanged {
+                    cell: 1,
+                    hot: true,
+                    ..
+                }
+            )
+        })
+        .unwrap();
+    assert!(ration < command);
+}
+
+#[test]
+fn cluster_11_huge_sparse_advance_has_exact_boundary_work() {
+    let mut world = World::new(0);
+    let id = spawn(&mut world, 1, 0, 0);
+    let events = apply(
+        &mut world,
+        Command::AdvanceTo {
+            target: 1_000_000_000,
+        },
+    );
+    assert!(matches!(
+        world.soldier(id).unwrap().living.life,
+        LifeState::Dead {
+            at: 499,
+            cause: DeathCause::Dehydration
+        }
+    ));
+    assert_eq!(world.living_work_counters(), (100, 0));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event.event, Event::SoldierDied { id: got, .. } if got == id))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn cluster_12_hot_processing_touches_exact_indexed_membership() {
+    let mut world = World::new(0);
+    let hot_a = spawn(&mut world, 7, 2, 2);
+    let removed = spawn(&mut world, 7, 2, 2);
+    let cold = spawn(&mut world, 8, 2, 2);
+    apply(&mut world, Command::DespawnSoldier { id: removed });
+    apply(&mut world, Command::SetRegionHot { cell: 7, hot: true });
+    apply(&mut world, Command::AdvanceTo { target: 3 });
+    assert_eq!(world.living_work_counters(), (0, 3));
+    assert_eq!(world.soldier(hot_a).unwrap().living.materialized_at, 3);
+    assert_eq!(world.soldier(cold).unwrap().needs.hunger, 3);
+    assert!(world.soldier(removed).is_none());
+    assert!(World::from_snapshot(&world.snapshot()).is_ok());
 }
