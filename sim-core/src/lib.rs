@@ -2,11 +2,71 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 
-pub const SNAPSHOT_VERSION: u32 = 5;
+pub const SNAPSHOT_VERSION: u32 = 6;
+pub const NEED_MAX: u32 = 1_000;
+pub const RATION_THRESHOLD: u32 = 100;
+pub const FOOD_RATION: u32 = 1;
+pub const WATER_RATION: u32 = 1;
+pub const SEVERE_HUNGER: u32 = 800;
+pub const SEVERE_THIRST: u32 = 800;
+pub const FORCED_IDLE_FATIGUE: u32 = 900;
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Activity {
+    Rest,
+    #[default]
+    Idle,
+    March,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeathCause {
+    Dehydration,
+    Starvation,
+    Exhaustion,
+}
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum LifeState {
+    #[default]
+    Alive,
+    Dead {
+        at: u64,
+        cause: DeathCause,
+    },
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LivingState {
+    pub hunger: u32,
+    pub thirst: u32,
+    pub fatigue: u32,
+    pub sleep_debt: u32,
+    pub morale: u16,
+    pub health: u16,
+    pub activity: Activity,
+    pub life: LifeState,
+    pub materialized_at: u64,
+}
+impl Default for LivingState {
+    fn default() -> Self {
+        Self {
+            hunger: 0,
+            thirst: 0,
+            fatigue: 0,
+            sleep_debt: 0,
+            morale: 1000,
+            health: 1000,
+            activity: Activity::Idle,
+            life: LifeState::Alive,
+            materialized_at: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Hash)]
 pub struct EntityId(u64);
 impl EntityId {
+    pub fn from_raw(raw: u64) -> Self {
+        Self(raw)
+    }
     pub fn from_parts(i: u32, g: u32) -> Self {
         Self((u64::from(g) << 32) | u64::from(i))
     }
@@ -59,6 +119,7 @@ pub struct Soldier {
     pub needs: Needs,
     pub ammunition: u32,
     pub inventory: Inventory,
+    pub living: LivingState,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SoldierSpec {
@@ -171,6 +232,10 @@ pub enum Command {
         target: u64,
     },
     NextRandom,
+    SetActivity {
+        id: EntityId,
+        activity: Activity,
+    },
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Event {
@@ -220,6 +285,33 @@ pub enum Event {
     RandomGenerated {
         value: u64,
     },
+    ActivityChanged {
+        id: EntityId,
+        before: Activity,
+        after: Activity,
+        forced: bool,
+    },
+    RationConsumed {
+        id: EntityId,
+        food: u32,
+        water: u32,
+        hunger_before: u32,
+        hunger_after: u32,
+        thirst_before: u32,
+        thirst_after: u32,
+    },
+    LivingDeteriorated {
+        id: EntityId,
+        morale_before: u16,
+        morale_after: u16,
+        health_before: u16,
+        health_after: u16,
+    },
+    SoldierDied {
+        id: EntityId,
+        cause: DeathCause,
+        health_before: u16,
+    },
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TimedEvent {
@@ -247,6 +339,12 @@ pub struct ResourceTotals {
     pub carried_food: u128,
     pub carried_water: u128,
     pub carried_medical: u128,
+    pub sourced_food: u128,
+    pub sourced_water: u128,
+    pub consumed_food: u128,
+    pub consumed_water: u128,
+    pub lost_food: u128,
+    pub lost_water: u128,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SimError {
@@ -263,6 +361,7 @@ pub enum SimError {
     InvalidScheduledCommand,
     UnknownScheduledCommand,
     Snapshot(&'static str),
+    DeadEntity,
 }
 impl fmt::Display for SimError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -276,7 +375,7 @@ struct Soldiers {
     generation: Vec<u32>,
     alive: Vec<bool>,
     data: Vec<SoldierSpec>,
-    needs_at: Vec<u64>,
+    living: Vec<LivingState>,
     free: Vec<u32>,
     live: usize,
 }
@@ -293,12 +392,16 @@ impl Soldiers {
             self.generation.push(0);
             self.alive.push(false);
             self.data.push(SoldierSpec::default());
-            self.needs_at.push(now);
+            self.living.push(LivingState::default());
             self.alive.len() - 1
         };
         self.alive[i] = true;
         self.data[i] = s;
-        self.needs_at[i] = now;
+        self.living[i] = LivingState {
+            health: s.health,
+            materialized_at: now,
+            ..LivingState::default()
+        };
         self.live += 1;
         EntityId::from_parts(i as u32, self.generation[i])
     }
@@ -314,15 +417,6 @@ impl Soldiers {
             self.free.push(i as u32)
         }
         Some(self.data[i])
-    }
-    fn needs(&self, i: usize, now: u64) -> Needs {
-        let e = now - self.needs_at[i];
-        Needs {
-            fatigue: u32::try_from(e).unwrap_or(u32::MAX),
-            hunger: u32::try_from(e / 3).unwrap_or(u32::MAX),
-            thirst: u32::try_from(e / 2).unwrap_or(u32::MAX),
-            sleep_debt: u32::try_from(e / 4).unwrap_or(u32::MAX),
-        }
     }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -345,8 +439,240 @@ pub struct World {
     // Derived authoritative index: expected O(1) ID lookup; bucket removal is O(log N).
     schedule_index: HashMap<u64, u64>,
     reserved_stockpiles: BTreeSet<u32>,
+    cell_members: BTreeMap<u32, BTreeSet<EntityId>>,
+    living_due: BTreeMap<u64, BTreeSet<EntityId>>,
+    due_by_entity: HashMap<EntityId, u64>,
+    sourced_food: u128,
+    sourced_water: u128,
+    consumed_food: u128,
+    consumed_water: u128,
+    lost_food: u128,
+    lost_water: u128,
+    cold_boundaries: u64,
+    hot_member_steps: u64,
 }
 impl World {
+    fn rates(a: Activity) -> (i32, u32, u32, i32) {
+        match a {
+            Activity::Rest => (-2, 1, 1, -2),
+            Activity::Idle => (1, 1, 2, 1),
+            Activity::March => (3, 2, 3, 2),
+        }
+    }
+    fn unschedule_due(&mut self, id: EntityId) {
+        if let Some(at) = self.due_by_entity.remove(&id) {
+            if let Some(s) = self.living_due.get_mut(&at) {
+                s.remove(&id);
+                if s.is_empty() {
+                    self.living_due.remove(&at);
+                }
+            }
+        }
+    }
+    fn schedule_due(&mut self, id: EntityId) -> Result<(), SimError> {
+        self.unschedule_due(id);
+        if !self.soldiers.valid(id)
+            || self
+                .hot_cells
+                .contains_key(&self.soldiers.data[id.index()].position.cell)
+            || self.soldiers.living[id.index()].life != LifeState::Alive
+        {
+            return Ok(());
+        }
+        let l = self.soldiers.living[id.index()];
+        let inv = self.soldiers.data[id.index()].inventory;
+        let (_, hr, tr, _) = Self::rates(l.activity);
+        let ceil = |d: u32, r: u32| u64::from(d.saturating_add(r - 1) / r).max(1);
+        let mut d = u64::MAX;
+        if inv.food > 0 {
+            d = d.min(ceil(RATION_THRESHOLD.saturating_sub(l.hunger), hr));
+        } else if l.hunger < SEVERE_HUNGER {
+            d = d.min(ceil(SEVERE_HUNGER - l.hunger, hr));
+        } else {
+            d = 1;
+        }
+        if inv.water > 0 {
+            d = d.min(ceil(RATION_THRESHOLD.saturating_sub(l.thirst), tr));
+        } else if l.thirst < SEVERE_THIRST {
+            d = d.min(ceil(SEVERE_THIRST - l.thirst, tr));
+        } else {
+            d = 1;
+        }
+        if l.activity == Activity::March && l.fatigue < FORCED_IDLE_FATIGUE {
+            d = d.min(ceil(FORCED_IDLE_FATIGUE - l.fatigue, 3));
+        }
+        let at = l
+            .materialized_at
+            .checked_add(d)
+            .ok_or(SimError::ArithmeticOverflow)?;
+        self.living_due.entry(at).or_default().insert(id);
+        self.due_by_entity.insert(id, at);
+        Ok(())
+    }
+    fn analytical(&mut self, id: EntityId, to: u64) -> Result<(), SimError> {
+        let i = id.index();
+        let l = &mut self.soldiers.living[i];
+        let n = to
+            .checked_sub(l.materialized_at)
+            .ok_or(SimError::TimeReversal)?;
+        if n == 0 || l.life != LifeState::Alive {
+            return Ok(());
+        }
+        let (fr, hr, tr, sr) = Self::rates(l.activity);
+        let adj = |v: u32, r: i32| -> u32 {
+            if r >= 0 {
+                v.saturating_add(
+                    u32::try_from(n)
+                        .unwrap_or(u32::MAX)
+                        .saturating_mul(r as u32),
+                )
+                .min(NEED_MAX)
+            } else {
+                v.saturating_sub(
+                    u32::try_from(n)
+                        .unwrap_or(u32::MAX)
+                        .saturating_mul((-r) as u32),
+                )
+            }
+        };
+        l.fatigue = adj(l.fatigue, fr);
+        l.sleep_debt = adj(l.sleep_debt, sr);
+        l.hunger = l
+            .hunger
+            .saturating_add(u32::try_from(n).unwrap_or(u32::MAX).saturating_mul(hr))
+            .min(NEED_MAX);
+        l.thirst = l
+            .thirst
+            .saturating_add(u32::try_from(n).unwrap_or(u32::MAX).saturating_mul(tr))
+            .min(NEED_MAX);
+        l.materialized_at = to;
+        Ok(())
+    }
+    fn reference_second(
+        &mut self,
+        id: EntityId,
+        at: u64,
+        out: &mut Vec<TimedEvent>,
+    ) -> Result<(), SimError> {
+        self.analytical(id, at)?;
+        let i = id.index();
+        if self.soldiers.living[i].life != LifeState::Alive {
+            return Ok(());
+        }
+        let mut l = self.soldiers.living[i];
+        let inv = &mut self.soldiers.data[i].inventory;
+        let hb = l.hunger;
+        let tb = l.thirst;
+        let mut food = 0;
+        let mut water = 0;
+        if l.hunger >= RATION_THRESHOLD && inv.food > 0 {
+            inv.food -= FOOD_RATION;
+            food = FOOD_RATION;
+            l.hunger -= RATION_THRESHOLD;
+            self.consumed_food += 1;
+        }
+        if l.thirst >= RATION_THRESHOLD && inv.water > 0 {
+            inv.water -= WATER_RATION;
+            water = WATER_RATION;
+            l.thirst -= RATION_THRESHOLD;
+            self.consumed_water += 1;
+        }
+        if food != 0 || water != 0 {
+            out.push(TimedEvent {
+                at,
+                event: Event::RationConsumed {
+                    id,
+                    food,
+                    water,
+                    hunger_before: hb,
+                    hunger_after: l.hunger,
+                    thirst_before: tb,
+                    thirst_after: l.thirst,
+                },
+            });
+        }
+        if l.activity == Activity::March && l.fatigue >= FORCED_IDLE_FATIGUE {
+            let before = l.activity;
+            l.activity = Activity::Idle;
+            out.push(TimedEvent {
+                at,
+                event: Event::ActivityChanged {
+                    id,
+                    before,
+                    after: l.activity,
+                    forced: true,
+                },
+            });
+        }
+        if (inv.food == 0 && l.hunger >= SEVERE_HUNGER)
+            || (inv.water == 0 && l.thirst >= SEVERE_THIRST)
+        {
+            let mb = l.morale;
+            let hb = l.health;
+            l.morale = l.morale.saturating_sub(1);
+            let damage = if inv.water == 0 && l.thirst >= SEVERE_THIRST {
+                10
+            } else {
+                4
+            };
+            l.health = l.health.saturating_sub(damage);
+            out.push(TimedEvent {
+                at,
+                event: Event::LivingDeteriorated {
+                    id,
+                    morale_before: mb,
+                    morale_after: l.morale,
+                    health_before: hb,
+                    health_after: l.health,
+                },
+            });
+            if l.health == 0 {
+                let cause = if inv.water == 0 && l.thirst >= SEVERE_THIRST {
+                    DeathCause::Dehydration
+                } else {
+                    DeathCause::Starvation
+                };
+                l.life = LifeState::Dead { at, cause };
+                out.push(TimedEvent {
+                    at,
+                    event: Event::SoldierDied {
+                        id,
+                        cause,
+                        health_before: hb,
+                    },
+                });
+            }
+        }
+        self.soldiers.living[i] = l;
+        Ok(())
+    }
+    fn advance_cold_to(&mut self, t: u64, out: &mut Vec<TimedEvent>) -> Result<(), SimError> {
+        while let Some(at) = self.living_due.keys().next().copied().filter(|x| *x <= t) {
+            let ids = self.living_due.remove(&at).unwrap();
+            for id in ids {
+                self.due_by_entity.remove(&id);
+                if self.soldiers.valid(id)
+                    && !self
+                        .hot_cells
+                        .contains_key(&self.soldiers.data[id.index()].position.cell)
+                {
+                    self.reference_second(id, at, out)?;
+                    self.cold_boundaries = self
+                        .cold_boundaries
+                        .checked_add(1)
+                        .ok_or(SimError::ArithmeticOverflow)?;
+                    self.schedule_due(id)?;
+                }
+            }
+        }
+        let ids: Vec<_> = self.due_by_entity.keys().copied().collect();
+        for id in ids {
+            if self.soldiers.valid(id) {
+                self.analytical(id, t)?;
+            }
+        }
+        Ok(())
+    }
     pub fn new(seed: u64) -> Self {
         Self {
             clock: 0,
@@ -360,6 +686,17 @@ impl World {
             scheduled: BTreeMap::new(),
             schedule_index: HashMap::new(),
             reserved_stockpiles: BTreeSet::new(),
+            cell_members: BTreeMap::new(),
+            living_due: BTreeMap::new(),
+            due_by_entity: HashMap::new(),
+            sourced_food: 0,
+            sourced_water: 0,
+            consumed_food: 0,
+            consumed_water: 0,
+            lost_food: 0,
+            lost_water: 0,
+            cold_boundaries: 0,
+            hot_member_steps: 0,
         }
     }
     pub fn clock(&self) -> u64 {
@@ -394,9 +731,15 @@ impl World {
             role: s.role,
             rank: s.rank,
             health: s.health,
-            needs: self.soldiers.needs(i, self.clock),
+            needs: Needs {
+                fatigue: self.soldiers.living[i].fatigue,
+                hunger: self.soldiers.living[i].hunger,
+                thirst: self.soldiers.living[i].thirst,
+                sleep_debt: self.soldiers.living[i].sleep_debt,
+            },
             ammunition: s.ammunition,
             inventory: s.inventory,
+            living: self.soldiers.living[i],
         })
     }
     pub fn apply(&mut self, c: Command) -> ApplyOutcome {
@@ -428,9 +771,16 @@ impl World {
                     }
                 }
                 let id = self.soldiers.spawn(spec, self.clock);
+                self.sourced_food += u128::from(spec.inventory.food);
+                self.sourced_water += u128::from(spec.inventory.water);
+                self.cell_members
+                    .entry(spec.position.cell)
+                    .or_default()
+                    .insert(id);
                 if let Some(s) = spec.squad {
                     self.squads.get_mut(&s).expect("checked").members.insert(id);
                 }
+                self.schedule_due(id)?;
                 Ok(Event::SoldierSpawned {
                     id,
                     loadout: spec.into(),
@@ -450,6 +800,12 @@ impl World {
                         q.officer = None
                     }
                 }
+                self.unschedule_due(id);
+                if let Some(members) = self.cell_members.get_mut(&spec.position.cell) {
+                    members.remove(&id);
+                }
+                self.lost_food += u128::from(spec.inventory.food);
+                self.lost_water += u128::from(spec.inventory.water);
                 self.soldiers.remove(id);
                 Ok(Event::SoldierRemoved {
                     id,
@@ -556,6 +912,23 @@ impl World {
                     value: z ^ (z >> 31),
                 })
             }
+            Command::SetActivity { id, activity } => {
+                if !self.soldiers.valid(id) {
+                    return Err(SimError::InvalidEntity);
+                }
+                if self.soldiers.living[id.index()].life != LifeState::Alive {
+                    return Err(SimError::DeadEntity);
+                }
+                let before = self.soldiers.living[id.index()].activity;
+                self.soldiers.living[id.index()].activity = activity;
+                self.schedule_due(id)?;
+                Ok(Event::ActivityChanged {
+                    id,
+                    before,
+                    after: activity,
+                    forced: false,
+                })
+            }
             Command::AdvanceTo { .. } => unreachable!(),
         }
     }
@@ -626,6 +999,17 @@ impl World {
                 })
             }
             ScheduledCommand::SetRegionHot { cell, hot } => {
+                let members: Vec<_> = self
+                    .cell_members
+                    .get(&cell)
+                    .into_iter()
+                    .flat_map(|x| x.iter())
+                    .copied()
+                    .collect();
+                for id in &members {
+                    self.analytical(*id, self.clock)?;
+                    self.unschedule_due(*id);
+                }
                 let fixed_steps = if hot {
                     self.hot_cells
                         .entry(cell)
@@ -638,6 +1022,11 @@ impl World {
                 } else {
                     self.hot_cells.remove(&cell).map_or(0, |h| h.fixed_steps)
                 };
+                if !hot {
+                    for id in members {
+                        self.schedule_due(id)?;
+                    }
+                }
                 Ok(Event::RegionFidelityChanged {
                     cell,
                     hot,
@@ -646,14 +1035,37 @@ impl World {
             }
         }
     }
-    fn step_hot_to(&mut self, t: u64) -> Result<(u64, u64), SimError> {
+    fn step_hot_to(&mut self, t: u64, out: &mut Vec<TimedEvent>) -> Result<(u64, u64), SimError> {
         for h in self.hot_cells.values() {
             h.fixed_steps
                 .checked_add(t - h.last_stepped_at)
                 .ok_or(SimError::ArithmeticOverflow)?;
         }
-        for h in self.hot_cells.values_mut() {
-            let d = t - h.last_stepped_at;
+        let cells: Vec<_> = self.hot_cells.keys().copied().collect();
+        for cell in cells {
+            let start = self.hot_cells[&cell].last_stepped_at;
+            let members: Vec<_> = self
+                .cell_members
+                .get(&cell)
+                .into_iter()
+                .flat_map(|x| x.iter())
+                .copied()
+                .collect();
+            if !members.is_empty() {
+                for at in start + 1..=t {
+                    for id in &members {
+                        if self.soldiers.valid(*id) {
+                            self.reference_second(*id, at, out)?;
+                            self.hot_member_steps = self
+                                .hot_member_steps
+                                .checked_add(1)
+                                .ok_or(SimError::ArithmeticOverflow)?;
+                        }
+                    }
+                }
+            }
+            let h = self.hot_cells.get_mut(&cell).unwrap();
+            let d = t - start;
             h.fixed_steps += d;
             h.last_stepped_at = t;
         }
@@ -676,7 +1088,8 @@ impl World {
         let times: Vec<_> = self.scheduled.range(..=target).map(|(t, _)| *t).collect();
         for t in times {
             let from = self.clock;
-            let (hot_cells_stepped, fixed_steps_per_hot_cell) = self.step_hot_to(t)?;
+            self.advance_cold_to(t, out)?;
+            let (hot_cells_stepped, fixed_steps_per_hot_cell) = self.step_hot_to(t, out)?;
             self.clock = t;
             if t != from {
                 out.push(TimedEvent {
@@ -710,7 +1123,8 @@ impl World {
             }
         }
         let from = self.clock;
-        let (hot_cells_stepped, fixed_steps_per_hot_cell) = self.step_hot_to(target)?;
+        self.advance_cold_to(target, out)?;
+        let (hot_cells_stepped, fixed_steps_per_hot_cell) = self.step_hot_to(target, out)?;
         self.clock = target;
         if target != from {
             out.push(TimedEvent {
@@ -733,7 +1147,7 @@ impl World {
         for i in 0..self.soldiers.alive.len() {
             if self.soldiers.alive[i] {
                 let id = EntityId::from_parts(i as u32, self.soldiers.generation[i]);
-                let n = self.soldiers.needs(i, self.clock);
+                let n = self.soldiers.living[i];
                 for b in id
                     .raw()
                     .to_le_bytes()
@@ -778,7 +1192,16 @@ impl World {
             carried_food: f,
             carried_water: w,
             carried_medical: m,
+            sourced_food: self.sourced_food,
+            sourced_water: self.sourced_water,
+            consumed_food: self.consumed_food,
+            consumed_water: self.consumed_water,
+            lost_food: self.lost_food,
+            lost_water: self.lost_water,
         }
+    }
+    pub fn living_work_counters(&self) -> (u64, u64) {
+        (self.cold_boundaries, self.hot_member_steps)
     }
     pub fn snapshot(&self) -> Vec<u8> {
         let mut w = W::default();
@@ -787,13 +1210,21 @@ impl World {
         w.u64(self.seed);
         w.u64(self.rng_counter);
         w.u64(self.next_schedule_id);
+        w.u128(self.sourced_food);
+        w.u128(self.sourced_water);
+        w.u128(self.consumed_food);
+        w.u128(self.consumed_water);
+        w.u128(self.lost_food);
+        w.u128(self.lost_water);
+        w.u64(self.cold_boundaries);
+        w.u64(self.hot_member_steps);
         w.u32(self.soldiers.alive.len() as u32);
         for i in 0..self.soldiers.alive.len() {
             w.u32(self.soldiers.generation[i]);
             w.bool(self.soldiers.alive[i]);
             if self.soldiers.alive[i] {
                 w.spec(self.soldiers.data[i]);
-                w.u64(self.soldiers.needs_at[i])
+                w.living(self.soldiers.living[i]);
             }
         }
         w.u32(self.soldiers.free.len() as u32);
@@ -830,6 +1261,14 @@ impl World {
                 w.sc(*command)
             }
         }
+        w.u32(self.living_due.len() as u32);
+        for (at, ids) in &self.living_due {
+            w.u64(*at);
+            w.u32(ids.len() as u32);
+            for id in ids {
+                w.u64(id.raw())
+            }
+        }
         w.0
     }
     pub fn from_snapshot(b: &[u8]) -> Result<Self, SimError> {
@@ -841,6 +1280,14 @@ impl World {
         let seed = r.u64()?;
         let rng_counter = r.u64()?;
         let next_schedule_id = r.u64()?;
+        let sourced_food = r.u128()?;
+        let sourced_water = r.u128()?;
+        let consumed_food = r.u128()?;
+        let consumed_water = r.u128()?;
+        let lost_food = r.u128()?;
+        let lost_water = r.u128()?;
+        let cold_boundaries = r.u64()?;
+        let hot_member_steps = r.u64()?;
         let mut soldiers = Soldiers::default();
         for _ in 0..r.u32()? {
             soldiers.generation.push(r.u32()?);
@@ -852,7 +1299,11 @@ impl World {
             } else {
                 SoldierSpec::default()
             });
-            soldiers.needs_at.push(if alive { r.u64()? } else { clock })
+            soldiers.living.push(if alive {
+                r.living()?
+            } else {
+                LivingState::default()
+            })
         }
         let mut seen = BTreeSet::new();
         for _ in 0..r.u32()? {
@@ -982,6 +1433,34 @@ impl World {
                 return Err(SimError::Snapshot("scheduled time"));
             }
         }
+        let mut living_due: BTreeMap<u64, BTreeSet<EntityId>> = BTreeMap::new();
+        let mut due_by_entity = HashMap::new();
+        let mut prev_due = None;
+        for _ in 0..r.u32()? {
+            let at = r.u64()?;
+            if at <= clock || prev_due.is_some_and(|p| at <= p) {
+                return Err(SimError::Snapshot("living due time"));
+            }
+            prev_due = Some(at);
+            let mut ids = BTreeSet::new();
+            let mut prev = None;
+            for _ in 0..r.u32()? {
+                let id = EntityId(r.u64()?);
+                if prev.is_some_and(|p| id <= p)
+                    || !soldiers.valid(id)
+                    || soldiers.living[id.index()].life != LifeState::Alive
+                    || !ids.insert(id)
+                    || due_by_entity.insert(id, at).is_some()
+                {
+                    return Err(SimError::Snapshot("living due entity"));
+                }
+                prev = Some(id);
+            }
+            if ids.is_empty() {
+                return Err(SimError::Snapshot("empty living due"));
+            }
+            living_due.insert(at, ids);
+        }
         if r.p != b.len() {
             return Err(SimError::Snapshot("trailing bytes"));
         }
@@ -997,7 +1476,28 @@ impl World {
             scheduled,
             schedule_index,
             reserved_stockpiles,
+            cell_members: BTreeMap::new(),
+            living_due,
+            due_by_entity,
+            sourced_food,
+            sourced_water,
+            consumed_food,
+            consumed_water,
+            lost_food,
+            lost_water,
+            cold_boundaries,
+            hot_member_steps,
         };
+        let mut w = w;
+        for i in 0..w.soldiers.alive.len() {
+            if w.soldiers.alive[i] {
+                let id = EntityId::from_parts(i as u32, w.soldiers.generation[i]);
+                w.cell_members
+                    .entry(w.soldiers.data[i].position.cell)
+                    .or_default()
+                    .insert(id);
+            }
+        }
         w.validate()?;
         Ok(w)
     }
@@ -1023,14 +1523,44 @@ impl World {
         }
         for i in 0..self.soldiers.alive.len() {
             if self.soldiers.alive[i] {
-                if self.soldiers.needs_at[i] > self.clock {
-                    return Err(SimError::Snapshot("future needs"));
+                if self.soldiers.living[i].materialized_at > self.clock
+                    || (self.soldiers.living[i].life == LifeState::Alive
+                        && self.soldiers.living[i].materialized_at != self.clock)
+                {
+                    return Err(SimError::Snapshot("living timestamp"));
                 }
                 if let Some(q) = self.soldiers.data[i].squad {
                     let id = EntityId::from_parts(i as u32, self.soldiers.generation[i]);
                     if !self.squads.get(&q).is_some_and(|q| q.members.contains(&id)) {
                         return Err(SimError::Snapshot("soldier squad"));
                     }
+                }
+            }
+        }
+        let carried = self.resource_totals();
+        if self.sourced_food != carried.carried_food + self.consumed_food + self.lost_food
+            || self.sourced_water != carried.carried_water + self.consumed_water + self.lost_water
+        {
+            return Err(SimError::Snapshot("resource ledger"));
+        }
+        for (cell, ids) in &self.cell_members {
+            for id in ids {
+                if !self.soldiers.valid(*id)
+                    || self.soldiers.data[id.index()].position.cell != *cell
+                {
+                    return Err(SimError::Snapshot("cell membership"));
+                }
+            }
+        }
+        for i in 0..self.soldiers.alive.len() {
+            if self.soldiers.alive[i] {
+                let id = EntityId::from_parts(i as u32, self.soldiers.generation[i]);
+                let hot = self
+                    .hot_cells
+                    .contains_key(&self.soldiers.data[i].position.cell);
+                let alive = self.soldiers.living[i].life == LifeState::Alive;
+                if self.due_by_entity.contains_key(&id) != (alive && !hot) {
+                    return Err(SimError::Snapshot("living due coverage"));
                 }
             }
         }
@@ -1062,6 +1592,27 @@ impl W {
     }
     fn u64(&mut self, x: u64) {
         self.0.extend(x.to_le_bytes())
+    }
+    fn u128(&mut self, x: u128) {
+        self.0.extend(x.to_le_bytes())
+    }
+    fn living(&mut self, l: LivingState) {
+        self.u32(l.hunger);
+        self.u32(l.thirst);
+        self.u32(l.fatigue);
+        self.u32(l.sleep_debt);
+        self.u16(l.morale);
+        self.u16(l.health);
+        self.u8(l.activity as u8);
+        match l.life {
+            LifeState::Alive => self.u8(0),
+            LifeState::Dead { at, cause } => {
+                self.u8(1);
+                self.u64(at);
+                self.u8(cause as u8)
+            }
+        }
+        self.u64(l.materialized_at)
     }
     fn opt_id(&mut self, x: Option<EntityId>) {
         self.bool(x.is_some());
@@ -1156,6 +1707,63 @@ impl R<'_> {
     fn u64(&mut self) -> Result<u64, SimError> {
         Ok(u64::from_le_bytes(self.take()?))
     }
+    fn u128(&mut self) -> Result<u128, SimError> {
+        Ok(u128::from_le_bytes(self.take()?))
+    }
+    fn living(&mut self) -> Result<LivingState, SimError> {
+        let hunger = self.u32()?;
+        let thirst = self.u32()?;
+        let fatigue = self.u32()?;
+        let sleep_debt = self.u32()?;
+        let morale = self.u16()?;
+        let health = self.u16()?;
+        let activity = match self.u8()? {
+            0 => Activity::Rest,
+            1 => Activity::Idle,
+            2 => Activity::March,
+            _ => return Err(SimError::Snapshot("activity")),
+        };
+        let life = match self.u8()? {
+            0 => LifeState::Alive,
+            1 => {
+                let at = self.u64()?;
+                let cause = match self.u8()? {
+                    0 => DeathCause::Dehydration,
+                    1 => DeathCause::Starvation,
+                    2 => DeathCause::Exhaustion,
+                    _ => return Err(SimError::Snapshot("death cause")),
+                };
+                LifeState::Dead { at, cause }
+            }
+            _ => return Err(SimError::Snapshot("life state")),
+        };
+        let materialized_at = self.u64()?;
+        if hunger > NEED_MAX
+            || thirst > NEED_MAX
+            || fatigue > NEED_MAX
+            || sleep_debt > NEED_MAX
+            || morale > 1000
+            || health > 1000
+        {
+            return Err(SimError::Snapshot("living range"));
+        }
+        if let LifeState::Dead { at, .. } = life {
+            if at != materialized_at || health != 0 {
+                return Err(SimError::Snapshot("death state"));
+            }
+        }
+        Ok(LivingState {
+            hunger,
+            thirst,
+            fatigue,
+            sleep_debt,
+            morale,
+            health,
+            activity,
+            life,
+            materialized_at,
+        })
+    }
     fn opt_id(&mut self) -> Result<Option<EntityId>, SimError> {
         if self.bool()? {
             Ok(Some(EntityId(self.u64()?)))
@@ -1234,7 +1842,7 @@ mod private_invariants {
         soldiers.generation.push(u32::MAX - 1);
         soldiers.alive.push(true);
         soldiers.data.push(SoldierSpec::default());
-        soldiers.needs_at.push(0);
+        soldiers.living.push(LivingState::default());
         soldiers.live = 1;
         let old = EntityId::from_parts(0, u32::MAX - 1);
         assert!(soldiers.remove(old).is_some());
@@ -1290,7 +1898,7 @@ mod private_invariants {
         world.soldiers.generation.push(0);
         world.soldiers.alive.push(false);
         world.soldiers.data.push(SoldierSpec::default());
-        world.soldiers.needs_at.push(0);
+        world.soldiers.living.push(LivingState::default());
         world.soldiers.free.push(0);
         assert!(matches!(
             World::from_snapshot(&world.snapshot()),
@@ -1304,7 +1912,7 @@ mod private_invariants {
         world.soldiers.generation.push(u32::MAX - 1);
         world.soldiers.alive.push(true);
         world.soldiers.data.push(SoldierSpec::default());
-        world.soldiers.needs_at.push(0);
+        world.soldiers.living.push(LivingState::default());
         world.soldiers.live = 1;
         let near_retirement = EntityId::from_parts(0, u32::MAX - 1);
         assert!(world
