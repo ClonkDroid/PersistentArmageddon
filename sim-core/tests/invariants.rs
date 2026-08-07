@@ -1,4 +1,5 @@
 use sim_core::*;
+use std::collections::BTreeSet;
 
 fn ok(w: &mut World, c: Command) -> Vec<TimedEvent> {
     let o = w.apply(c);
@@ -321,6 +322,80 @@ fn hot_cells_step_only_after_activation_and_survive_snapshot() {
 }
 
 #[test]
+fn time_advanced_reports_exact_segment_hot_work() {
+    let mut world = World::new(0);
+    let cold = ok(&mut world, Command::AdvanceTo { target: 2 });
+    assert!(matches!(
+        cold[0].event,
+        Event::TimeAdvanced {
+            hot_cells_stepped: 0,
+            fixed_steps_per_hot_cell: 0,
+            ..
+        }
+    ));
+    ok(&mut world, Command::SetRegionHot { cell: 1, hot: true });
+    let one = ok(&mut world, Command::AdvanceTo { target: 5 });
+    assert!(matches!(
+        one[0].event,
+        Event::TimeAdvanced {
+            hot_cells_stepped: 1,
+            fixed_steps_per_hot_cell: 3,
+            ..
+        }
+    ));
+    ok(&mut world, Command::SetRegionHot { cell: 2, hot: true });
+    let many = ok(&mut world, Command::AdvanceTo { target: 9 });
+    assert!(matches!(
+        many[0].event,
+        Event::TimeAdvanced {
+            hot_cells_stepped: 2,
+            fixed_steps_per_hot_cell: 4,
+            ..
+        }
+    ));
+    ok(
+        &mut world,
+        Command::CreateStockpile {
+            id: 1,
+            initial: Stock::default(),
+        },
+    );
+    ok(
+        &mut world,
+        Command::CreateStockpile {
+            id: 2,
+            initial: Stock::default(),
+        },
+    );
+    ok(
+        &mut world,
+        Command::Schedule {
+            at: 12,
+            command: ScheduledCommand::Transfer {
+                from: 1,
+                to: 2,
+                ammunition: 1,
+                supplies: 0,
+            },
+        },
+    );
+    let partial = world.apply(Command::AdvanceTo { target: 20 });
+    assert_eq!(partial.error, Some(SimError::InsufficientStock));
+    assert!(matches!(
+        partial.events[0].event,
+        Event::TimeAdvanced {
+            hot_cells_stepped: 2,
+            fixed_steps_per_hot_cell: 3,
+            ..
+        }
+    ));
+    assert!(world
+        .apply(Command::AdvanceTo { target: 12 })
+        .events
+        .is_empty());
+}
+
+#[test]
 fn relationships_and_ids_replay() {
     let mut a = World::new(2);
     ok(&mut a, Command::CreateSquad { id: 1 });
@@ -396,6 +471,148 @@ fn same_seed_commands_produce_identical_events_and_digest() {
         assert_eq!(a.apply(command), b.apply(command));
     }
     assert_eq!(a.state_digest(), b.state_digest());
+}
+
+#[test]
+fn allocator_reuse_keeps_live_ids_unique_and_stale_ids_dead() {
+    let mut world = World::new(5);
+    let held: Vec<_> = (0..64)
+        .map(
+            |_| match ok(&mut world, Command::SpawnSoldier { spec: spec(1) })[0].event {
+                Event::SoldierSpawned { id, .. } => id,
+                _ => unreachable!(),
+            },
+        )
+        .collect();
+    let mut current = held[0];
+    let mut stale = Vec::new();
+    for _ in 0..2_000 {
+        stale.push(current);
+        ok(&mut world, Command::DespawnSoldier { id: current });
+        current = match ok(&mut world, Command::SpawnSoldier { spec: spec(2) })[0].event {
+            Event::SoldierSpawned { id, .. } => id,
+            _ => unreachable!(),
+        };
+        assert!(stale.iter().all(|id| world.soldier(*id).is_none()));
+        let mut live = BTreeSet::new();
+        assert!(live.insert(current));
+        for id in held.iter().skip(1) {
+            assert!(live.insert(*id));
+            assert!(world.soldier(*id).is_some());
+        }
+    }
+}
+
+#[test]
+fn fidelity_cycles_preserve_tracked_soldier_records_and_continuation() {
+    let mut world = World::new(11);
+    ok(&mut world, Command::CreateSquad { id: 4 });
+    let specs = [
+        SoldierSpec {
+            position: Position {
+                x_mm: 10,
+                y_mm: 20,
+                cell: 7,
+            },
+            ammunition: 31,
+            inventory: Inventory {
+                food: 2,
+                water: 3,
+                medical: 4,
+            },
+            ..SoldierSpec::default()
+        },
+        SoldierSpec {
+            position: Position {
+                x_mm: -5,
+                y_mm: 8,
+                cell: 7,
+            },
+            rank: 3,
+            ..SoldierSpec::default()
+        },
+        SoldierSpec {
+            position: Position {
+                x_mm: 99,
+                y_mm: -2,
+                cell: 8,
+            },
+            role: Role::Officer,
+            ..SoldierSpec::default()
+        },
+    ];
+    let ids: Vec<_> = specs
+        .iter()
+        .map(
+            |spec| match ok(&mut world, Command::SpawnSoldier { spec: *spec })[0].event {
+                Event::SoldierSpawned { id, .. } => id,
+                _ => unreachable!(),
+            },
+        )
+        .collect();
+    ok(
+        &mut world,
+        Command::AssignOfficer {
+            squad: 4,
+            officer: ids[2],
+        },
+    );
+    ok(&mut world, Command::SetRegionHot { cell: 7, hot: true });
+    ok(
+        &mut world,
+        Command::Schedule {
+            at: 4,
+            command: ScheduledCommand::SetRegionHot {
+                cell: 7,
+                hot: false,
+            },
+        },
+    );
+    ok(&mut world, Command::AdvanceTo { target: 6 });
+    ok(&mut world, Command::SetRegionHot { cell: 7, hot: true });
+    ok(&mut world, Command::AdvanceTo { target: 9 });
+    ok(
+        &mut world,
+        Command::SetRegionHot {
+            cell: 7,
+            hot: false,
+        },
+    );
+    assert_eq!(world.soldier_count(), ids.len());
+    for (id, expected) in ids.iter().zip(specs) {
+        let actual = world.soldier(*id).unwrap();
+        assert_eq!(actual.id, *id);
+        assert_eq!(
+            (
+                actual.position,
+                actual.role,
+                actual.rank,
+                actual.ammunition,
+                actual.inventory
+            ),
+            (
+                expected.position,
+                expected.role,
+                expected.rank,
+                expected.ammunition,
+                expected.inventory
+            )
+        );
+    }
+    assert_eq!(world.soldier(ids[2]).unwrap().squad, Some(4));
+    let mut restored = World::from_snapshot(&world.snapshot()).unwrap();
+    for world in [&mut world, &mut restored] {
+        ok(world, Command::SetRegionHot { cell: 8, hot: true });
+        ok(world, Command::AdvanceTo { target: 12 });
+        ok(
+            world,
+            Command::SetRegionHot {
+                cell: 8,
+                hot: false,
+            },
+        );
+    }
+    assert_eq!(world.state_digest(), restored.state_digest());
 }
 
 #[test]

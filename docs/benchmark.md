@@ -7,30 +7,30 @@ Measured on 2026-08-07 with:
 ```text
 $ time cargo run --release -p sim-server -- --benchmark
 soldiers=2410000
-initialization_seconds=0.543056
+initialization_seconds=0.697565
 dense_scheduler_commands=100000
 advance_simulated_seconds=60
 advance_events=100004
 hot_cell_steps_included=true
 full_needs_pass_included=true
-combined_advance_wall_seconds=0.145459
-simulated_seconds_per_wall_second=412.488
+combined_advance_wall_seconds=0.243280
+simulated_seconds_per_wall_second=246.630
 design_goal_simulated_seconds_per_wall_second=1.000
 design_goal_met=true
 needs_checksum=3399153494c8c265
-snapshot_seconds=0.568191
+snapshot_seconds=0.567072
 snapshot_bytes=118480100
-digest_seconds=0.709766
+digest_seconds=0.972147
 digest=a89bf1efbf1f27bc
-current_rss_kib=267148
-peak_rss_kib=382744
+current_rss_kib=268008
+peak_rss_kib=383448
 
-real    2.131s
-user    1.186s
-sys     0.946s
+real    2.671s
+user    1.608s
+sys     1.045s
 ```
 
-Initialization, snapshot, and digest are separately timed and excluded from advance throughput. The defined advance workload combines ordered execution of 100,000 same-time hot-cell activations and one transfer across 60 simulated seconds with the complete derived-needs pass over all 2,410,000 live records. Hot-cell fixed-step counters are advanced across clock segments. Its measured 412.488 simulated-seconds per wall-second exceeds the design goal of 1, but this is evidence only for the M0 skeleton.
+Initialization, snapshot, and digest are separately timed and excluded from advance throughput. The defined advance workload combines ordered execution of 100,000 same-time hot-cell activations and one transfer across 60 simulated seconds with the complete derived-needs pass over all 2,410,000 live records. Hot-cell fixed-step counters are advanced across clock segments. Its measured 246.630 simulated-seconds per wall-second exceeds the design goal of 1, but this is evidence only for the M0 skeleton.
 
 ## Measurement environment
 
@@ -50,23 +50,23 @@ It does **not** measure or predict full warfare, combat, AI, pathfinding, graphi
 ```text
 $ PA_SOLDIERS=10000 PA_DENSE_COMMANDS=1000 cargo run --release -p sim-server -- --benchmark
 soldiers=10000
-initialization_seconds=0.002695
+initialization_seconds=0.003592
 dense_scheduler_commands=1000
 advance_simulated_seconds=60
 advance_events=1004
 hot_cell_steps_included=true
 full_needs_pass_included=true
-combined_advance_wall_seconds=0.000780
-simulated_seconds_per_wall_second=76897.839
+combined_advance_wall_seconds=0.000913
+simulated_seconds_per_wall_second=65711.729
 design_goal_simulated_seconds_per_wall_second=1.000
 design_goal_met=true
 needs_checksum=c6a9060f4fc58285
-snapshot_seconds=0.002400
+snapshot_seconds=0.002886
 snapshot_bytes=508100
-digest_seconds=0.003148
+digest_seconds=0.003491
 digest=8506f3af80594579
-current_rss_kib=3804
-peak_rss_kib=4136
+current_rss_kib=3808
+peak_rss_kib=4068
 ```
 
 Timings use `Instant`; RSS and peak RSS use Linux `/proc/self/status`. Unit tests assert deterministic state and event order, never timing.

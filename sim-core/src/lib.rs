@@ -206,7 +206,8 @@ pub enum Event {
     TimeAdvanced {
         from: u64,
         to: u64,
-        hot_steps: u64,
+        hot_cells_stepped: u64,
+        fixed_steps_per_hot_cell: u64,
     },
     Scheduled {
         id: u64,
@@ -645,7 +646,7 @@ impl World {
             }
         }
     }
-    fn step_hot_to(&mut self, t: u64) -> Result<(), SimError> {
+    fn step_hot_to(&mut self, t: u64) -> Result<(u64, u64), SimError> {
         for h in self.hot_cells.values() {
             h.fixed_steps
                 .checked_add(t - h.last_stepped_at)
@@ -656,7 +657,12 @@ impl World {
             h.fixed_steps += d;
             h.last_stepped_at = t;
         }
-        Ok(())
+        let cells = self.hot_cells.len() as u64;
+        Ok(if cells == 0 {
+            (0, 0)
+        } else {
+            (cells, t - self.clock)
+        })
     }
     fn advance(
         &mut self,
@@ -670,7 +676,7 @@ impl World {
         let times: Vec<_> = self.scheduled.range(..=target).map(|(t, _)| *t).collect();
         for t in times {
             let from = self.clock;
-            self.step_hot_to(t)?;
+            let (hot_cells_stepped, fixed_steps_per_hot_cell) = self.step_hot_to(t)?;
             self.clock = t;
             if t != from {
                 out.push(TimedEvent {
@@ -678,7 +684,8 @@ impl World {
                     event: Event::TimeAdvanced {
                         from,
                         to: t,
-                        hot_steps: t - from,
+                        hot_cells_stepped,
+                        fixed_steps_per_hot_cell,
                     },
                 });
             }
@@ -703,7 +710,7 @@ impl World {
             }
         }
         let from = self.clock;
-        self.step_hot_to(target)?;
+        let (hot_cells_stepped, fixed_steps_per_hot_cell) = self.step_hot_to(target)?;
         self.clock = target;
         if target != from {
             out.push(TimedEvent {
@@ -711,7 +718,8 @@ impl World {
                 event: Event::TimeAdvanced {
                     from,
                     to: target,
-                    hot_steps: target - from,
+                    hot_cells_stepped,
+                    fixed_steps_per_hot_cell,
                 },
             });
         }
@@ -851,6 +859,7 @@ impl World {
             let x = r.u32()?;
             if x as usize >= soldiers.alive.len()
                 || soldiers.alive[x as usize]
+                || soldiers.generation[x as usize] == 0
                 || soldiers.generation[x as usize] == u32::MAX
                 || !seen.insert(x)
             {
@@ -1272,6 +1281,20 @@ mod private_invariants {
         assert!(matches!(
             World::from_snapshot(&hot.snapshot()),
             Err(SimError::Snapshot("hot cell"))
+        ));
+    }
+
+    #[test]
+    fn restore_rejects_unreachable_zero_generation_free_slot() {
+        let mut world = World::new(0);
+        world.soldiers.generation.push(0);
+        world.soldiers.alive.push(false);
+        world.soldiers.data.push(SoldierSpec::default());
+        world.soldiers.needs_at.push(0);
+        world.soldiers.free.push(0);
+        assert!(matches!(
+            World::from_snapshot(&world.snapshot()),
+            Err(SimError::Snapshot("invalid free slot"))
         ));
     }
 }

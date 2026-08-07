@@ -8,7 +8,7 @@ This workspace implements the M0 deterministic execution skeleton, not combat or
 
 Soldier spawn is an explicit scenario-loadout source and removal is an explicit loadout loss. Their events identify the soldier and exact ammunition, food, water, and medical quantities. These are M0 scenario/casualty accounting events, not production or consumption.
 
-Hot cells have a deterministic one-second fixed-step counter. Clock segments advance only active cells; cold cells remain sparse. This is a queryable execution skeleton and does not claim tactical combat.
+Hot cells have a deterministic one-second fixed-step counter. Clock segments advance only active cells; cold cells remain sparse. `TimeAdvanced` reports the exact active-cell count and fixed steps per active cell for each segment, avoiding an overflowing aggregate product. This is a queryable execution skeleton and does not claim tactical combat.
 
 ## Server wire format
 
@@ -25,4 +25,4 @@ PA_SOLDIERS=10000 PA_DENSE_COMMANDS=1000 cargo run --release -p sim-server -- --
 cargo run --release -p sim-server -- --benchmark
 ```
 
-Snapshot version 5 includes schedule IDs, the cancellation index, reserved stockpile creations, and hot-cell execution state and is decoded strictly. The manual benchmark defaults to 2,410,000 records and 100,000 dense commands. See [benchmark evidence](docs/benchmark.md) and [ADR 0001](docs/adr/0001-authoritative-state-and-lod.md).
+Snapshot version 5 includes schedule IDs, canonical pending schedule data from which cancellation and stockpile-reservation indexes are reconstructed, and hot-cell execution state and is decoded strictly. The manual benchmark defaults to 2,410,000 records and 100,000 dense commands. See [benchmark evidence](docs/benchmark.md) and [ADR 0001](docs/adr/0001-authoritative-state-and-lod.md).

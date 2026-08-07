@@ -7,10 +7,11 @@ use sim_core::{
 use std::env;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 const MAX_REQUEST: usize = 64 * 1024;
 const MAX_HEADER: usize = 16 * 1024;
+const CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     if env::args().any(|a| a == "--benchmark") {
@@ -19,13 +20,46 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind("127.0.0.1:8080")?;
     let mut world = World::new(1);
     eprintln!("sim-server listening on http://127.0.0.1:8080");
-    for stream in listener.incoming() {
-        serve_connection(stream?, &mut world)?;
-    }
+    serve_listener(
+        &listener,
+        &mut world,
+        CONNECTION_TIMEOUT,
+        None,
+        serve_connection,
+    );
     Ok(())
 }
 
-fn serve_connection(mut stream: TcpStream, world: &mut World) -> std::io::Result<()> {
+fn serve_listener<F>(
+    listener: &TcpListener,
+    world: &mut World,
+    timeout: Duration,
+    limit: Option<usize>,
+    mut handler: F,
+) where
+    F: FnMut(TcpStream, &mut World, Duration) -> std::io::Result<()>,
+{
+    let mut accepted = 0;
+    while limit.is_none_or(|limit| accepted < limit) {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                accepted += 1;
+                if let Err(error) = handler(stream, world, timeout) {
+                    eprintln!("contained connection failure: {error}");
+                }
+            }
+            Err(error) => eprintln!("contained accept failure: {error}"),
+        }
+    }
+}
+
+fn serve_connection(
+    mut stream: TcpStream,
+    world: &mut World,
+    timeout: Duration,
+) -> std::io::Result<()> {
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
     let (status, kind, body) = read_and_handle(&mut stream, world);
     write!(stream,"HTTP/1.1 {status}\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",body.len())?;
     stream.write_all(&body)
@@ -289,8 +323,11 @@ fn event_json(x: &TimedEvent) -> Value {
         Event::TimeAdvanced {
             from,
             to,
-            hot_steps,
-        } => json!({"type":"time_advanced","from":from,"to":to,"hot_steps":hot_steps}),
+            hot_cells_stepped,
+            fixed_steps_per_hot_cell,
+        } => {
+            json!({"type":"time_advanced","from":from,"to":to,"hot_cells_stepped":hot_cells_stepped,"fixed_steps_per_hot_cell":fixed_steps_per_hot_cell})
+        }
         Event::Scheduled { id, at } => json!({"type":"scheduled","id":id,"at":at}),
         Event::ScheduleCancelled { id, at } => json!({"type":"schedule_cancelled","id":id,"at":at}),
         Event::RandomGenerated { value } => json!({"type":"random_generated","value":value}),
@@ -421,7 +458,7 @@ mod tests {
         let server = thread::spawn(move || {
             let mut world = world;
             let (stream, _) = listener.accept().unwrap();
-            serve_connection(stream, &mut world).unwrap();
+            serve_connection(stream, &mut world, Duration::from_secs(2)).unwrap();
             world
         });
         let mut client = TcpStream::connect(address).unwrap();
@@ -525,5 +562,89 @@ mod tests {
         let (response, world) = exchange(b"GET /health HTTP/1.1\n\n".to_vec(), true, world);
         assert_eq!(status(&response), "HTTP/1.1 400 Bad Request");
         assert_eq!(world.state_digest(), digest);
+    }
+
+    fn later_health(listener: &TcpListener) -> TcpStream {
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        client
+            .write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
+        client
+    }
+
+    #[test]
+    fn listener_contains_connection_failure_and_serves_later_peer() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client_listener = listener.try_clone().unwrap();
+        let server = thread::spawn(move || {
+            let mut first = true;
+            let mut world = World::new(0);
+            serve_listener(
+                &listener,
+                &mut world,
+                Duration::from_millis(100),
+                Some(2),
+                |mut stream, world, timeout| {
+                    if first {
+                        first = false;
+                        stream.set_read_timeout(Some(timeout))?;
+                        let _committed_response = read_and_handle(&mut stream, world);
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::BrokenPipe,
+                            "injected response write failure",
+                        ));
+                    }
+                    serve_connection(stream, world, timeout)
+                },
+            );
+            world
+        });
+        let body = r#"{"version":1,"command":"set_region_hot","cell":7,"hot":true}"#;
+        let mut failed = TcpStream::connect(client_listener.local_addr().unwrap()).unwrap();
+        failed.write_all(&req(body)).unwrap();
+        drop(failed);
+        let mut healthy = later_health(&client_listener);
+        let mut response = Vec::new();
+        healthy.read_to_end(&mut response).unwrap();
+        assert_eq!(status(&response), "HTTP/1.1 200 OK");
+        assert!(server.join().unwrap().hot_cell(7).is_some());
+    }
+
+    fn stalled_peer_does_not_wedge_listener(request: &[u8]) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client_listener = listener.try_clone().unwrap();
+        let server = thread::spawn(move || {
+            let mut world = World::new(0);
+            serve_listener(
+                &listener,
+                &mut world,
+                Duration::from_millis(40),
+                Some(2),
+                serve_connection,
+            );
+        });
+        let mut stalled = TcpStream::connect(client_listener.local_addr().unwrap()).unwrap();
+        stalled.write_all(request).unwrap();
+        let mut healthy = later_health(&client_listener);
+        healthy
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let mut response = Vec::new();
+        healthy.read_to_end(&mut response).unwrap();
+        assert_eq!(status(&response), "HTTP/1.1 200 OK");
+        server.join().unwrap();
+        drop(stalled);
+    }
+
+    #[test]
+    fn stalled_header_times_out_without_process_restart() {
+        stalled_peer_does_not_wedge_listener(b"GET /health HTTP/1.1\r\nHost: localhost\r\n");
+    }
+
+    #[test]
+    fn stalled_declared_body_times_out_without_half_close() {
+        stalled_peer_does_not_wedge_listener(
+            b"POST /v1/command HTTP/1.1\r\nContent-Length: 100\r\n\r\n{}",
+        );
     }
 }

@@ -10,7 +10,7 @@ Accepted.
 
 Spawn and removal are explicitly modeled as scenario-loadout source and casualty/removal loss events containing exact carried quantities. Transfers are atomic and conserved. M0 does not implement consumption or production.
 
-Each hot cell stores activation time, last stepped time, and an exact one-second fixed-step count. Every clock segment advances active cells before commands at its endpoint, so activation at T affects only later intervals and deactivation observes all work through T. Cold cells receive no per-step work. Same-time command insertion order determines transitions. This is only an execution skeleton; it contains no combat.
+Each hot cell stores activation time, last stepped time, and an exact one-second fixed-step count. Every clock segment advances active cells before commands at its endpoint, so activation at T affects only later intervals and deactivation observes all work through T. Its event reports `hot_cells_stepped` and `fixed_steps_per_hot_cell`; both are zero for a cold segment, and their aggregate can be computed in `u128`. Cold cells receive no per-step work. Same-time command insertion order determines transitions. This is only an execution skeleton; it contains no combat.
 
 Snapshots use canonical little-endian version 5 encoding. They include allocator order and retirement, RNG and schedule ID counters, pending order, relationships, loadouts, ledger state, and hot-cell execution state. Restore reconstructs and validates cancellation and reservation indexes, rejects noncanonical ordering, and requires the exact active-window step equation. Digests cover the snapshot.
 
