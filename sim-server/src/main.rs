@@ -258,23 +258,49 @@ fn remaining(deadline: Instant) -> std::io::Result<Duration> {
 fn set_remaining_read(stream: &TcpStream, deadline: Instant) -> std::io::Result<()> {
     stream.set_read_timeout(Some(remaining(deadline)?))
 }
+
+trait DeadlineWriter {
+    fn now(&self) -> Instant;
+    fn set_timeout(&mut self, timeout: Duration) -> std::io::Result<()>;
+    fn write_chunk(&mut self, bytes: &[u8]) -> std::io::Result<usize>;
+}
+
+impl DeadlineWriter for TcpStream {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+
+    fn set_timeout(&mut self, timeout: Duration) -> std::io::Result<()> {
+        self.set_write_timeout(Some(timeout))
+    }
+
+    fn write_chunk(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.write(bytes)
+    }
+}
+
 fn write_all_deadline(
     stream: &mut TcpStream,
     bytes: &[u8],
     deadline: Instant,
 ) -> std::io::Result<()> {
-    write_all_bounded(stream, bytes, |stream| {
-        stream.set_write_timeout(Some(remaining(deadline)?))
-    })
+    write_all_deadline_with(stream, bytes, deadline)
 }
-fn write_all_bounded<W: Write>(
+
+fn write_all_deadline_with<W: DeadlineWriter>(
     stream: &mut W,
     mut bytes: &[u8],
-    mut before_write: impl FnMut(&mut W) -> std::io::Result<()>,
+    deadline: Instant,
 ) -> std::io::Result<()> {
     while !bytes.is_empty() {
-        before_write(stream)?;
-        match stream.write(bytes) {
+        let timeout = deadline
+            .checked_duration_since(stream.now())
+            .filter(|duration| !duration.is_zero())
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "connection deadline expired")
+            })?;
+        stream.set_timeout(timeout)?;
+        match stream.write_chunk(bytes) {
             Ok(0) => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::WriteZero,
@@ -935,37 +961,61 @@ mod tests {
 
     #[test]
     fn deadline_aware_write_stops_incremental_progress() {
-        use std::sync::{
-            atomic::{AtomicBool, Ordering},
-            Arc,
-        };
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let mut writer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-        let (mut reader, _) = listener.accept().unwrap();
-        let stop = Arc::new(AtomicBool::new(false));
-        let reader_stop = Arc::clone(&stop);
-        let draining = thread::spawn(move || {
-            let mut byte = [0];
-            while !reader_stop.load(Ordering::SeqCst) {
-                let _ = reader.read(&mut byte);
-                thread::sleep(Duration::from_millis(5));
+        struct ControlledWriter {
+            now: Instant,
+            step: Duration,
+            chunk: usize,
+            written: usize,
+            progress: Vec<usize>,
+            timeouts: Vec<Duration>,
+        }
+
+        impl DeadlineWriter for ControlledWriter {
+            fn now(&self) -> Instant {
+                self.now
             }
-        });
-        let body = vec![0_u8; 8 * 1024 * 1024];
-        let error = write_all_deadline(
-            &mut writer,
-            &body,
-            connection_deadline(Duration::from_millis(50)),
-        )
-        .unwrap_err();
-        assert!(matches!(
-            error.kind(),
-            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-        ));
-        assert!(!stop.load(Ordering::SeqCst));
-        stop.store(true, Ordering::SeqCst);
-        writer.shutdown(std::net::Shutdown::Both).unwrap();
-        draining.join().unwrap();
+
+            fn set_timeout(&mut self, timeout: Duration) -> std::io::Result<()> {
+                self.timeouts.push(timeout);
+                Ok(())
+            }
+
+            fn write_chunk(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                let count = self.chunk.min(bytes.len());
+                self.written += count;
+                self.progress.push(count);
+                self.now += self.step;
+                Ok(count)
+            }
+        }
+
+        let start = Instant::now();
+        let mut writer = ControlledWriter {
+            now: start,
+            step: Duration::from_millis(3),
+            chunk: 2,
+            written: 0,
+            progress: Vec::new(),
+            timeouts: Vec::new(),
+        };
+        let body = [0_u8; 10];
+        let error = write_all_deadline_with(&mut writer, &body, start + Duration::from_millis(9))
+            .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(writer.progress, [2, 2, 2]);
+        assert!(writer.progress.iter().all(|count| *count > 0));
+        assert_eq!(writer.written, 6, "three partial writes made progress");
+        assert!(writer.written < body.len());
+        assert_eq!(
+            writer.timeouts,
+            [
+                Duration::from_millis(9),
+                Duration::from_millis(6),
+                Duration::from_millis(3),
+            ]
+        );
+        assert!(writer.timeouts.windows(2).all(|pair| pair[1] < pair[0]));
     }
 
     #[test]
