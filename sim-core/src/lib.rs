@@ -513,10 +513,6 @@ impl World {
         }
         Ok(l.materialized_at.checked_add(d))
     }
-    fn analytical(&mut self, id: EntityId, to: u64) -> Result<(), SimError> {
-        let i = id.index();
-        Self::project(&mut self.soldiers.living[i], to)
-    }
     fn project(l: &mut LivingState, to: u64) -> Result<(), SimError> {
         let n = to
             .checked_sub(l.materialized_at)
@@ -560,13 +556,16 @@ impl World {
         at: u64,
         out: &mut Vec<TimedEvent>,
     ) -> Result<(), SimError> {
-        self.analytical(id, at)?;
         let i = id.index();
         if self.soldiers.living[i].life != LifeState::Alive {
             return Ok(());
         }
         let mut l = self.soldiers.living[i];
-        let inv = &mut self.soldiers.data[i].inventory;
+        Self::project(&mut l, at)?;
+        let mut inv = self.soldiers.data[i].inventory;
+        let mut consumed_food = self.consumed_food;
+        let mut consumed_water = self.consumed_water;
+        let mut events = Vec::new();
         let hb = l.hunger;
         let tb = l.thirst;
         let mut food = 0;
@@ -575,8 +574,7 @@ impl World {
             inv.food -= FOOD_RATION;
             food = FOOD_RATION;
             l.hunger -= RATION_THRESHOLD;
-            self.consumed_food = self
-                .consumed_food
+            consumed_food = consumed_food
                 .checked_add(1)
                 .ok_or(SimError::ArithmeticOverflow)?;
         }
@@ -584,13 +582,12 @@ impl World {
             inv.water -= WATER_RATION;
             water = WATER_RATION;
             l.thirst -= RATION_THRESHOLD;
-            self.consumed_water = self
-                .consumed_water
+            consumed_water = consumed_water
                 .checked_add(1)
                 .ok_or(SimError::ArithmeticOverflow)?;
         }
         if food != 0 || water != 0 {
-            out.push(TimedEvent {
+            events.push(TimedEvent {
                 at,
                 event: Event::RationConsumed {
                     id,
@@ -606,7 +603,7 @@ impl World {
         if l.activity == Activity::March && l.fatigue >= FORCED_IDLE_FATIGUE {
             let before = l.activity;
             l.activity = Activity::Idle;
-            out.push(TimedEvent {
+            events.push(TimedEvent {
                 at,
                 event: Event::ActivityChanged {
                     id,
@@ -628,7 +625,7 @@ impl World {
                 4
             };
             l.health = l.health.saturating_sub(damage);
-            out.push(TimedEvent {
+            events.push(TimedEvent {
                 at,
                 event: Event::LivingDeteriorated {
                     id,
@@ -645,7 +642,7 @@ impl World {
                     DeathCause::Starvation
                 };
                 l.life = LifeState::Dead { at, cause };
-                out.push(TimedEvent {
+                events.push(TimedEvent {
                     at,
                     event: Event::SoldierDied {
                         id,
@@ -656,28 +653,11 @@ impl World {
             }
         }
         self.soldiers.living[i] = l;
+        self.soldiers.data[i].inventory = inv;
         self.soldiers.data[i].health = l.health;
-        Ok(())
-    }
-    fn advance_cold_to(&mut self, t: u64, out: &mut Vec<TimedEvent>) -> Result<(), SimError> {
-        while let Some(at) = self.living_due.keys().next().copied().filter(|x| *x <= t) {
-            let ids = self.living_due.remove(&at).unwrap();
-            for id in ids {
-                self.due_by_entity.remove(&id);
-                if self.soldiers.valid(id)
-                    && !self
-                        .hot_cells
-                        .contains_key(&self.soldiers.data[id.index()].position.cell)
-                {
-                    self.reference_second(id, at, out)?;
-                    self.cold_boundaries = self
-                        .cold_boundaries
-                        .checked_add(1)
-                        .ok_or(SimError::ArithmeticOverflow)?;
-                    self.schedule_due(id)?;
-                }
-            }
-        }
+        self.consumed_food = consumed_food;
+        self.consumed_water = consumed_water;
+        out.extend(events);
         Ok(())
     }
     pub fn new(seed: u64) -> Self {
@@ -757,19 +737,7 @@ impl World {
         let mut events = Vec::new();
         let mut blocked = None;
         let error = match c {
-            Command::AdvanceTo { target } => {
-                let mut staged = self.clone();
-                match staged.advance(target, &mut events, &mut blocked) {
-                    Ok(()) => {
-                        *self = staged;
-                        Ok(())
-                    }
-                    Err(error) => {
-                        events.clear();
-                        Err(error)
-                    }
-                }
-            }
+            Command::AdvanceTo { target } => self.advance(target, &mut events, &mut blocked),
             _ => self.apply_one(c).map(|e| {
                 events.push(TimedEvent {
                     at: self.clock,
@@ -916,10 +884,7 @@ impl World {
                 supplies,
             }),
             Command::SetRegionHot { cell, hot } => {
-                let mut staged = self.clone();
-                let event = staged.apply_scheduled(ScheduledCommand::SetRegionHot { cell, hot })?;
-                *self = staged;
-                Ok(event)
+                self.apply_scheduled(ScheduledCommand::SetRegionHot { cell, hot })
             }
             Command::Schedule { at, command } => {
                 if at < self.clock {
@@ -976,15 +941,24 @@ impl World {
                 let mut replacement = old;
                 Self::project(&mut replacement, self.clock)?;
                 replacement.activity = activity;
-                self.soldiers.living[id.index()] = replacement;
-                let due = self.canonical_due(id);
-                self.soldiers.living[id.index()] = old;
-                let due = due?;
+                let hot = self
+                    .hot_cells
+                    .contains_key(&self.soldiers.data[id.index()].position.cell);
+                let due = if hot {
+                    None
+                } else {
+                    self.soldiers.living[id.index()] = replacement;
+                    let result = self.canonical_due(id);
+                    self.soldiers.living[id.index()] = old;
+                    result?
+                };
                 self.unschedule_due(id);
                 self.soldiers.living[id.index()] = replacement;
-                if let Some(at) = due {
-                    self.living_due.entry(at).or_default().insert(id);
-                    self.due_by_entity.insert(id, at);
+                if !hot {
+                    if let Some(at) = due {
+                        self.living_due.entry(at).or_default().insert(id);
+                        self.due_by_entity.insert(id, at);
+                    }
                 }
                 Ok(Event::ActivityChanged {
                     id,
@@ -1070,8 +1044,26 @@ impl World {
                     .flat_map(|x| x.iter())
                     .copied()
                     .collect();
+                // Stage every touched living record and replacement due time before
+                // changing fidelity or either index. This is proportional to the
+                // cell membership, never to the whole world.
+                let mut staged = Vec::with_capacity(members.len());
                 for id in &members {
-                    self.analytical(*id, self.clock)?;
+                    let mut living = self.soldiers.living[id.index()];
+                    Self::project(&mut living, self.clock)?;
+                    let due = if !hot && living.life == LifeState::Alive {
+                        let old = self.soldiers.living[id.index()];
+                        self.soldiers.living[id.index()] = living;
+                        let result = self.canonical_due(*id);
+                        self.soldiers.living[id.index()] = old;
+                        result?
+                    } else {
+                        None
+                    };
+                    staged.push((*id, living, due));
+                }
+                for (id, living, _) in &staged {
+                    self.soldiers.living[id.index()] = *living;
                     self.unschedule_due(*id);
                 }
                 let fixed_steps = if hot {
@@ -1087,8 +1079,11 @@ impl World {
                     self.hot_cells.remove(&cell).map_or(0, |h| h.fixed_steps)
                 };
                 if !hot {
-                    for id in members {
-                        self.schedule_due(id)?;
+                    for (id, _, due) in staged {
+                        if let Some(at) = due {
+                            self.living_due.entry(at).or_default().insert(id);
+                            self.due_by_entity.insert(id, at);
+                        }
                     }
                 }
                 Ok(Event::RegionFidelityChanged {
@@ -1099,7 +1094,7 @@ impl World {
             }
         }
     }
-    fn step_hot_to(&mut self, t: u64, out: &mut Vec<TimedEvent>) -> Result<(u64, u64), SimError> {
+    fn preflight_hot_cells(&self, t: u64) -> Result<(), SimError> {
         let mut required = 0_u64;
         for h in self.hot_cells.values() {
             let elapsed = t
@@ -1110,55 +1105,133 @@ impl World {
                 .ok_or(SimError::ArithmeticOverflow)?;
         }
         for (cell, h) in &self.hot_cells {
-            let alive = self
-                .cell_members
-                .get(cell)
-                .into_iter()
-                .flat_map(|x| x.iter())
-                .filter(|id| {
-                    self.soldiers.valid(**id)
-                        && self.soldiers.living[id.index()].life == LifeState::Alive
-                })
-                .count() as u64;
-            required = required
-                .checked_add(
-                    alive
-                        .checked_mul(t - h.last_stepped_at)
-                        .ok_or(SimError::ArithmeticOverflow)?,
-                )
-                .ok_or(SimError::ArithmeticOverflow)?;
+            for id in self.cell_members.get(cell).into_iter().flatten() {
+                if !self.soldiers.valid(*id) {
+                    continue;
+                }
+                let mut living = self.soldiers.living[id.index()];
+                let mut inventory = self.soldiers.data[id.index()].inventory;
+                let mut at = h.last_stepped_at;
+                while at < t && living.life == LifeState::Alive {
+                    at += 1;
+                    Self::project(&mut living, at)?;
+                    if living.hunger >= RATION_THRESHOLD && inventory.food > 0 {
+                        inventory.food -= FOOD_RATION;
+                        living.hunger -= RATION_THRESHOLD;
+                    }
+                    if living.thirst >= RATION_THRESHOLD && inventory.water > 0 {
+                        inventory.water -= WATER_RATION;
+                        living.thirst -= RATION_THRESHOLD;
+                    }
+                    if living.activity == Activity::March && living.fatigue >= FORCED_IDLE_FATIGUE {
+                        living.activity = Activity::Idle;
+                    }
+                    if (inventory.food == 0 && living.hunger >= SEVERE_HUNGER)
+                        || (inventory.water == 0 && living.thirst >= SEVERE_THIRST)
+                    {
+                        let damage = if inventory.water == 0 && living.thirst >= SEVERE_THIRST {
+                            10
+                        } else {
+                            4
+                        };
+                        living.health = living.health.saturating_sub(damage);
+                        if living.health == 0 {
+                            living.life = LifeState::Dead {
+                                at,
+                                cause: if inventory.water == 0 && living.thirst >= SEVERE_THIRST {
+                                    DeathCause::Dehydration
+                                } else {
+                                    DeathCause::Starvation
+                                },
+                            };
+                        }
+                    }
+                    required = required
+                        .checked_add(1)
+                        .ok_or(SimError::ArithmeticOverflow)?;
+                }
+            }
         }
         self.hot_member_steps
             .checked_add(required)
             .ok_or(SimError::ArithmeticOverflow)?;
-        let cells: Vec<_> = self.hot_cells.keys().copied().collect();
-        for cell in cells {
-            let start = self.hot_cells[&cell].last_stepped_at;
-            let members: Vec<_> = self
-                .cell_members
-                .get(&cell)
-                .into_iter()
-                .flat_map(|x| x.iter())
-                .copied()
-                .collect();
-            if start < t && !members.is_empty() {
-                for at in start.checked_add(1).ok_or(SimError::ArithmeticOverflow)?..=t {
-                    for id in &members {
-                        if self.soldiers.valid(*id)
-                            && self.soldiers.living[id.index()].life == LifeState::Alive
-                        {
-                            self.reference_second(*id, at, out)?;
-                            self.hot_member_steps = self
-                                .hot_member_steps
-                                .checked_add(1)
-                                .ok_or(SimError::ArithmeticOverflow)?;
-                        }
-                    }
+        Ok(())
+    }
+    fn automatic_to(&mut self, t: u64, out: &mut Vec<TimedEvent>) -> Result<(u64, u64), SimError> {
+        self.preflight_hot_cells(t)?;
+        loop {
+            let cold_at = self.living_due.keys().next().copied().filter(|at| *at <= t);
+            let hot_at = self
+                .hot_cells
+                .iter()
+                .filter(|(cell, h)| {
+                    h.last_stepped_at < t
+                        && self.cell_members.get(cell).into_iter().flatten().any(|id| {
+                            self.soldiers.valid(*id)
+                                && self.soldiers.living[id.index()].life == LifeState::Alive
+                        })
+                })
+                .map(|(_, h)| h)
+                .map(|h| h.last_stepped_at + 1)
+                .min();
+            let Some(at) = cold_at.into_iter().chain(hot_at).min() else {
+                break;
+            };
+            let mut ids = BTreeSet::new();
+            if cold_at == Some(at) {
+                ids.extend(self.living_due.get(&at).into_iter().flatten().copied());
+            }
+            for (cell, h) in &self.hot_cells {
+                if h.last_stepped_at < at {
+                    ids.extend(self.cell_members.get(cell).into_iter().flatten().copied());
                 }
             }
-            let h = self.hot_cells.get_mut(&cell).unwrap();
-            let d = t - start;
-            h.fixed_steps += d;
+            for id in ids {
+                if !self.soldiers.valid(id)
+                    || self.soldiers.living[id.index()].life != LifeState::Alive
+                {
+                    self.unschedule_due(id);
+                    continue;
+                }
+                let cell = self.soldiers.data[id.index()].position.cell;
+                let is_hot = self
+                    .hot_cells
+                    .get(&cell)
+                    .is_some_and(|h| h.last_stepped_at < at);
+                if is_hot {
+                    let next = self
+                        .hot_member_steps
+                        .checked_add(1)
+                        .ok_or(SimError::ArithmeticOverflow)?;
+                    self.reference_second(id, at, out)?;
+                    self.hot_member_steps = next;
+                } else if self.due_by_entity.get(&id) == Some(&at) {
+                    let next = self
+                        .cold_boundaries
+                        .checked_add(1)
+                        .ok_or(SimError::ArithmeticOverflow)?;
+                    self.unschedule_due(id);
+                    if let Err(error) = self.reference_second(id, at, out) {
+                        self.living_due.entry(at).or_default().insert(id);
+                        self.due_by_entity.insert(id, at);
+                        return Err(error);
+                    }
+                    self.cold_boundaries = next;
+                    self.schedule_due(id)?;
+                }
+            }
+            for h in self
+                .hot_cells
+                .values_mut()
+                .filter(|h| h.last_stepped_at < at)
+            {
+                h.fixed_steps += 1;
+                h.last_stepped_at = at;
+            }
+        }
+        for h in self.hot_cells.values_mut() {
+            let elapsed = t - h.last_stepped_at;
+            h.fixed_steps += elapsed;
             h.last_stepped_at = t;
         }
         let cells = self.hot_cells.len() as u64;
@@ -1180,10 +1253,7 @@ impl World {
         let times: Vec<_> = self.scheduled.range(..=target).map(|(t, _)| *t).collect();
         for t in times {
             let from = self.clock;
-            let event_start = out.len();
-            self.advance_cold_to(t, out)?;
-            let (hot_cells_stepped, fixed_steps_per_hot_cell) = self.step_hot_to(t, out)?;
-            Self::order_automatic(&mut out[event_start..]);
+            let (hot_cells_stepped, fixed_steps_per_hot_cell) = self.automatic_to(t, out)?;
             self.clock = t;
             if t != from {
                 out.push(TimedEvent {
@@ -1217,10 +1287,7 @@ impl World {
             }
         }
         let from = self.clock;
-        let event_start = out.len();
-        self.advance_cold_to(target, out)?;
-        let (hot_cells_stepped, fixed_steps_per_hot_cell) = self.step_hot_to(target, out)?;
-        Self::order_automatic(&mut out[event_start..]);
+        let (hot_cells_stepped, fixed_steps_per_hot_cell) = self.automatic_to(target, out)?;
         self.clock = target;
         if target != from {
             out.push(TimedEvent {
@@ -1234,18 +1301,6 @@ impl World {
             });
         }
         Ok(())
-    }
-    fn order_automatic(events: &mut [TimedEvent]) {
-        fn id(event: &Event) -> u64 {
-            match *event {
-                Event::ActivityChanged { id, .. }
-                | Event::RationConsumed { id, .. }
-                | Event::LivingDeteriorated { id, .. }
-                | Event::SoldierDied { id, .. } => id.raw(),
-                _ => u64::MAX,
-            }
-        }
-        events.sort_by_key(|event| (event.at, id(&event.event)));
     }
     pub fn state_digest(&self) -> u64 {
         fnv1a(&self.snapshot())
@@ -2099,6 +2154,83 @@ mod private_invariants {
             None
         );
         assert_eq!(world.state_digest(), digest);
+    }
+
+    #[test]
+    fn hot_activity_never_installs_a_cold_due_entry() {
+        let mut world = World::new(0);
+        world.apply(Command::SetRegionHot { cell: 7, hot: true });
+        let id = spawn(
+            &mut world,
+            SoldierSpec {
+                position: Position {
+                    cell: 7,
+                    ..Position::default()
+                },
+                ..SoldierSpec::default()
+            },
+        );
+        assert!(world
+            .apply(Command::SetActivity {
+                id,
+                activity: Activity::March,
+            })
+            .error
+            .is_none());
+        assert!(!world.due_by_entity.contains_key(&id));
+        assert!(World::from_snapshot(&world.snapshot()).is_ok());
+        world.apply(Command::SetRegionHot {
+            cell: 7,
+            hot: false,
+        });
+        assert!(world.due_by_entity.contains_key(&id));
+    }
+
+    #[test]
+    fn exact_hot_counter_capacity_accounts_for_death() {
+        let mut world = World::new(0);
+        world.apply(Command::SetRegionHot { cell: 1, hot: true });
+        let id = spawn(
+            &mut world,
+            SoldierSpec {
+                position: Position {
+                    cell: 1,
+                    ..Position::default()
+                },
+                health: 10,
+                ..SoldierSpec::default()
+            },
+        );
+        world.soldiers.living[id.index()].thirst = SEVERE_THIRST;
+        world.hot_member_steps = u64::MAX - 1;
+        let outcome = world.apply(Command::AdvanceTo { target: 2 });
+        assert_eq!(outcome.error, None);
+        assert_eq!(world.hot_member_steps, u64::MAX);
+        assert!(matches!(
+            world.soldiers.living[id.index()].life,
+            LifeState::Dead { at: 1, .. }
+        ));
+
+        let mut overflow = World::new(0);
+        overflow.apply(Command::SetRegionHot { cell: 1, hot: true });
+        let id = spawn(
+            &mut overflow,
+            SoldierSpec {
+                position: Position {
+                    cell: 1,
+                    ..Position::default()
+                },
+                ..SoldierSpec::default()
+            },
+        );
+        overflow.hot_member_steps = u64::MAX;
+        let before = overflow.soldiers.living[id.index()];
+        assert_eq!(
+            overflow.apply(Command::AdvanceTo { target: 1 }).error,
+            Some(SimError::ArithmeticOverflow)
+        );
+        assert_eq!(overflow.clock, 0);
+        assert_eq!(overflow.soldiers.living[id.index()], before);
     }
 
     #[test]

@@ -175,3 +175,111 @@ fn snapshot_resume_and_fidelity_churn_are_byte_deterministic() {
     let _ = world.soldier(id);
     assert_eq!(world.snapshot(), before);
 }
+
+#[test]
+fn one_second_activity_oracle_has_independent_expected_values() {
+    let cases = [
+        (Activity::Rest, 0, 1, 1, 0),
+        (Activity::Idle, 1, 1, 2, 1),
+        (Activity::March, 3, 2, 3, 2),
+    ];
+    for (activity, fatigue, hunger, thirst, sleep_debt) in cases {
+        let mut world = World::new(0);
+        let id = spawn(&mut world, 1, 0, 0);
+        apply(&mut world, Command::SetActivity { id, activity });
+        apply(&mut world, Command::AdvanceTo { target: 1 });
+        assert_eq!(
+            world.soldier(id).unwrap().needs,
+            Needs {
+                fatigue,
+                hunger,
+                thirst,
+                sleep_debt,
+            }
+        );
+    }
+}
+
+#[test]
+fn ration_boundaries_are_exact_and_not_double_consumed() {
+    let mut world = World::new(0);
+    let id = spawn(&mut world, 1, 2, 2);
+    assert!(automatic(&apply(&mut world, Command::AdvanceTo { target: 49 })).is_empty());
+    let at_50 = automatic(&apply(&mut world, Command::AdvanceTo { target: 50 }));
+    assert_eq!(at_50.len(), 1);
+    assert!(
+        matches!(at_50[0].event, Event::RationConsumed { id: got, food: 0, water: 1, .. } if got == id)
+    );
+    let at_100 = automatic(&apply(&mut world, Command::AdvanceTo { target: 100 }));
+    assert_eq!(at_100.len(), 1);
+    assert!(
+        matches!(at_100[0].event, Event::RationConsumed { id: got, food: 1, water: 1, .. } if got == id)
+    );
+    assert_eq!(
+        world.soldier(id).unwrap().inventory,
+        Inventory {
+            food: 1,
+            water: 0,
+            medical: 0
+        }
+    );
+}
+
+#[test]
+fn hot_activity_snapshot_and_immediate_cold_transition_are_canonical() {
+    let mut world = World::new(0);
+    apply(&mut world, Command::SetRegionHot { cell: 9, hot: true });
+    let id = spawn(&mut world, 9, 1, 1);
+    apply(
+        &mut world,
+        Command::SetActivity {
+            id,
+            activity: Activity::March,
+        },
+    );
+    let snapshot = world.snapshot();
+    let mut restored = World::from_snapshot(&snapshot).unwrap();
+    apply(
+        &mut world,
+        Command::SetRegionHot {
+            cell: 9,
+            hot: false,
+        },
+    );
+    apply(
+        &mut restored,
+        Command::SetRegionHot {
+            cell: 9,
+            hot: false,
+        },
+    );
+    assert_eq!(world.snapshot(), restored.snapshot());
+    assert_eq!(
+        apply(&mut world, Command::AdvanceTo { target: 100 }),
+        apply(&mut restored, Command::AdvanceTo { target: 100 })
+    );
+}
+
+#[test]
+fn stale_generation_cannot_change_reused_soldier_activity() {
+    let mut world = World::new(0);
+    let stale = spawn(&mut world, 1, 0, 0);
+    apply(&mut world, Command::DespawnSoldier { id: stale });
+    let current = spawn(&mut world, 1, 0, 0);
+    assert_ne!(stale, current);
+    let before = world.snapshot();
+    assert_eq!(
+        world
+            .apply(Command::SetActivity {
+                id: stale,
+                activity: Activity::March
+            })
+            .error,
+        Some(SimError::InvalidEntity)
+    );
+    assert_eq!(world.snapshot(), before);
+    assert_eq!(
+        world.soldier(current).unwrap().living.activity,
+        Activity::Idle
+    );
+}

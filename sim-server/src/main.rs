@@ -655,11 +655,19 @@ fn benchmark() -> Result<(), Box<dyn std::error::Error>> {
     let sparse_out = w.apply(Command::AdvanceTo { target: 60 });
     let mixed_time = mixed_start.elapsed();
     assert!(dense_out.error.is_none() && sparse_out.error.is_none());
+    let repeated_start = Instant::now();
+    let mut repeated_events = 0;
+    for target in 61..=63 {
+        let outcome = w.apply(Command::AdvanceTo { target });
+        assert!(outcome.error.is_none());
+        repeated_events += outcome.events.len();
+    }
+    let repeated_time = repeated_start.elapsed();
     let needs = Instant::now();
     let checksum = w.needs_checksum();
     let needs_time = needs.elapsed();
-    let combined = cold_time + mixed_time + needs_time;
-    let rate = 60.0 / combined.as_secs_f64();
+    let combined = cold_time + mixed_time + repeated_time + needs_time;
+    let rate = 63.0 / combined.as_secs_f64();
     let st = Instant::now();
     let snapshot = w.snapshot();
     let snapshot_time = st.elapsed();
@@ -668,7 +676,7 @@ fn benchmark() -> Result<(), Box<dyn std::error::Error>> {
     let digest_time = dt.elapsed();
     let (rss, peak) = memory_kib();
     let (cold_boundaries, hot_member_steps) = w.living_work_counters();
-    println!("soldiers={count}\ninitialization_seconds={:.6}\ndense_scheduler_commands={dense}\nadvance_simulated_seconds=60\ncold_advance_seconds={:.6}\nmixed_hot_due_advance_seconds={:.6}\nadvance_events={}\ncold_due_transitions={cold_boundaries}\nhot_indexed_members={hot_cohort}\nhot_member_steps={hot_member_steps}\nfull_living_checksum_seconds={:.6}\nsimulated_seconds_per_wall_second={rate:.3}\ndesign_goal_simulated_seconds_per_wall_second=1.000\ndesign_goal_met={}\nliving_checksum={checksum:016x}\nsnapshot_seconds={:.6}\nsnapshot_bytes={}\ndigest_seconds={:.6}\ndigest={digest:016x}\ncurrent_rss_kib={rss}\npeak_rss_kib={peak}",init.as_secs_f64(),cold_time.as_secs_f64(),mixed_time.as_secs_f64(),dense_out.events.len()+sparse_out.events.len(),needs_time.as_secs_f64(),rate>=1.0,snapshot_time.as_secs_f64(),snapshot.len(),digest_time.as_secs_f64());
+    println!("soldiers={count}\ninitialization_seconds={:.6}\ndense_scheduler_commands={dense}\nadvance_simulated_seconds=63\ncold_advance_seconds={:.6}\nmixed_hot_due_advance_seconds={:.6}\nrepeated_one_second_advances=3\nrepeated_one_second_seconds={:.6}\nrepeated_one_second_events={repeated_events}\nadvance_events={}\ncold_due_transitions={cold_boundaries}\nhot_indexed_members={hot_cohort}\nhot_member_steps={hot_member_steps}\nfull_living_checksum_seconds={:.6}\nsimulated_seconds_per_wall_second={rate:.3}\ndesign_goal_simulated_seconds_per_wall_second=1.000\ndesign_goal_met={}\nliving_checksum={checksum:016x}\nsnapshot_seconds={:.6}\nsnapshot_bytes={}\ndigest_seconds={:.6}\ndigest={digest:016x}\ncurrent_rss_kib={rss}\npeak_rss_kib={peak}",init.as_secs_f64(),cold_time.as_secs_f64(),mixed_time.as_secs_f64(),repeated_time.as_secs_f64(),dense_out.events.len()+sparse_out.events.len()+repeated_events,needs_time.as_secs_f64(),rate>=1.0,snapshot_time.as_secs_f64(),snapshot.len(),digest_time.as_secs_f64());
     Ok(())
 }
 fn memory_kib() -> (u64, u64) {
@@ -784,8 +792,8 @@ mod tests {
             parsed["blocked"],
             json!({"id":0,"at":2,"command":{"type":"transfer","from":7,"to":8,"ammunition":40,"supplies":2}})
         );
-        assert_eq!(parsed["clock"], 0);
-        assert_eq!(parsed["events"], json!([]));
+        assert_eq!(parsed["clock"], 2);
+        assert_eq!(parsed["events"][0]["event"]["type"], "time_advanced");
         assert_eq!(parsed["digest"], format!("{:016x}", world.state_digest()));
         let digest = world.state_digest();
         let malformed =
