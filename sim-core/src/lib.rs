@@ -1129,7 +1129,11 @@ impl World {
         }
         Ok(())
     }
-    fn automatic_to(&mut self, t: u64, out: &mut Vec<TimedEvent>) -> Result<(u64, u64), SimError> {
+    fn automatic_to_inner(
+        &mut self,
+        t: u64,
+        out: &mut Vec<TimedEvent>,
+    ) -> Result<(u64, u64), SimError> {
         self.preflight_hot_cells(t)?;
         loop {
             let cold_at = self.living_due.keys().next().copied().filter(|at| *at <= t);
@@ -1260,6 +1264,72 @@ impl World {
         } else {
             (cells, t - self.clock)
         })
+    }
+
+    /// Runs one externally committed automatic segment transactionally.  The
+    /// journal contains only records which can be reached by this segment: due
+    /// entities through `t`, indexed members of hot cells, and the hot cells
+    /// whose clocks advance.  It deliberately does not clone `World` or either
+    /// world-sized entity index.
+    fn automatic_to(&mut self, t: u64, out: &mut Vec<TimedEvent>) -> Result<(u64, u64), SimError> {
+        let mut touched = BTreeSet::new();
+        for (_, ids) in self.living_due.range(..=t) {
+            touched.extend(ids.iter().copied());
+        }
+        for cell in self.hot_cells.keys() {
+            touched.extend(self.cell_members.get(cell).into_iter().flatten().copied());
+        }
+        let records: Vec<_> = touched
+            .iter()
+            .filter(|id| self.soldiers.valid(**id))
+            .map(|id| {
+                (
+                    *id,
+                    self.soldiers.data[id.index()],
+                    self.soldiers.living[id.index()],
+                )
+            })
+            .collect();
+        let due: Vec<_> = touched
+            .iter()
+            .map(|id| (*id, self.due_by_entity.get(id).copied()))
+            .collect();
+        let hot_cells = self.hot_cells.clone();
+        let counters = (
+            self.consumed_food,
+            self.consumed_water,
+            self.cold_boundaries,
+            self.hot_member_steps,
+        );
+        let out_len = out.len();
+
+        match self.automatic_to_inner(t, out) {
+            Ok(result) => Ok(result),
+            Err(error) => {
+                // Remove both original and replacement reverse/bucket entries,
+                // then reconstruct exactly the pre-segment index entries.
+                for id in &touched {
+                    self.unschedule_due(*id);
+                }
+                for (id, data, living) in records {
+                    self.soldiers.data[id.index()] = data;
+                    self.soldiers.living[id.index()] = living;
+                }
+                for (id, at) in due {
+                    if let Some(at) = at {
+                        self.living_due.entry(at).or_default().insert(id);
+                        self.due_by_entity.insert(id, at);
+                    }
+                }
+                self.hot_cells = hot_cells;
+                self.consumed_food = counters.0;
+                self.consumed_water = counters.1;
+                self.cold_boundaries = counters.2;
+                self.hot_member_steps = counters.3;
+                out.truncate(out_len);
+                Err(error)
+            }
+        }
     }
     fn advance(
         &mut self,
@@ -2212,6 +2282,108 @@ mod private_invariants {
         assert_eq!(world.soldier(hot).unwrap().living.materialized_at, 0);
         assert_eq!(world.snapshot(), before);
         assert!(World::from_snapshot(&world.snapshot()).is_ok());
+    }
+
+    #[test]
+    fn complete_hot_segment_rolls_back_all_internal_seconds() {
+        let mut world = World::new(0);
+        world.apply(Command::SetRegionHot { cell: 1, hot: true });
+        let id = spawn(
+            &mut world,
+            SoldierSpec {
+                position: Position {
+                    cell: 1,
+                    ..Position::default()
+                },
+                ..SoldierSpec::default()
+            },
+        );
+        world.hot_member_steps = u64::MAX - 1;
+        let before = world.snapshot();
+        let digest = world.state_digest();
+        let outcome = world.apply(Command::AdvanceTo { target: 2 });
+        assert_eq!(outcome.error, Some(SimError::ArithmeticOverflow));
+        assert!(outcome.events.is_empty());
+        assert_eq!(world.clock, 0);
+        assert_eq!(world.soldiers.living[id.index()].materialized_at, 0);
+        assert_eq!(world.snapshot(), before);
+        assert_eq!(world.state_digest(), digest);
+        assert!(World::from_snapshot(&before).is_ok());
+    }
+
+    #[test]
+    fn complete_cold_segment_rolls_back_all_internal_boundaries() {
+        let mut world = World::new(0);
+        let id = spawn(&mut world, SoldierSpec::default());
+        world.soldiers.living[id.index()].thirst = SEVERE_THIRST;
+        world.soldiers.data[id.index()].inventory.water = 0;
+        world.schedule_due(id).unwrap();
+        world.cold_boundaries = u64::MAX - 1;
+        let before = world.snapshot();
+        let outcome = world.apply(Command::AdvanceTo { target: 2 });
+        assert_eq!(outcome.error, Some(SimError::ArithmeticOverflow));
+        assert!(outcome.events.is_empty());
+        assert_eq!(world.snapshot(), before);
+        assert!(World::from_snapshot(&world.snapshot()).is_ok());
+    }
+
+    #[test]
+    fn later_ledger_overflow_rolls_back_earlier_ration_and_events() {
+        let mut world = World::new(0);
+        let id = spawn(
+            &mut world,
+            SoldierSpec {
+                inventory: Inventory {
+                    food: 0,
+                    water: 2,
+                    medical: 0,
+                },
+                ..SoldierSpec::default()
+            },
+        );
+        world.soldiers.living[id.index()].thirst = RATION_THRESHOLD - 1;
+        world.schedule_due(id).unwrap();
+        world.consumed_water = u128::MAX - 1;
+        let before = world.snapshot();
+        let outcome = world.apply(Command::AdvanceTo { target: 51 });
+        assert_eq!(outcome.error, Some(SimError::ArithmeticOverflow));
+        assert!(outcome.events.is_empty());
+        assert_eq!(world.snapshot(), before);
+    }
+
+    #[test]
+    fn failed_later_segment_preserves_earlier_scheduled_prefix() {
+        let mut world = World::new(0);
+        let id = spawn(
+            &mut world,
+            SoldierSpec {
+                position: Position {
+                    cell: 4,
+                    ..Position::default()
+                },
+                ..SoldierSpec::default()
+            },
+        );
+        world.apply(Command::Schedule {
+            at: 1,
+            command: ScheduledCommand::SetRegionHot { cell: 4, hot: true },
+        });
+        world.hot_member_steps = u64::MAX - 1;
+        let outcome = world.apply(Command::AdvanceTo { target: 3 });
+        assert_eq!(outcome.error, Some(SimError::ArithmeticOverflow));
+        assert_eq!(world.clock, 1);
+        assert!(world.hot_cells.contains_key(&4));
+        assert_eq!(world.soldiers.living[id.index()].materialized_at, 1);
+        assert_eq!(world.hot_member_steps, u64::MAX - 1);
+        assert!(World::from_snapshot(&world.snapshot()).is_ok());
+        assert!(outcome.events.iter().any(|event| matches!(
+            event.event,
+            Event::RegionFidelityChanged {
+                cell: 4,
+                hot: true,
+                ..
+            }
+        )));
     }
 
     #[test]
