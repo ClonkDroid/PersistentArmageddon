@@ -1,8 +1,8 @@
 //! Deterministic authoritative M0 simulation kernel.
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 
-pub const SNAPSHOT_VERSION: u32 = 4;
+pub const SNAPSHOT_VERSION: u32 = 5;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct EntityId(u64);
@@ -174,16 +174,51 @@ pub enum Command {
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Event {
-    SoldierSpawned { id: EntityId, loadout: Loadout },
-    SoldierRemoved { id: EntityId, loadout: Loadout },
-    SquadCreated { id: u32 },
-    OfficerAssigned { squad: u32, officer: EntityId },
-    StockpileCreated { id: u32, initial: Stock },
-    TransferCompleted { from: u32, to: u32, stock: Stock },
-    RegionFidelityChanged { cell: u32, hot: bool },
-    Scheduled { id: u64, at: u64 },
-    ScheduleCancelled { id: u64, at: u64 },
-    RandomGenerated { value: u64 },
+    SoldierSpawned {
+        id: EntityId,
+        loadout: Loadout,
+    },
+    SoldierRemoved {
+        id: EntityId,
+        loadout: Loadout,
+    },
+    SquadCreated {
+        id: u32,
+    },
+    OfficerAssigned {
+        squad: u32,
+        officer: EntityId,
+    },
+    StockpileCreated {
+        id: u32,
+        initial: Stock,
+    },
+    TransferCompleted {
+        from: u32,
+        to: u32,
+        stock: Stock,
+    },
+    RegionFidelityChanged {
+        cell: u32,
+        hot: bool,
+        fixed_steps: u64,
+    },
+    TimeAdvanced {
+        from: u64,
+        to: u64,
+        hot_steps: u64,
+    },
+    Scheduled {
+        id: u64,
+        at: u64,
+    },
+    ScheduleCancelled {
+        id: u64,
+        at: u64,
+    },
+    RandomGenerated {
+        value: u64,
+    },
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TimedEvent {
@@ -195,6 +230,22 @@ pub struct ApplyOutcome {
     pub clock: u64,
     pub events: Vec<TimedEvent>,
     pub error: Option<SimError>,
+    pub blocked: Option<BlockedCommand>,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BlockedCommand {
+    pub id: u64,
+    pub at: u64,
+    pub command: ScheduledCommand,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ResourceTotals {
+    pub ammunition: u128,
+    pub stockpile_supplies: u128,
+    pub carried_food: u128,
+    pub carried_water: u128,
+    pub carried_medical: u128,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SimError {
@@ -279,11 +330,6 @@ pub struct HotCellState {
     pub last_stepped_at: u64,
     pub fixed_steps: u64,
 }
-#[derive(Clone, Copy)]
-struct Pending {
-    id: u64,
-    command: ScheduledCommand,
-}
 #[derive(Clone)]
 pub struct World {
     clock: u64,
@@ -294,7 +340,10 @@ pub struct World {
     squads: BTreeMap<u32, Squad>,
     stockpiles: BTreeMap<u32, Stock>,
     hot_cells: BTreeMap<u32, HotCellState>,
-    scheduled: BTreeMap<u64, Vec<Pending>>,
+    scheduled: BTreeMap<u64, BTreeMap<u64, ScheduledCommand>>,
+    // Derived authoritative index: expected O(1) ID lookup; bucket removal is O(log N).
+    schedule_index: HashMap<u64, u64>,
+    reserved_stockpiles: BTreeSet<u32>,
 }
 impl World {
     pub fn new(seed: u64) -> Self {
@@ -308,6 +357,8 @@ impl World {
             stockpiles: BTreeMap::new(),
             hot_cells: BTreeMap::new(),
             scheduled: BTreeMap::new(),
+            schedule_index: HashMap::new(),
+            reserved_stockpiles: BTreeSet::new(),
         }
     }
     pub fn clock(&self) -> u64 {
@@ -349,8 +400,9 @@ impl World {
     }
     pub fn apply(&mut self, c: Command) -> ApplyOutcome {
         let mut events = Vec::new();
+        let mut blocked = None;
         let error = match c {
-            Command::AdvanceTo { target } => self.advance(target, &mut events),
+            Command::AdvanceTo { target } => self.advance(target, &mut events, &mut blocked),
             _ => self.apply_one(c).map(|e| {
                 events.push(TimedEvent {
                     at: self.clock,
@@ -363,6 +415,7 @@ impl World {
             clock: self.clock,
             events,
             error,
+            blocked,
         }
     }
     fn apply_one(&mut self, c: Command) -> Result<Event, SimError> {
@@ -440,6 +493,9 @@ impl World {
                 Ok(Event::OfficerAssigned { squad, officer })
             }
             Command::CreateStockpile { id, initial } => {
+                if self.reserved_stockpiles.contains(&id) {
+                    return Err(SimError::StockpileAlreadyExists);
+                }
                 self.apply_scheduled(ScheduledCommand::CreateStockpile { id, initial })
             }
             Command::Transfer {
@@ -466,19 +522,23 @@ impl World {
                     .next_schedule_id
                     .checked_add(1)
                     .ok_or(SimError::ArithmeticOverflow)?;
-                self.scheduled
-                    .entry(at)
-                    .or_default()
-                    .push(Pending { id, command });
+                self.scheduled.entry(at).or_default().insert(id, command);
+                self.schedule_index.insert(id, at);
+                if let ScheduledCommand::CreateStockpile { id, .. } = command {
+                    self.reserved_stockpiles.insert(id);
+                }
                 Ok(Event::Scheduled { id, at })
             }
             Command::CancelScheduled { id } => {
-                let found = self.scheduled.iter().find_map(|(at, v)| {
-                    v.iter().position(|p| p.id == id).map(|index| (*at, index))
-                });
-                let (at, index) = found.ok_or(SimError::UnknownScheduledCommand)?;
+                let at = self
+                    .schedule_index
+                    .remove(&id)
+                    .ok_or(SimError::UnknownScheduledCommand)?;
                 let queue = self.scheduled.get_mut(&at).expect("found");
-                queue.remove(index);
+                let command = queue.remove(&id).expect("indexed");
+                if let ScheduledCommand::CreateStockpile { id, .. } = command {
+                    self.reserved_stockpiles.remove(&id);
+                }
                 if queue.is_empty() {
                     self.scheduled.remove(&at);
                 }
@@ -503,7 +563,9 @@ impl World {
             ScheduledCommand::Transfer { from, to, .. } if from == to => {
                 Err(SimError::InvalidTransfer)
             }
-            ScheduledCommand::CreateStockpile { id, .. } if self.stockpiles.contains_key(&id) => {
+            ScheduledCommand::CreateStockpile { id, .. }
+                if self.stockpiles.contains_key(&id) || self.reserved_stockpiles.contains(&id) =>
+            {
                 Err(SimError::StockpileAlreadyExists)
             }
             _ => Ok(()),
@@ -563,16 +625,23 @@ impl World {
                 })
             }
             ScheduledCommand::SetRegionHot { cell, hot } => {
-                if hot {
-                    self.hot_cells.entry(cell).or_insert(HotCellState {
-                        activated_at: self.clock,
-                        last_stepped_at: self.clock,
-                        fixed_steps: 0,
-                    });
+                let fixed_steps = if hot {
+                    self.hot_cells
+                        .entry(cell)
+                        .or_insert(HotCellState {
+                            activated_at: self.clock,
+                            last_stepped_at: self.clock,
+                            fixed_steps: 0,
+                        })
+                        .fixed_steps
                 } else {
-                    self.hot_cells.remove(&cell);
-                }
-                Ok(Event::RegionFidelityChanged { cell, hot })
+                    self.hot_cells.remove(&cell).map_or(0, |h| h.fixed_steps)
+                };
+                Ok(Event::RegionFidelityChanged {
+                    cell,
+                    hot,
+                    fixed_steps,
+                })
             }
         }
     }
@@ -589,28 +658,63 @@ impl World {
         }
         Ok(())
     }
-    fn advance(&mut self, target: u64, out: &mut Vec<TimedEvent>) -> Result<(), SimError> {
+    fn advance(
+        &mut self,
+        target: u64,
+        out: &mut Vec<TimedEvent>,
+        blocked: &mut Option<BlockedCommand>,
+    ) -> Result<(), SimError> {
         if target < self.clock {
             return Err(SimError::TimeReversal);
         }
         let times: Vec<_> = self.scheduled.range(..=target).map(|(t, _)| *t).collect();
         for t in times {
+            let from = self.clock;
             self.step_hot_to(t)?;
             self.clock = t;
-            if let Some(mut v) = self.scheduled.remove(&t) {
-                for i in 0..v.len() {
-                    match self.apply_scheduled(v[i].command) {
+            if t != from {
+                out.push(TimedEvent {
+                    at: t,
+                    event: Event::TimeAdvanced {
+                        from,
+                        to: t,
+                        hot_steps: t - from,
+                    },
+                });
+            }
+            if let Some(v) = self.scheduled.remove(&t) {
+                let mut pending = v.into_iter();
+                while let Some((id, command)) = pending.next() {
+                    match self.apply_scheduled(command) {
                         Ok(event) => out.push(TimedEvent { at: t, event }),
                         Err(e) => {
-                            self.scheduled.insert(t, v.split_off(i));
+                            let queue = self.scheduled.entry(t).or_default();
+                            queue.insert(id, command);
+                            queue.extend(pending);
+                            *blocked = Some(BlockedCommand { id, at: t, command });
                             return Err(e);
                         }
+                    }
+                    self.schedule_index.remove(&id);
+                    if let ScheduledCommand::CreateStockpile { id, .. } = command {
+                        self.reserved_stockpiles.remove(&id);
                     }
                 }
             }
         }
+        let from = self.clock;
         self.step_hot_to(target)?;
         self.clock = target;
+        if target != from {
+            out.push(TimedEvent {
+                at: target,
+                event: Event::TimeAdvanced {
+                    from,
+                    to: target,
+                    hot_steps: target - from,
+                },
+            });
+        }
         Ok(())
     }
     pub fn state_digest(&self) -> u64 {
@@ -637,11 +741,16 @@ impl World {
         }
         h
     }
-    pub fn resource_totals(&self) -> (u128, u128, u128, u128) {
+    pub fn resource_totals(&self) -> ResourceTotals {
         let mut a = self
             .stockpiles
             .values()
             .map(|s| u128::from(s.ammunition))
+            .sum();
+        let supplies = self
+            .stockpiles
+            .values()
+            .map(|s| u128::from(s.supplies))
             .sum();
         let mut f = 0;
         let mut w = 0;
@@ -655,7 +764,13 @@ impl World {
                 m += u128::from(s.inventory.medical)
             }
         }
-        (a, f, w, m)
+        ResourceTotals {
+            ammunition: a,
+            stockpile_supplies: supplies,
+            carried_food: f,
+            carried_water: w,
+            carried_medical: m,
+        }
     }
     pub fn snapshot(&self) -> Vec<u8> {
         let mut w = W::default();
@@ -702,9 +817,9 @@ impl World {
         for (at, v) in &self.scheduled {
             w.u64(*at);
             w.u32(v.len() as u32);
-            for p in v {
-                w.u64(p.id);
-                w.sc(p.command)
+            for (id, command) in v {
+                w.u64(*id);
+                w.sc(*command)
             }
         }
         w.0
@@ -753,14 +868,24 @@ impl World {
             return Err(SimError::Snapshot("incomplete free list"));
         }
         let mut squads = BTreeMap::new();
+        let mut previous_squad = None;
         for _ in 0..r.u32()? {
             let id = r.u32()?;
+            if previous_squad.is_some_and(|previous| id <= previous) {
+                return Err(SimError::Snapshot("noncanonical squads"));
+            }
+            previous_squad = Some(id);
             let officer = r.opt_id()?;
             let mut members = BTreeSet::new();
+            let mut previous_member = None;
             for _ in 0..r.u32()? {
-                if !members.insert(EntityId(r.u64()?)) {
+                let member = EntityId(r.u64()?);
+                if previous_member.is_some_and(|previous| member <= previous)
+                    || !members.insert(member)
+                {
                     return Err(SimError::Snapshot("duplicate squad member"));
                 }
+                previous_member = Some(member);
             }
             if squads
                 .insert(
@@ -777,15 +902,25 @@ impl World {
             }
         }
         let mut stockpiles = BTreeMap::new();
+        let mut previous_stockpile = None;
         for _ in 0..r.u32()? {
             let id = r.u32()?;
+            if previous_stockpile.is_some_and(|previous| id <= previous) {
+                return Err(SimError::Snapshot("noncanonical stockpiles"));
+            }
+            previous_stockpile = Some(id);
             if stockpiles.insert(id, r.stock()?).is_some() {
                 return Err(SimError::Snapshot("duplicate stockpile"));
             }
         }
         let mut hot_cells = BTreeMap::new();
+        let mut previous_cell = None;
         for _ in 0..r.u32()? {
             let id = r.u32()?;
+            if previous_cell.is_some_and(|previous| id <= previous) {
+                return Err(SimError::Snapshot("noncanonical hot cells"));
+            }
+            previous_cell = Some(id);
             let h = HotCellState {
                 activated_at: r.u64()?,
                 last_stepped_at: r.u64()?,
@@ -793,26 +928,46 @@ impl World {
             };
             if h.activated_at > h.last_stepped_at
                 || h.last_stepped_at != clock
-                || h.fixed_steps < h.last_stepped_at - h.activated_at
+                || h.fixed_steps != h.last_stepped_at - h.activated_at
                 || hot_cells.insert(id, h).is_some()
             {
                 return Err(SimError::Snapshot("hot cell"));
             }
         }
         let mut scheduled = BTreeMap::new();
+        let mut schedule_index = HashMap::new();
+        let mut reserved_stockpiles = BTreeSet::new();
         let mut ids = BTreeSet::new();
+        let mut previous_at = None;
         for _ in 0..r.u32()? {
             let at = r.u64()?;
-            let mut v = Vec::new();
+            if previous_at.is_some_and(|previous| at <= previous) {
+                return Err(SimError::Snapshot("noncanonical scheduled times"));
+            }
+            previous_at = Some(at);
+            let mut v = BTreeMap::new();
+            let mut previous_id = None;
             for _ in 0..r.u32()? {
                 let id = r.u64()?;
-                if id >= next_schedule_id || !ids.insert(id) {
+                if id >= next_schedule_id || !ids.insert(id) || previous_id.is_some_and(|p| id <= p)
+                {
                     return Err(SimError::Snapshot("schedule id"));
                 }
-                v.push(Pending {
-                    id,
-                    command: r.sc()?,
-                })
+                previous_id = Some(id);
+                let command = r.sc()?;
+                match command {
+                    ScheduledCommand::Transfer { from, to, .. } if from == to => {
+                        return Err(SimError::Snapshot("invalid scheduled command"))
+                    }
+                    ScheduledCommand::CreateStockpile { id, .. }
+                        if stockpiles.contains_key(&id) || !reserved_stockpiles.insert(id) =>
+                    {
+                        return Err(SimError::Snapshot("conflicting reserved stockpile"))
+                    }
+                    _ => {}
+                }
+                v.insert(id, command);
+                schedule_index.insert(id, at);
             }
             if at < clock || v.is_empty() || scheduled.insert(at, v).is_some() {
                 return Err(SimError::Snapshot("scheduled time"));
@@ -831,6 +986,8 @@ impl World {
             stockpiles,
             hot_cells,
             scheduled,
+            schedule_index,
+            reserved_stockpiles,
         };
         w.validate()?;
         Ok(w)
@@ -1055,5 +1212,66 @@ impl R<'_> {
             }),
             _ => Err(SimError::Snapshot("command")),
         }
+    }
+}
+
+#[cfg(test)]
+mod private_invariants {
+    use super::*;
+
+    #[test]
+    fn generation_exhaustion_retires_slot_permanently() {
+        let mut soldiers = Soldiers::default();
+        soldiers.generation.push(u32::MAX - 1);
+        soldiers.alive.push(true);
+        soldiers.data.push(SoldierSpec::default());
+        soldiers.needs_at.push(0);
+        soldiers.live = 1;
+        let old = EntityId::from_parts(0, u32::MAX - 1);
+        assert!(soldiers.remove(old).is_some());
+        let last = soldiers.spawn(SoldierSpec::default(), 0);
+        assert_eq!(last, EntityId::from_parts(0, u32::MAX));
+        assert!(soldiers.remove(last).is_some());
+        assert!(soldiers.free.is_empty());
+        let fresh = soldiers.spawn(SoldierSpec::default(), 0);
+        assert_eq!(fresh.index(), 1);
+        assert!(!soldiers.valid(old));
+    }
+
+    #[test]
+    fn rng_wrap_is_explicit_and_snapshot_restore_rejects_invalid_internal_state() {
+        let mut world = World::new(9);
+        world.rng_counter = u64::MAX;
+        assert!(world.apply(Command::NextRandom).error.is_none());
+        assert_eq!(world.rng_counter, 0);
+        let mut invalid = World::new(0);
+        invalid.scheduled.entry(1).or_default().insert(
+            0,
+            ScheduledCommand::Transfer {
+                from: 2,
+                to: 2,
+                ammunition: 0,
+                supplies: 0,
+            },
+        );
+        invalid.schedule_index.insert(0, 1);
+        invalid.next_schedule_id = 1;
+        assert!(matches!(
+            World::from_snapshot(&invalid.snapshot()),
+            Err(SimError::Snapshot("invalid scheduled command"))
+        ));
+        let mut hot = World::new(0);
+        hot.hot_cells.insert(
+            3,
+            HotCellState {
+                activated_at: 0,
+                last_stepped_at: 0,
+                fixed_steps: 1,
+            },
+        );
+        assert!(matches!(
+            World::from_snapshot(&hot.snapshot()),
+            Err(SimError::Snapshot("hot cell"))
+        ));
     }
 }

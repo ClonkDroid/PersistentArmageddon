@@ -1,11 +1,16 @@
 use serde::Deserialize;
-use sim_core::{Command, Event, ScheduledCommand, SoldierSpec, Stock, TimedEvent, World};
+use serde_json::{json, Value};
+use sim_core::{
+    BlockedCommand, Command, Event, ScheduledCommand, SimError, SoldierSpec, Stock, TimedEvent,
+    World,
+};
 use std::env;
 use std::io::{Read, Write};
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::time::Instant;
 
 const MAX_REQUEST: usize = 64 * 1024;
+const MAX_HEADER: usize = 16 * 1024;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     if env::args().any(|a| a == "--benchmark") {
@@ -15,33 +20,66 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut world = World::new(1);
     eprintln!("sim-server listening on http://127.0.0.1:8080");
     for stream in listener.incoming() {
-        let mut stream = stream?;
-        let (status, kind, body) = read_and_handle(&mut stream, &mut world);
-        write!(stream,"HTTP/1.1 {status}\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",body.len())?;
-        stream.write_all(&body)?;
+        serve_connection(stream?, &mut world)?;
     }
     Ok(())
 }
 
+fn serve_connection(mut stream: TcpStream, world: &mut World) -> std::io::Result<()> {
+    let (status, kind, body) = read_and_handle(&mut stream, world);
+    write!(stream,"HTTP/1.1 {status}\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",body.len())?;
+    stream.write_all(&body)
+}
+
 fn read_and_handle(r: &mut impl Read, w: &mut World) -> (&'static str, &'static str, Vec<u8>) {
-    let mut b = Vec::new();
-    if r.take((MAX_REQUEST + 1) as u64)
-        .read_to_end(&mut b)
-        .is_err()
-        || b.len() > MAX_REQUEST
-    {
-        return (
-            "413 Payload Too Large",
-            "application/json",
-            b"{\"error\":\"request_too_large\"}".to_vec(),
-        );
+    let mut header = Vec::new();
+    let mut byte = [0];
+    while !header.ends_with(b"\r\n\r\n") {
+        if header.len() == MAX_HEADER {
+            return too_large();
+        }
+        match r.read(&mut byte) {
+            Ok(1) => header.push(byte[0]),
+            _ => return bad(),
+        }
     }
-    let Some(split) = b.windows(4).position(|x| x == b"\r\n\r\n") else {
-        return bad();
+    let head = match std::str::from_utf8(&header[..header.len() - 4]) {
+        Ok(h) => h,
+        Err(_) => return bad(),
     };
-    let head = String::from_utf8_lossy(&b[..split]);
-    let body = &b[split + 4..];
-    if head.starts_with("GET /health ") {
+    let mut lines = head.split("\r\n");
+    let request = match lines.next() {
+        Some(x) => x,
+        None => return bad(),
+    };
+    let mut length = None;
+    for line in lines {
+        let Some((name, value)) = line.split_once(':') else {
+            return bad();
+        };
+        if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+            return bad();
+        }
+        if name.eq_ignore_ascii_case("transfer-encoding") {
+            return bad();
+        }
+        if name.eq_ignore_ascii_case("content-length") {
+            if length.is_some()
+                || value.trim().is_empty()
+                || !value.trim().bytes().all(|b| b.is_ascii_digit())
+            {
+                return bad();
+            }
+            length = value.trim().parse::<usize>().ok();
+            if length.is_none() {
+                return bad();
+            }
+        }
+    }
+    if request == "GET /health HTTP/1.1" {
+        if length.unwrap_or(0) != 0 {
+            return bad();
+        }
         return (
             "200 OK",
             "application/json",
@@ -54,23 +92,24 @@ fn read_and_handle(r: &mut impl Read, w: &mut World) -> (&'static str, &'static 
             .into_bytes(),
         );
     }
-    if head.starts_with("GET /snapshot ") {
+    if request == "GET /snapshot HTTP/1.1" {
+        if length.unwrap_or(0) != 0 {
+            return bad();
+        }
         return ("200 OK", "application/octet-stream", w.snapshot());
     }
-    if !head.starts_with("POST /v1/command ") {
+    if request != "POST /v1/command HTTP/1.1" {
         return ("404 Not Found", "text/plain", b"not found\n".to_vec());
     }
-    let declared = head
-        .lines()
-        .find_map(|l| {
-            l.strip_prefix("Content-Length: ")
-                .or_else(|| l.strip_prefix("content-length: "))
-        })
-        .and_then(|x| x.parse::<usize>().ok());
-    if declared != Some(body.len()) {
+    let Some(declared) = length else { return bad() };
+    if declared > MAX_REQUEST {
+        return too_large();
+    }
+    let mut body = vec![0; declared];
+    if r.read_exact(&mut body).is_err() {
         return bad();
     }
-    let wire: Wire = match serde_json::from_slice(body) {
+    let wire: Wire = match serde_json::from_slice(&body) {
         Ok(x) => x,
         Err(_) => return bad(),
     };
@@ -85,10 +124,18 @@ fn read_and_handle(r: &mut impl Read, w: &mut World) -> (&'static str, &'static 
         outcome_json(
             o.clock,
             &o.events,
-            o.error.as_ref().map(|e| format!("{e:?}")),
+            o.error.as_ref(),
+            o.blocked,
             w.state_digest(),
         )
         .into_bytes(),
+    )
+}
+fn too_large() -> (&'static str, &'static str, Vec<u8>) {
+    (
+        "413 Payload Too Large",
+        "application/json",
+        b"{\"error\":\"request_too_large\"}".to_vec(),
     )
 }
 fn bad() -> (&'static str, &'static str, Vec<u8>) {
@@ -163,27 +210,92 @@ impl Wire {
         }
     }
 }
-fn outcome_json(clock: u64, events: &[TimedEvent], error: Option<String>, digest: u64) -> String {
-    let events = events
-        .iter()
-        .map(|x| format!("{{\"at\":{},\"event\":\"{}\"}}", x.at, event_name(x.event)))
-        .collect::<Vec<_>>()
-        .join(",");
-    format!("{{\"version\":1,\"clock\":{clock},\"events\":[{events}],\"terminal_error\":{},\"digest\":\"{digest:016x}\"}}",error.map_or_else(||"null".into(),|e|format!("\"{e}\"")))
+fn outcome_json(
+    clock: u64,
+    events: &[TimedEvent],
+    error: Option<&SimError>,
+    blocked: Option<BlockedCommand>,
+    digest: u64,
+) -> String {
+    json!({"version":1,"clock":clock,"events":events.iter().map(event_json).collect::<Vec<_>>(),
+        "terminal_error":error.map(error_code), "blocked":blocked.map(blocked_json), "digest":format!("{digest:016x}")}).to_string()
 }
-fn event_name(e: Event) -> &'static str {
-    match e {
-        Event::SoldierSpawned { .. } => "soldier_spawned",
-        Event::SoldierRemoved { .. } => "soldier_removed",
-        Event::SquadCreated { .. } => "squad_created",
-        Event::OfficerAssigned { .. } => "officer_assigned",
-        Event::StockpileCreated { .. } => "stockpile_created",
-        Event::TransferCompleted { .. } => "transfer_completed",
-        Event::RegionFidelityChanged { .. } => "region_fidelity_changed",
-        Event::Scheduled { .. } => "scheduled",
-        Event::ScheduleCancelled { .. } => "schedule_cancelled",
-        Event::RandomGenerated { .. } => "random_generated",
+fn stock_json(s: Stock) -> Value {
+    json!({"ammunition":s.ammunition,"supplies":s.supplies})
+}
+fn command_json(c: ScheduledCommand) -> Value {
+    match c {
+        ScheduledCommand::Transfer {
+            from,
+            to,
+            ammunition,
+            supplies,
+        } => {
+            json!({"type":"transfer","from":from,"to":to,"ammunition":ammunition,"supplies":supplies})
+        }
+        ScheduledCommand::SetRegionHot { cell, hot } => {
+            json!({"type":"set_region_hot","cell":cell,"hot":hot})
+        }
+        ScheduledCommand::CreateStockpile { id, initial } => {
+            json!({"type":"create_stockpile","id":id,"initial":stock_json(initial)})
+        }
     }
+}
+fn blocked_json(b: BlockedCommand) -> Value {
+    json!({"id":b.id,"at":b.at,"command":command_json(b.command)})
+}
+fn error_code(e: &SimError) -> &'static str {
+    match e {
+        SimError::InvalidEntity => "invalid_entity",
+        SimError::TimeReversal => "time_reversal",
+        SimError::UnknownStockpile => "unknown_stockpile",
+        SimError::InsufficientStock => "insufficient_stock",
+        SimError::InvalidTransfer => "invalid_transfer",
+        SimError::StockpileAlreadyExists => "stockpile_already_exists",
+        SimError::ArithmeticOverflow => "arithmetic_overflow",
+        SimError::InvalidSquad => "invalid_squad",
+        SimError::SquadAlreadyExists => "squad_already_exists",
+        SimError::InvalidOfficerRole => "invalid_officer_role",
+        SimError::InvalidScheduledCommand => "invalid_scheduled_command",
+        SimError::UnknownScheduledCommand => "unknown_scheduled_command",
+        SimError::Snapshot(_) => "snapshot_invalid",
+    }
+}
+fn event_json(x: &TimedEvent) -> Value {
+    let payload = match x.event {
+        Event::SoldierSpawned { id, loadout } => {
+            json!({"type":"soldier_spawned","id":id.raw(),"loadout":{"ammunition":loadout.ammunition,"food":loadout.food,"water":loadout.water,"medical":loadout.medical}})
+        }
+        Event::SoldierRemoved { id, loadout } => {
+            json!({"type":"soldier_removed","id":id.raw(),"loadout":{"ammunition":loadout.ammunition,"food":loadout.food,"water":loadout.water,"medical":loadout.medical}})
+        }
+        Event::SquadCreated { id } => json!({"type":"squad_created","id":id}),
+        Event::OfficerAssigned { squad, officer } => {
+            json!({"type":"officer_assigned","squad":squad,"officer":officer.raw()})
+        }
+        Event::StockpileCreated { id, initial } => {
+            json!({"type":"stockpile_created","id":id,"initial":stock_json(initial)})
+        }
+        Event::TransferCompleted { from, to, stock } => {
+            json!({"type":"transfer_completed","from":from,"to":to,"stock":stock_json(stock)})
+        }
+        Event::RegionFidelityChanged {
+            cell,
+            hot,
+            fixed_steps,
+        } => {
+            json!({"type":"region_fidelity_changed","cell":cell,"hot":hot,"fixed_steps":fixed_steps})
+        }
+        Event::TimeAdvanced {
+            from,
+            to,
+            hot_steps,
+        } => json!({"type":"time_advanced","from":from,"to":to,"hot_steps":hot_steps}),
+        Event::Scheduled { id, at } => json!({"type":"scheduled","id":id,"at":at}),
+        Event::ScheduleCancelled { id, at } => json!({"type":"schedule_cancelled","id":id,"at":at}),
+        Event::RandomGenerated { value } => json!({"type":"random_generated","value":value}),
+    };
+    json!({"at":x.at,"event":payload})
 }
 
 fn apply_ok(w: &mut World, c: Command) {
@@ -293,7 +405,8 @@ fn memory_kib() -> (u64, u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
+    use std::net::Shutdown;
+    use std::thread;
     fn req(body: &str) -> Vec<u8> {
         format!(
             "POST /v1/command HTTP/1.1\r\nContent-Length: {}\r\n\r\n{}",
@@ -302,19 +415,115 @@ mod tests {
         )
         .into_bytes()
     }
-    #[test]
-    fn command_changes_once_and_malformed_is_atomic() {
-        let mut w = World::new(0);
-        let body = r#"{"version":1,"command":"create_stockpile","id":7,"ammunition":9,"supplies":3,"target":null,"from":null,"to":null,"cell":null,"hot":null,"at":null}"#;
-        let (a, _, response) = read_and_handle(&mut Cursor::new(req(body)), &mut w);
-        assert_eq!(a, "200 OK");
-        assert!(String::from_utf8(response)
+    fn exchange(request: Vec<u8>, shutdown: bool, world: World) -> (Vec<u8>, World) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let mut world = world;
+            let (stream, _) = listener.accept().unwrap();
+            serve_connection(stream, &mut world).unwrap();
+            world
+        });
+        let mut client = TcpStream::connect(address).unwrap();
+        client.write_all(&request).unwrap();
+        if shutdown {
+            client.shutdown(Shutdown::Write).unwrap();
+        }
+        let mut response = Vec::new();
+        let mut chunk = [0; 4096];
+        loop {
+            match client.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => response.extend_from_slice(&chunk[..n]),
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::ConnectionReset
+                        && !response.is_empty() =>
+                {
+                    break
+                }
+                Err(error) => panic!("response read: {error}"),
+            }
+        }
+        (response, server.join().unwrap())
+    }
+    fn status(response: &[u8]) -> &str {
+        std::str::from_utf8(response)
             .unwrap()
-            .contains("stockpile_created"));
-        assert_eq!(w.stockpile(7).unwrap().ammunition, 9);
-        let digest = w.state_digest();
-        let (a, _, _) = read_and_handle(&mut Cursor::new(req("{}")), &mut w);
-        assert_eq!(a, "400 Bad Request");
-        assert_eq!(w.state_digest(), digest)
+            .split("\r\n")
+            .next()
+            .unwrap()
+    }
+    fn json_body(response: &[u8]) -> Value {
+        let split = response.windows(4).position(|x| x == b"\r\n\r\n").unwrap();
+        serde_json::from_slice(&response[split + 4..]).unwrap()
+    }
+
+    #[test]
+    fn live_socket_framing_and_typed_outcomes() {
+        let (response, world) = exchange(
+            b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec(),
+            false,
+            World::new(0),
+        );
+        assert_eq!(status(&response), "HTTP/1.1 200 OK");
+        let body = r#"{"version":1,"command":"create_stockpile","id":7,"ammunition":9,"supplies":3,"target":null,"from":null,"to":null,"cell":null,"hot":null,"at":null}"#;
+        let (response, world) = exchange(req(body), false, world);
+        let parsed = json_body(&response);
+        assert_eq!(
+            parsed["events"][0]["event"],
+            json!({"type":"stockpile_created","id":7,"initial":{"ammunition":9,"supplies":3}})
+        );
+        assert_eq!(
+            world.stockpile(7).unwrap(),
+            Stock {
+                ammunition: 9,
+                supplies: 3
+            }
+        );
+        let schedule = r#"{"version":1,"command":"schedule_transfer","at":2,"from":7,"to":8,"ammunition":40,"supplies":2,"target":null,"id":null,"cell":null,"hot":null}"#;
+        let (response, world) = exchange(req(schedule), false, world);
+        assert_eq!(json_body(&response)["events"][0]["event"]["id"], 0);
+        let create_destination =
+            r#"{"version":1,"command":"create_stockpile","id":8,"ammunition":0,"supplies":0}"#;
+        let (_, world) = exchange(req(create_destination), false, world);
+        let advance = r#"{"version":1,"command":"advance_to","target":3}"#;
+        let (response, world) = exchange(req(advance), false, world);
+        let parsed = json_body(&response);
+        assert_eq!(parsed["terminal_error"], "insufficient_stock");
+        assert_eq!(
+            parsed["blocked"],
+            json!({"id":0,"at":2,"command":{"type":"transfer","from":7,"to":8,"ammunition":40,"supplies":2}})
+        );
+        assert_eq!(parsed["clock"], 2);
+        assert_eq!(parsed["events"][0]["event"]["type"], "time_advanced");
+        assert_eq!(parsed["digest"], format!("{:016x}", world.state_digest()));
+        let digest = world.state_digest();
+        let malformed =
+            b"POST /v1/command HTTP/1.1\r\nContent-Length: 2\r\ncontent-length: 2\r\n\r\n{}"
+                .to_vec();
+        let (response, world) = exchange(malformed, false, world);
+        assert_eq!(status(&response), "HTTP/1.1 400 Bad Request");
+        assert_eq!(world.state_digest(), digest);
+    }
+
+    #[test]
+    fn live_socket_rejects_truncated_oversized_and_bad_framing_atomically() {
+        let world = World::new(3);
+        let digest = world.state_digest();
+        let truncated = b"POST /v1/command HTTP/1.1\r\nContent-Length: 10\r\n\r\n{}".to_vec();
+        let (response, world) = exchange(truncated, true, world);
+        assert_eq!(status(&response), "HTTP/1.1 400 Bad Request");
+        assert_eq!(world.state_digest(), digest);
+        let oversized = format!(
+            "POST /v1/command HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+            MAX_REQUEST + 1
+        )
+        .into_bytes();
+        let (response, world) = exchange(oversized, false, world);
+        assert_eq!(status(&response), "HTTP/1.1 413 Payload Too Large");
+        assert_eq!(world.state_digest(), digest);
+        let (response, world) = exchange(b"GET /health HTTP/1.1\n\n".to_vec(), true, world);
+        assert_eq!(status(&response), "HTTP/1.1 400 Bad Request");
+        assert_eq!(world.state_digest(), digest);
     }
 }
