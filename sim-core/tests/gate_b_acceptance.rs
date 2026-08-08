@@ -849,9 +849,34 @@ fn gate_b_acceptance_06_immediate_wound_consequences_and_endpoint_interruptions(
     );
     assert!(!trauma.wound(trauma_wound).unwrap().controlled);
     let later = trauma.apply(Command::AdvanceTo { target: 20 });
+    assert_eq!(
+        later
+            .events
+            .iter()
+            .filter(
+                |event| matches!(event.event, Event::SoldierDied { id, .. } if id == trauma_patient)
+            )
+            .count(),
+        0
+    );
+    assert_eq!(
+        later
+            .events
+            .iter()
+            .filter(|event| matches!(event.event, Event::TreatmentInterrupted { id, .. } if id == trauma_treatment))
+            .count(),
+        0
+    );
     assert!(!later.events.iter().any(
-        |e| matches!(e.event, Event::TreatmentCompleted { id, .. } if id == trauma_treatment)
+        |event| matches!(event.event, Event::TreatmentCompleted { id, .. } if id == trauma_treatment)
     ));
+    assert_eq!(
+        trauma.soldier(trauma_patient).unwrap().living.life,
+        LifeState::Dead {
+            at: 0,
+            cause: DeathCause::ImmediateTrauma
+        }
+    );
 
     // Immediate traumatic shock death while the casualty is the active medic.
     let (mut shock, shock_medic, _shock_patient, shock_wound, shock_treatment) =
@@ -913,6 +938,35 @@ fn gate_b_acceptance_06_immediate_wound_consequences_and_endpoint_interruptions(
     );
     assert!(!shock.wound(shock_wound).unwrap().controlled);
     assert!(!shock.casualty_state(shock_medic).unwrap().recovering);
+    let later = shock.apply(Command::AdvanceTo { target: 20 });
+    assert_eq!(
+        later
+            .events
+            .iter()
+            .filter(
+                |event| matches!(event.event, Event::SoldierDied { id, .. } if id == shock_medic)
+            )
+            .count(),
+        0
+    );
+    assert_eq!(
+        later
+            .events
+            .iter()
+            .filter(|event| matches!(event.event, Event::TreatmentInterrupted { id, .. } if id == shock_treatment))
+            .count(),
+        0
+    );
+    assert!(!later.events.iter().any(
+        |event| matches!(event.event, Event::TreatmentCompleted { id, .. } if id == shock_treatment)
+    ));
+    assert_eq!(
+        shock.soldier(shock_medic).unwrap().living.life,
+        LifeState::Dead {
+            at: 0,
+            cause: DeathCause::TraumaticShock
+        }
+    );
 
     // A marching casualty is forced idle at the instant incapacity is crossed.
     let mut marching = World::new(6_063);

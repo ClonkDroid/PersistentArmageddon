@@ -11,7 +11,7 @@ Gate B acceptance is **not complete or accepted**. Acceptance tranche 1 implemen
 | 05 nonfatal recovery cancellation and absolute-deadline restart | Implemented in tranche 1 | `gate_b_acceptance_05_new_wound_cancels_and_restarts_absolute_recovery` | — |
 | 06 immediate wound and endpoint-interruption matrices | Implemented in tranche 2A | `gate_b_acceptance_06_immediate_wound_consequences_and_endpoint_interruptions` | — |
 | 07 authoritative hot/cold command failure atomicity | Implemented in tranche 2A | — | `gate_b_acceptance_07_world_apply_failures_are_fully_atomic` |
-| 08 automatic medic/patient interruption and death precedence | Implemented in tranche 2A | `gate_b_acceptance_08_automatic_incapacity_interrupts_before_completion` | `gate_b_acceptance_08_living_death_at_completion_has_role_precedence_and_cleans_indexes` |
+| 08 automatic medic/patient interruption and death precedence | Implemented in tranche 2A | `gate_b_acceptance_08_automatic_incapacity_interrupts_before_completion` | `gate_b_acceptance_08_automatic_incapacity_preserves_audit_and_cleans_indexes`; `gate_b_acceptance_08_living_death_at_completion_has_role_precedence_and_cleans_indexes` |
 | 09 real-entity availability churn and exact candidate visits | Pending | — | — |
 | 10 medic/patient removal, conservation, and generation cleanup | Pending | — | — |
 | 11 hot/cold cycles during treatment and recovery | Pending | — | — |

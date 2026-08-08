@@ -8079,4 +8079,132 @@ mod private_invariants {
             assert!(!later.events.iter().any(|event| matches!(event.event, Event::TreatmentCompleted { id, .. } if id == treatment)));
         }
     }
+
+    #[test]
+    fn gate_b_acceptance_08_automatic_incapacity_preserves_audit_and_cleans_indexes() {
+        for incapacitated_medic in [true, false] {
+            let mut world = World::new(8_810 + u64::from(incapacitated_medic));
+            let medic = spawn(
+                &mut world,
+                SoldierSpec {
+                    role: Role::Medic,
+                    inventory: Inventory {
+                        medical: if incapacitated_medic {
+                            HEMOSTATIC_COST
+                        } else {
+                            HEMOSTATIC_COST + SHOCK_TREATMENT_COST
+                        },
+                        ..Inventory::default()
+                    },
+                    ..SoldierSpec::default()
+                },
+            );
+            let patient = spawn(&mut world, SoldierSpec::default());
+            let treated_wound = gate_wound(&mut world, patient, 1, 0);
+            let treatment = gate_start(&mut world, medic, patient, treated_wound);
+            let endpoint = if incapacitated_medic { medic } else { patient };
+            gate_wound(&mut world, endpoint, 1_000, 0);
+
+            let interrupted = world.apply(Command::AdvanceTo { target: 4 });
+            assert_eq!(interrupted.error, None);
+            assert_eq!(
+                interrupted
+                    .events
+                    .iter()
+                    .filter(|event| matches!(event.event, Event::TreatmentInterrupted { id, reason: InterruptionReason::Ineligible } if id == treatment))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                world.treatments[&treatment].status,
+                TreatmentStatus::Interrupted {
+                    at: 4,
+                    reason: InterruptionReason::Ineligible
+                }
+            );
+            assert!(!world.active_by_entity.contains_key(&medic));
+            assert!(!world.active_by_entity.contains_key(&patient));
+            assert!(!world.due_by_treatment.contains_key(&treatment));
+            assert!(world
+                .treatment_due
+                .values()
+                .all(|ids| !ids.contains(&treatment)));
+            assert_eq!(
+                world.treatment_ids_by_entity.get(&medic),
+                Some(&BTreeSet::from([treatment]))
+            );
+            assert_eq!(
+                world.treatment_ids_by_entity.get(&patient),
+                Some(&BTreeSet::from([treatment]))
+            );
+
+            if incapacitated_medic {
+                assert!(!world.availability_by_medic.contains_key(&medic));
+                assert!(world
+                    .available_medics
+                    .values()
+                    .all(|medics| !medics.contains(&medic)));
+            } else {
+                let expected_keys =
+                    BTreeSet::from([(0, 0, HEMOSTATIC_COST), (0, 0, SHOCK_TREATMENT_COST)]);
+                assert_eq!(world.availability_by_medic[&medic], expected_keys);
+                assert_eq!(
+                    world.available_medics[&(0, 0, HEMOSTATIC_COST)],
+                    BTreeSet::from([medic])
+                );
+                assert_eq!(
+                    world.available_medics[&(0, 0, SHOCK_TREATMENT_COST)],
+                    BTreeSet::from([medic])
+                );
+            }
+
+            let carried = world
+                .soldiers
+                .data
+                .iter()
+                .map(|soldier| u128::from(soldier.inventory.medical))
+                .sum::<u128>();
+            assert_eq!(world.consumed_medical, u128::from(HEMOSTATIC_COST));
+            assert_eq!(world.lost_medical, 0);
+            assert_eq!(
+                world.sourced_medical,
+                carried + world.consumed_medical + world.lost_medical
+            );
+
+            let stable_treatment = world.treatments[&treatment];
+            let stable_active = world.active_by_entity.clone();
+            let stable_due = world.due_by_treatment.clone();
+            let stable_buckets = world.treatment_due.clone();
+            let stable_history = world.treatment_ids_by_entity.clone();
+            let stable_available = world.available_medics.clone();
+            let stable_availability = world.availability_by_medic.clone();
+            let stable_accounting = (
+                world.sourced_medical,
+                world.consumed_medical,
+                world.lost_medical,
+            );
+
+            let later = world.apply(Command::AdvanceTo { target: 20 });
+            assert!(!later.events.iter().any(|event| matches!(
+                event.event,
+                Event::TreatmentInterrupted { id, .. }
+                    | Event::TreatmentCompleted { id, .. } if id == treatment
+            )));
+            assert_eq!(world.treatments[&treatment], stable_treatment);
+            assert_eq!(world.active_by_entity, stable_active);
+            assert_eq!(world.due_by_treatment, stable_due);
+            assert_eq!(world.treatment_due, stable_buckets);
+            assert_eq!(world.treatment_ids_by_entity, stable_history);
+            assert_eq!(world.available_medics, stable_available);
+            assert_eq!(world.availability_by_medic, stable_availability);
+            assert_eq!(
+                (
+                    world.sourced_medical,
+                    world.consumed_medical,
+                    world.lost_medical,
+                ),
+                stable_accounting
+            );
+        }
+    }
 }
