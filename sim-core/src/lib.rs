@@ -7757,4 +7757,326 @@ mod private_invariants {
         assert_eq!(hot.medical_entity_candidates - hot_candidates, 25);
         assert!(!hot.casualty[&hot_patient].recovering);
     }
+
+    fn gate_b_assert_failed_command_preserves_all_authority(
+        world: &mut World,
+        command: Command,
+        error: SimError,
+    ) {
+        let clock = world.clock;
+        let snapshot = world.snapshot();
+        let digest = world.state_digest();
+        let ids = (world.next_wound_id, world.next_treatment_id);
+        let ledgers = (
+            world.sourced_food,
+            world.sourced_water,
+            world.consumed_food,
+            world.consumed_water,
+            world.lost_food,
+            world.lost_water,
+            world.sourced_medical,
+            world.consumed_medical,
+            world.lost_medical,
+        );
+        let private_indexes = (
+            world.living_due.clone(),
+            world.due_by_entity.clone(),
+            world.treatment_due.clone(),
+            world.due_by_treatment.clone(),
+            world.active_by_entity.clone(),
+            world.treatment_ids_by_entity.clone(),
+            world.wound_ids_by_patient.clone(),
+            world.bleeding_rate_by_patient.clone(),
+            world.medic_index.clone(),
+            world.available_medics.clone(),
+            world.availability_by_medic.clone(),
+        );
+        let counters = (
+            world.cold_boundaries,
+            world.hot_member_steps,
+            world.automatic_journal_visits,
+            world.automatic_execution_visits,
+            world.medical_entity_candidates,
+            world.wound_index_visits,
+            world.treatment_completion_candidates,
+            world.selection_candidates,
+        );
+
+        let outcome = world.apply(command);
+
+        assert_eq!(outcome.error, Some(error));
+        assert!(outcome.events.is_empty());
+        assert_eq!(outcome.clock, clock);
+        assert_eq!(world.clock, clock);
+        assert_eq!(world.snapshot(), snapshot);
+        assert_eq!(world.state_digest(), digest);
+        assert_eq!((world.next_wound_id, world.next_treatment_id), ids);
+        assert_eq!(
+            (
+                world.sourced_food,
+                world.sourced_water,
+                world.consumed_food,
+                world.consumed_water,
+                world.lost_food,
+                world.lost_water,
+                world.sourced_medical,
+                world.consumed_medical,
+                world.lost_medical,
+            ),
+            ledgers
+        );
+        assert_eq!(
+            (
+                world.living_due.clone(),
+                world.due_by_entity.clone(),
+                world.treatment_due.clone(),
+                world.due_by_treatment.clone(),
+                world.active_by_entity.clone(),
+                world.treatment_ids_by_entity.clone(),
+                world.wound_ids_by_patient.clone(),
+                world.bleeding_rate_by_patient.clone(),
+                world.medic_index.clone(),
+                world.available_medics.clone(),
+                world.availability_by_medic.clone(),
+            ),
+            private_indexes
+        );
+        assert_eq!(
+            (
+                world.cold_boundaries,
+                world.hot_member_steps,
+                world.automatic_journal_visits,
+                world.automatic_execution_visits,
+                world.medical_entity_candidates,
+                world.wound_index_visits,
+                world.treatment_completion_candidates,
+                world.selection_candidates,
+            ),
+            counters
+        );
+    }
+
+    fn gate_b_overflow_world(hot: bool) -> World {
+        let mut world = World::new(8_700 + u64::from(hot));
+        let patient = spawn(&mut world, SoldierSpec::default());
+        let wound = WoundId(0);
+        world.next_wound_id = 1;
+        world.wounds.insert(
+            wound,
+            Wound {
+                id: wound,
+                patient,
+                created_at: u64::MAX - 1,
+                spec: WoundSpec {
+                    trauma: 1,
+                    bleeding_per_second: 0,
+                    shock: 1,
+                },
+                controlled: true,
+                healed: false,
+            },
+        );
+        world
+            .wound_ids_by_patient
+            .insert(patient, BTreeSet::from([wound]));
+        world.casualty.insert(
+            patient,
+            CasualtyState {
+                blood: 4_900,
+                shock: 100,
+                recovering: true,
+                recovery_next_at: Some(u64::MAX),
+                materialized_at: u64::MAX - 1,
+                ..CasualtyState::default()
+            },
+        );
+        world.clock = u64::MAX - 1;
+        world.soldiers.living[patient.index()].materialized_at = world.clock;
+        world.schedule_due(patient).unwrap();
+        if hot {
+            assert!(world
+                .apply(Command::SetRegionHot { cell: 0, hot: true })
+                .error
+                .is_none());
+        }
+        world
+    }
+
+    #[test]
+    fn gate_b_acceptance_07_world_apply_failures_are_fully_atomic() {
+        let mut invalid_wound = World::new(8_701);
+        let patient = spawn(&mut invalid_wound, SoldierSpec::default());
+        gate_b_assert_failed_command_preserves_all_authority(
+            &mut invalid_wound,
+            Command::InflictWound {
+                patient,
+                wound: WoundSpec {
+                    trauma: 0,
+                    bleeding_per_second: 0,
+                    shock: 0,
+                },
+            },
+            SimError::InvalidWound,
+        );
+
+        let mut stale = World::new(8_702);
+        let old = spawn(&mut stale, SoldierSpec::default());
+        assert!(stale
+            .apply(Command::DespawnSoldier { id: old })
+            .error
+            .is_none());
+        let replacement = spawn(&mut stale, SoldierSpec::default());
+        assert_ne!(old, replacement);
+        gate_b_assert_failed_command_preserves_all_authority(
+            &mut stale,
+            Command::InflictWound {
+                patient: old,
+                wound: WoundSpec {
+                    trauma: 1,
+                    bleeding_per_second: 0,
+                    shock: 0,
+                },
+            },
+            SimError::InvalidEntity,
+        );
+
+        let mut treatment = World::new(8_703);
+        let medic = spawn(
+            &mut treatment,
+            SoldierSpec {
+                role: Role::Medic,
+                inventory: Inventory {
+                    medical: HEMOSTATIC_COST,
+                    ..Inventory::default()
+                },
+                ..SoldierSpec::default()
+            },
+        );
+        let patient = spawn(&mut treatment, SoldierSpec::default());
+        gate_b_assert_failed_command_preserves_all_authority(
+            &mut treatment,
+            Command::StartTreatment {
+                medic,
+                patient,
+                wound: Some(WoundId(999)),
+                kind: TreatmentKind::Hemostatic,
+            },
+            SimError::InvalidTreatment,
+        );
+        gate_b_assert_failed_command_preserves_all_authority(
+            &mut treatment,
+            Command::RequestTreatment {
+                patient,
+                wound: Some(WoundId(999)),
+                kind: TreatmentKind::Hemostatic,
+            },
+            SimError::InvalidTreatment,
+        );
+
+        for hot in [false, true] {
+            let mut overflow = gate_b_overflow_world(hot);
+            gate_b_assert_failed_command_preserves_all_authority(
+                &mut overflow,
+                Command::AdvanceTo { target: u64::MAX },
+                SimError::ArithmeticOverflow,
+            );
+        }
+    }
+
+    #[test]
+    fn gate_b_acceptance_08_living_death_at_completion_has_role_precedence_and_cleans_indexes() {
+        for dying_medic in [true, false] {
+            let mut world = World::new(8_800 + u64::from(dying_medic));
+            let medic = spawn(
+                &mut world,
+                SoldierSpec {
+                    role: Role::Medic,
+                    inventory: Inventory {
+                        medical: HEMOSTATIC_COST,
+                        ..Inventory::default()
+                    },
+                    ..SoldierSpec::default()
+                },
+            );
+            let patient = spawn(&mut world, SoldierSpec::default());
+            let wound = gate_wound(&mut world, patient, 1, 0);
+            let treatment = gate_start(&mut world, medic, patient, wound);
+            let dying = if dying_medic { medic } else { patient };
+            world.soldiers.living[dying.index()].health = 10;
+            world.soldiers.living[dying.index()].thirst = SEVERE_THIRST - 30;
+            world.soldiers.living[dying.index()].activity = Activity::March;
+            world.soldiers.data[dying.index()].health = 10;
+            world.schedule_due(dying).unwrap();
+            let reason = if dying_medic {
+                InterruptionReason::MedicDied
+            } else {
+                InterruptionReason::PatientDied
+            };
+
+            let outcome = world.apply(Command::AdvanceTo { target: 10 });
+
+            assert_eq!(outcome.error, None);
+            assert_eq!(
+                outcome.events,
+                vec![
+                    TimedEvent {
+                        at: 10,
+                        event: Event::LivingDeteriorated {
+                            id: dying,
+                            morale_before: 1_000,
+                            morale_after: 999,
+                            health_before: 10,
+                            health_after: 0
+                        }
+                    },
+                    TimedEvent {
+                        at: 10,
+                        event: Event::SoldierDied {
+                            id: dying,
+                            cause: DeathCause::Dehydration,
+                            health_before: 10
+                        }
+                    },
+                    TimedEvent {
+                        at: 10,
+                        event: Event::TreatmentInterrupted {
+                            id: treatment,
+                            reason
+                        }
+                    },
+                    TimedEvent {
+                        at: 10,
+                        event: Event::TimeAdvanced {
+                            from: 0,
+                            to: 10,
+                            hot_cells_stepped: 0,
+                            fixed_steps_per_hot_cell: 0
+                        }
+                    },
+                ]
+            );
+            assert_eq!(
+                world.treatments[&treatment].status,
+                TreatmentStatus::Interrupted { at: 10, reason }
+            );
+            assert!(!world.wounds[&wound].controlled);
+            assert_eq!(world.soldiers.data[medic.index()].inventory.medical, 0);
+            assert!(!world.active_by_entity.contains_key(&medic));
+            assert!(!world.active_by_entity.contains_key(&patient));
+            assert!(!world.due_by_treatment.contains_key(&treatment));
+            assert!(world
+                .treatment_due
+                .values()
+                .all(|ids| !ids.contains(&treatment)));
+            assert!(!world.availability_by_medic.contains_key(&medic));
+            assert!(world
+                .available_medics
+                .values()
+                .all(|medics| !medics.contains(&medic)));
+            assert_eq!(outcome.events.iter().filter(|event| matches!(event.event, Event::TreatmentInterrupted { id, .. } if id == treatment)).count(), 1);
+            assert!(!outcome.events.iter().any(|event| matches!(event.event, Event::TreatmentCompleted { id, .. } if id == treatment)));
+            let later = world.apply(Command::AdvanceTo { target: 20 });
+            assert!(!later.events.iter().any(|event| matches!(event.event, Event::TreatmentCompleted { id, .. } if id == treatment)));
+        }
+    }
 }

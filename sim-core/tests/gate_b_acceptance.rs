@@ -766,3 +766,335 @@ fn gate_b_acceptance_05_new_wound_cancels_and_restarts_absolute_recovery() {
         ]
     );
 }
+
+fn active_hemostasis_world(seed: u64) -> (World, EntityId, EntityId, WoundId, TreatmentId) {
+    let mut world = World::new(seed);
+    let medic = spawn(&mut world, Role::Medic, HEMOSTATIC_COST);
+    let patient = spawn(&mut world, Role::Rifle, 0);
+    let wound = inflict(
+        &mut world,
+        patient,
+        WoundSpec {
+            trauma: 10,
+            bleeding_per_second: 1,
+            shock: 0,
+        },
+    );
+    let treatment = start_hemostasis(&mut world, medic, patient, wound);
+    (world, medic, patient, wound, treatment)
+}
+
+#[test]
+fn gate_b_acceptance_06_immediate_wound_consequences_and_endpoint_interruptions() {
+    // Immediate trauma death while the casualty is an active patient.
+    let (mut trauma, trauma_medic, trauma_patient, trauma_wound, trauma_treatment) =
+        active_hemostasis_world(6_061);
+    assert_eq!(trauma.soldier(trauma_medic).unwrap().inventory.medical, 0);
+    let outcome = trauma.apply(Command::InflictWound {
+        patient: trauma_patient,
+        wound: WoundSpec {
+            trauma: 1_000,
+            bleeding_per_second: 0,
+            shock: 0,
+        },
+    });
+    assert_eq!(outcome.error, None);
+    assert_eq!(
+        outcome.events,
+        vec![
+            TimedEvent {
+                at: 0,
+                event: Event::WoundInflicted {
+                    id: WoundId(1),
+                    patient: trauma_patient,
+                    wound: WoundSpec {
+                        trauma: 1_000,
+                        bleeding_per_second: 0,
+                        shock: 0
+                    }
+                }
+            },
+            TimedEvent {
+                at: 0,
+                event: Event::SoldierDied {
+                    id: trauma_patient,
+                    cause: DeathCause::ImmediateTrauma,
+                    health_before: 990
+                }
+            },
+            TimedEvent {
+                at: 0,
+                event: Event::TreatmentInterrupted {
+                    id: trauma_treatment,
+                    reason: InterruptionReason::PatientDied
+                }
+            },
+        ]
+    );
+    assert_eq!(
+        trauma.soldier(trauma_patient).unwrap().living.life,
+        LifeState::Dead {
+            at: 0,
+            cause: DeathCause::ImmediateTrauma
+        }
+    );
+    assert_eq!(trauma.soldier(trauma_patient).unwrap().living.health, 0);
+    assert!(!trauma.casualty_state(trauma_patient).unwrap().recovering);
+    assert_eq!(
+        trauma.treatment(trauma_treatment).unwrap().status,
+        TreatmentStatus::Interrupted {
+            at: 0,
+            reason: InterruptionReason::PatientDied
+        }
+    );
+    assert!(!trauma.wound(trauma_wound).unwrap().controlled);
+    let later = trauma.apply(Command::AdvanceTo { target: 20 });
+    assert!(!later.events.iter().any(
+        |e| matches!(e.event, Event::TreatmentCompleted { id, .. } if id == trauma_treatment)
+    ));
+
+    // Immediate traumatic shock death while the casualty is the active medic.
+    let (mut shock, shock_medic, _shock_patient, shock_wound, shock_treatment) =
+        active_hemostasis_world(6_062);
+    let outcome = shock.apply(Command::InflictWound {
+        patient: shock_medic,
+        wound: WoundSpec {
+            trauma: 0,
+            bleeding_per_second: 0,
+            shock: 1_000,
+        },
+    });
+    assert_eq!(outcome.error, None);
+    assert_eq!(
+        outcome.events,
+        vec![
+            TimedEvent {
+                at: 0,
+                event: Event::WoundInflicted {
+                    id: WoundId(1),
+                    patient: shock_medic,
+                    wound: WoundSpec {
+                        trauma: 0,
+                        bleeding_per_second: 0,
+                        shock: 1_000
+                    }
+                }
+            },
+            TimedEvent {
+                at: 0,
+                event: Event::SoldierDied {
+                    id: shock_medic,
+                    cause: DeathCause::TraumaticShock,
+                    health_before: 1_000
+                }
+            },
+            TimedEvent {
+                at: 0,
+                event: Event::TreatmentInterrupted {
+                    id: shock_treatment,
+                    reason: InterruptionReason::MedicDied
+                }
+            },
+        ]
+    );
+    assert_eq!(
+        shock.soldier(shock_medic).unwrap().living.life,
+        LifeState::Dead {
+            at: 0,
+            cause: DeathCause::TraumaticShock
+        }
+    );
+    assert_eq!(
+        shock.treatment(shock_treatment).unwrap().status,
+        TreatmentStatus::Interrupted {
+            at: 0,
+            reason: InterruptionReason::MedicDied
+        }
+    );
+    assert!(!shock.wound(shock_wound).unwrap().controlled);
+    assert!(!shock.casualty_state(shock_medic).unwrap().recovering);
+
+    // A marching casualty is forced idle at the instant incapacity is crossed.
+    let mut marching = World::new(6_063);
+    let marcher = spawn(&mut marching, Role::Rifle, 0);
+    assert_eq!(
+        marching
+            .apply(Command::SetActivity {
+                id: marcher,
+                activity: Activity::March
+            })
+            .error,
+        None
+    );
+    let outcome = marching.apply(Command::InflictWound {
+        patient: marcher,
+        wound: WoundSpec {
+            trauma: 1,
+            bleeding_per_second: 0,
+            shock: 700,
+        },
+    });
+    assert_eq!(
+        outcome.events,
+        vec![
+            TimedEvent {
+                at: 0,
+                event: Event::WoundInflicted {
+                    id: WoundId(0),
+                    patient: marcher,
+                    wound: WoundSpec {
+                        trauma: 1,
+                        bleeding_per_second: 0,
+                        shock: 700
+                    }
+                }
+            },
+            TimedEvent {
+                at: 0,
+                event: Event::ActivityChanged {
+                    id: marcher,
+                    before: Activity::March,
+                    after: Activity::Idle,
+                    forced: true
+                }
+            },
+        ]
+    );
+    assert!(marching.casualty_state(marcher).unwrap().incapacitated);
+    assert_eq!(
+        marching.soldier(marcher).unwrap().living.activity,
+        Activity::Idle
+    );
+
+    for (seed, wound_medic, reason) in [
+        (6_064, true, InterruptionReason::Ineligible),
+        (6_065, false, InterruptionReason::Ineligible),
+    ] {
+        let (mut world, medic, patient, treated_wound, treatment) = active_hemostasis_world(seed);
+        let endpoint = if wound_medic { medic } else { patient };
+        let outcome = world.apply(Command::InflictWound {
+            patient: endpoint,
+            wound: WoundSpec {
+                trauma: 1,
+                bleeding_per_second: 0,
+                shock: 700,
+            },
+        });
+        assert_eq!(outcome.error, None);
+        assert_eq!(
+            outcome.events,
+            vec![
+                TimedEvent {
+                    at: 0,
+                    event: Event::WoundInflicted {
+                        id: WoundId(1),
+                        patient: endpoint,
+                        wound: WoundSpec {
+                            trauma: 1,
+                            bleeding_per_second: 0,
+                            shock: 700
+                        }
+                    }
+                },
+                TimedEvent {
+                    at: 0,
+                    event: Event::TreatmentInterrupted {
+                        id: treatment,
+                        reason
+                    }
+                },
+            ]
+        );
+        assert_eq!(
+            world.treatment(treatment).unwrap().status,
+            TreatmentStatus::Interrupted { at: 0, reason }
+        );
+        assert_eq!(world.soldier(medic).unwrap().inventory.medical, 0);
+        assert!(!world.wound(treated_wound).unwrap().controlled);
+        let later = world.apply(Command::AdvanceTo { target: 20 });
+        assert!(!later
+            .events
+            .iter()
+            .any(|e| matches!(e.event, Event::TreatmentCompleted { id, .. } if id == treatment)));
+    }
+}
+
+#[test]
+fn gate_b_acceptance_08_automatic_incapacity_interrupts_before_completion() {
+    for (seed, wound_medic) in [(6_081, true), (6_082, false)] {
+        let (mut world, medic, patient, treated_wound, treatment) = active_hemostasis_world(seed);
+        let endpoint = if wound_medic { medic } else { patient };
+        let inflicted = world.apply(Command::InflictWound {
+            patient: endpoint,
+            wound: WoundSpec {
+                trauma: 0,
+                bleeding_per_second: 1_000,
+                shock: 0,
+            },
+        });
+        assert_eq!(
+            inflicted.events,
+            vec![TimedEvent {
+                at: 0,
+                event: Event::WoundInflicted {
+                    id: WoundId(1),
+                    patient: endpoint,
+                    wound: WoundSpec {
+                        trauma: 0,
+                        bleeding_per_second: 1_000,
+                        shock: 0
+                    }
+                }
+            }]
+        );
+        let advanced = world.apply(Command::AdvanceTo { target: 10 });
+        assert_eq!(advanced.error, None);
+        assert_eq!(
+            advanced.events,
+            vec![
+                TimedEvent {
+                    at: 4,
+                    event: Event::TreatmentInterrupted {
+                        id: treatment,
+                        reason: InterruptionReason::Ineligible
+                    }
+                },
+                TimedEvent {
+                    at: 5,
+                    event: Event::SoldierDied {
+                        id: endpoint,
+                        cause: DeathCause::Hemorrhage,
+                        health_before: if wound_medic { 1_000 } else { 990 }
+                    }
+                },
+                TimedEvent {
+                    at: 10,
+                    event: Event::TimeAdvanced {
+                        from: 0,
+                        to: 10,
+                        hot_cells_stepped: 0,
+                        fixed_steps_per_hot_cell: 0
+                    }
+                },
+            ]
+        );
+        assert_eq!(
+            world.treatment(treatment).unwrap().status,
+            TreatmentStatus::Interrupted {
+                at: 4,
+                reason: InterruptionReason::Ineligible
+            }
+        );
+        assert_eq!(world.soldier(medic).unwrap().inventory.medical, 0);
+        assert!(!world.wound(treated_wound).unwrap().controlled);
+        assert!(!advanced
+            .events
+            .iter()
+            .any(|e| matches!(e.event, Event::TreatmentCompleted { .. })));
+        let later = world.apply(Command::AdvanceTo { target: 20 });
+        assert!(!later
+            .events
+            .iter()
+            .any(|e| matches!(e.event, Event::TreatmentCompleted { .. })));
+    }
+}

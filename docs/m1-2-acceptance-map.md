@@ -1,6 +1,6 @@
 # M1.2 contract-to-test map
 
-Gate B acceptance is **not complete or accepted**. Acceptance tranche 1 implements only recovery scenarios 01–05. Scenarios 06–14 remain pending and no Gate C or M1.3 work is claimed.
+Gate B acceptance is **not complete or accepted**. Acceptance tranche 1 implements recovery scenarios 01–05, and tranche 2A implements scenarios 06–08. Scenarios 09–14 remain pending and no Gate C or M1.3 work is claimed.
 
 | Gate B scenario | Status | Dedicated evidence | Private structural evidence |
 | --- | --- | --- | --- |
@@ -9,9 +9,9 @@ Gate B acceptance is **not complete or accepted**. Acceptance tranche 1 implemen
 | 03 two-wound final-control gating and ordered healing | Implemented in tranche 1 | `gate_b_acceptance_03_two_wound_final_control_gates_distinct_healing` | — |
 | 04 successful shock care while a separate wound bleeds | Implemented in tranche 1 | `gate_b_acceptance_04_shock_care_while_bleeding_never_starts_recovery` | — |
 | 05 nonfatal recovery cancellation and absolute-deadline restart | Implemented in tranche 1 | `gate_b_acceptance_05_new_wound_cancels_and_restarts_absolute_recovery` | — |
-| 06 immediate wound and endpoint-interruption matrices | Pending | — | — |
-| 07 authoritative hot/cold command failure atomicity | Pending | — | — |
-| 08 automatic medic/patient interruption and death precedence | Pending | — | — |
+| 06 immediate wound and endpoint-interruption matrices | Implemented in tranche 2A | `gate_b_acceptance_06_immediate_wound_consequences_and_endpoint_interruptions` | — |
+| 07 authoritative hot/cold command failure atomicity | Implemented in tranche 2A | — | `gate_b_acceptance_07_world_apply_failures_are_fully_atomic` |
+| 08 automatic medic/patient interruption and death precedence | Implemented in tranche 2A | `gate_b_acceptance_08_automatic_incapacity_interrupts_before_completion` | `gate_b_acceptance_08_living_death_at_completion_has_role_precedence_and_cleans_indexes` |
 | 09 real-entity availability churn and exact candidate visits | Pending | — | — |
 | 10 medic/patient removal, conservation, and generation cleanup | Pending | — | — |
 | 11 hot/cold cycles during treatment and recovery | Pending | — | — |
