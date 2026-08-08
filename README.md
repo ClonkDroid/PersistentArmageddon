@@ -1,22 +1,18 @@
-# Persistent Armageddon deterministic kernel (M0)
+# Persistent Armageddon deterministic kernel (M1.1)
 
-This workspace implements the M0 deterministic execution skeleton, not combat or M1 living-world behavior.
+This workspace implements the M0 execution guarantees plus the M1.1 living-state increment. It is not a combat simulation or complete M1.
 
 ## Authoritative boundary
 
-`sim-core::World::apply` is the sole public mutation boundary. Typed commands cover soldier source/loss lifecycle, squads and officers, stockpiles and transfers, fidelity, scheduling/cancellation, time, and RNG. Every accepted mutation emits a timestamped event. An advance outcome retains committed-prefix events together with a terminal error; the failing scheduled command and exact suffix remain queued at the failure timestamp. Intrinsically invalid scheduled commands are rejected immediately, while stable schedule IDs allow state-dependent failures to be cancelled.
+`sim-core::World::apply` is the sole public mutation boundary. Every soldier owns integer hunger, thirst, fatigue, sleep debt, morale, health, activity, life/death state, carried rations, and a materialization timestamp. Idle, rest, and march use different documented rates; ration consumption removes inventory and updates the conservation ledger; deprivation emits deterioration and one persistent death. Queries are read-only.
 
-Soldier spawn is an explicit scenario-loadout source and removal is an explicit loadout loss. Their events identify the soldier and exact ammunition, food, water, and medical quantities. These are M0 scenario/casualty accounting events, not production or consumption.
+Cold soldiers are indexed by their next discrete consequence and lazily projected for pure queries, so unrelated scheduled timestamps do not materialize or visit them. Hot cells step only their indexed living members with the same one-second transition. At a shared timestamp, cold and hot candidates are deduplicated and processed globally by entity ID before commands execute in schedule-ID order. An `AdvanceTo` commits completed time segments and lower schedule IDs; on failure it returns that prefix and leaves the failing command plus exact suffix queued. Individual transitions and fidelity changes stage only touched records, so their own failures are atomic without cloning the world. Hot cells retain fixed-step telemetry, but the real living-member work is reported separately. See [ADR 0002](docs/adr/0002-living-state-transition-engine.md).
 
-Hot cells have a deterministic one-second fixed-step counter. Clock segments advance only active cells; cold cells remain sparse. `TimeAdvanced` reports the exact active-cell count and fixed steps per active cell for each segment, avoiding an overflowing aggregate product. This is a queryable execution skeleton and does not claim tactical combat.
+Soldier spawn is an explicit scenario-loadout source and removal is an explicit loss. Food and water track sourced, carried, consumed, and explicitly lost totals. Ammunition, medical inventory, squads, stockpiles, deterministic scheduling/cancellation, monotonic time, and deterministic RNG retain M0 behavior.
 
 ## Server wire format
 
-The server is an M0 **loopback-only, single-authoritative-writer boundary**, not a production multi-client transport. It retains `GET /health` and `GET /snapshot`, and accepts `POST /v1/command` with `Content-Length` and JSON no larger than 64 KiB. The body has `version: 1`, a `command` (`advance_to`, `create_stockpile`, `transfer`, `set_region_hot`, `schedule_hot`, `schedule_transfer`, or `cancel_scheduled`), the command's named fields, and `null` for the remaining optional fields. Unsupported, malformed, oversized, or length-mismatched requests are rejected before mutation. Responses contain version, clock, ordered timestamped events, nullable terminal error, and resulting digest.
-
-Commands commit before their HTTP response is written. A POST may therefore commit even when its response is lost, and a client **must never automatically retry an ambiguously delivered mutation**. Recovery is: stop all command submission; fetch `/health` and the authoritative `/snapshot`; reconcile the intended command against the complete state, pending queue, clock, and digest; and require operator recovery when the result cannot be proved. The digest detects state equality but does not identify which command produced that state. Durable client request IDs, a persistent idempotent command receipt/log, restart persistence, and multi-writer conflict control are mandatory before public or multi-client deployment and are intentionally outside M0.
-
-Each accepted connection has one absolute deadline covering header and body reads plus response-header and response-body writes, including incremental snapshot delivery. A timed-out or otherwise failed peer is closed without terminating the authoritative listener.
+The loopback-only server accepts `POST /v1/command`, including `set_activity` with a raw entity `id` and `activity` of `rest`, `idle`, or `march`. Responses serialize all automatic living events with exact timestamps and before/after audit data. Malformed or unsupported values fail before mutation. `GET /health` and `GET /snapshot` remain available. This is not a durable or multi-writer production transport; clients must not automatically retry ambiguously delivered mutations.
 
 ## Verification
 
@@ -29,4 +25,4 @@ PA_SOLDIERS=10000 PA_DENSE_COMMANDS=1000 cargo run --release -p sim-server -- --
 cargo run --release -p sim-server -- --benchmark
 ```
 
-Snapshot version 5 includes schedule IDs, canonical pending schedule data from which cancellation and stockpile-reservation indexes are reconstructed, and hot-cell execution state and is decoded strictly. The manual benchmark defaults to 2,410,000 records and 100,000 dense commands. See [benchmark evidence](docs/benchmark.md) and [ADR 0001](docs/adr/0001-authoritative-state-and-lod.md).
+Snapshot version 6 canonically includes living state, food/water accounting, due transitions, and work counters; cell membership is reconstructed and every reverse due time is recomputed and validated strictly. The benchmark checksum covers projected living fields, life/death details, activity, materialization time, health, and carried inventory. Version 5 is deliberately rejected. Time has a closed terminal instant at `u64::MAX`; no transition is scheduled beyond it. The manual benchmark defaults to 2,410,000 records and 100,000 dense commands. This increment does not implement combat, wounds, treatment, vehicles, routes, higher formations, communications, AI, graphics, or setting assets.

@@ -45,12 +45,27 @@ fn lifecycle_is_observable_and_conserved_by_explicit_sources_and_losses() {
             stockpile_supplies: 0,
             carried_food: 2,
             carried_water: 3,
-            carried_medical: 1
+            carried_medical: 1,
+            sourced_food: 2,
+            sourced_water: 3,
+            consumed_food: 0,
+            consumed_water: 0,
+            lost_food: 0,
+            lost_water: 0,
         }
     );
     let e = ok(&mut w, Command::DespawnSoldier { id });
     assert!(matches!(e[0].event,Event::SoldierRemoved{id:x,..} if x==id));
-    assert_eq!(w.resource_totals(), before);
+    let after = w.resource_totals();
+    assert_eq!(after.carried_food, before.carried_food);
+    assert_eq!(
+        after.sourced_food,
+        after.carried_food + after.consumed_food + after.lost_food
+    );
+    assert_eq!(
+        after.sourced_water,
+        after.carried_water + after.consumed_water + after.lost_water
+    );
     let digest = w.state_digest();
     assert_eq!(
         w.apply(Command::DespawnSoldier { id }).error,
@@ -637,12 +652,23 @@ fn fidelity_cycles_preserve_complete_soldier_and_relationship_state() {
                 health: spec.health,
                 needs: Needs {
                     fatigue: clock as u32,
-                    hunger: (clock / 3) as u32,
-                    thirst: (clock / 2) as u32,
-                    sleep_debt: (clock / 4) as u32,
+                    hunger: clock as u32,
+                    thirst: (clock * 2) as u32,
+                    sleep_debt: clock as u32,
                 },
                 ammunition: spec.ammunition,
                 inventory: spec.inventory,
+                living: LivingState {
+                    hunger: (clock as u32).min(NEED_MAX),
+                    thirst: (clock as u32).saturating_mul(2).min(NEED_MAX),
+                    fatigue: (clock as u32).min(NEED_MAX),
+                    sleep_debt: (clock as u32).min(NEED_MAX),
+                    morale: 1000,
+                    health: spec.health,
+                    activity: Activity::Idle,
+                    life: LifeState::Alive,
+                    materialized_at: clock,
+                },
             })
             .collect()
     }
@@ -784,15 +810,16 @@ fn elapsed_needs_saturate_and_time_never_reverses() {
         _ => unreachable!(),
     };
     ok(&mut w, Command::AdvanceTo { target: u64::MAX });
-    assert_eq!(
-        w.soldier(id).unwrap().needs,
-        Needs {
-            fatigue: u32::MAX,
-            hunger: u32::MAX,
-            thirst: u32::MAX,
-            sleep_debt: u32::MAX
+    let soldier = w.soldier(id).unwrap();
+    assert!(matches!(
+        soldier.living.life,
+        LifeState::Dead {
+            cause: DeathCause::Dehydration,
+            ..
         }
-    );
+    ));
+    assert_eq!(soldier.living.health, 0);
+    assert!(soldier.needs.hunger <= NEED_MAX && soldier.needs.thirst <= NEED_MAX);
     let digest = w.state_digest();
     assert_eq!(
         w.apply(Command::AdvanceTo {

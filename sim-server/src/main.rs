@@ -1,8 +1,8 @@
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sim_core::{
-    BlockedCommand, Command, Event, ScheduledCommand, SimError, SoldierSpec, Stock, TimedEvent,
-    World,
+    Activity, BlockedCommand, Command, DeathCause, Event, ScheduledCommand, SimError, SoldierSpec,
+    Stock, TimedEvent, World,
 };
 use std::env;
 use std::io::{Read, Write};
@@ -356,6 +356,7 @@ struct Wire {
     cell: Option<u32>,
     hot: Option<bool>,
     at: Option<u64>,
+    activity: Option<String>,
 }
 impl Wire {
     fn into_command(self) -> Result<Command, ()> {
@@ -401,6 +402,15 @@ impl Wire {
             }),
             "cancel_scheduled" => Ok(Command::CancelScheduled {
                 id: self.id.ok_or(())?,
+            }),
+            "set_activity" => Ok(Command::SetActivity {
+                id: sim_core::EntityId::from_raw(self.id.ok_or(())?),
+                activity: match self.activity.as_deref() {
+                    Some("rest") => Activity::Rest,
+                    Some("idle") => Activity::Idle,
+                    Some("march") => Activity::March,
+                    _ => return Err(()),
+                },
             }),
             _ => Err(()),
         }
@@ -455,6 +465,8 @@ fn error_code(e: &SimError) -> &'static str {
         SimError::InvalidScheduledCommand => "invalid_scheduled_command",
         SimError::UnknownScheduledCommand => "unknown_scheduled_command",
         SimError::Snapshot(_) => "snapshot_invalid",
+        SimError::DeadEntity => "dead_entity",
+        SimError::InvalidHealth => "invalid_health",
     }
 }
 fn event_json(x: &TimedEvent) -> Value {
@@ -493,8 +505,50 @@ fn event_json(x: &TimedEvent) -> Value {
         Event::Scheduled { id, at } => json!({"type":"scheduled","id":id,"at":at}),
         Event::ScheduleCancelled { id, at } => json!({"type":"schedule_cancelled","id":id,"at":at}),
         Event::RandomGenerated { value } => json!({"type":"random_generated","value":value}),
+        Event::ActivityChanged {
+            id,
+            before,
+            after,
+            forced,
+        } => {
+            json!({"type":"activity_changed","id":id.raw(),"before":activity_name(before),"after":activity_name(after),"forced":forced})
+        }
+        Event::RationConsumed {
+            id,
+            food,
+            water,
+            hunger_before,
+            hunger_after,
+            thirst_before,
+            thirst_after,
+        } => {
+            json!({"type":"ration_consumed","id":id.raw(),"food":food,"water":water,"hunger_before":hunger_before,"hunger_after":hunger_after,"thirst_before":thirst_before,"thirst_after":thirst_after})
+        }
+        Event::LivingDeteriorated {
+            id,
+            morale_before,
+            morale_after,
+            health_before,
+            health_after,
+        } => {
+            json!({"type":"living_deteriorated","id":id.raw(),"morale_before":morale_before,"morale_after":morale_after,"health_before":health_before,"health_after":health_after})
+        }
+        Event::SoldierDied {
+            id,
+            cause,
+            health_before,
+        } => {
+            json!({"type":"soldier_died","id":id.raw(),"cause":match cause{DeathCause::Dehydration=>"dehydration",DeathCause::Starvation=>"starvation",DeathCause::Exhaustion=>"exhaustion"},"health_before":health_before})
+        }
     };
     json!({"at":x.at,"event":payload})
+}
+fn activity_name(a: Activity) -> &'static str {
+    match a {
+        Activity::Rest => "rest",
+        Activity::Idle => "idle",
+        Activity::March => "march",
+    }
 }
 
 fn apply_ok(w: &mut World, c: Command) {
@@ -512,16 +566,45 @@ fn benchmark() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or(100_000usize);
     let mut w = World::new(0x5eed);
     let t = Instant::now();
+    let hot_cohort = (count / 100).clamp(1, 1_000);
     for i in 0..count {
-        apply_ok(
-            &mut w,
-            Command::SpawnSoldier {
-                spec: SoldierSpec {
-                    faction: (i % 2) as u16,
-                    ..SoldierSpec::default()
+        let outcome = w.apply(Command::SpawnSoldier {
+            spec: SoldierSpec {
+                faction: (i % 2) as u16,
+                position: sim_core::Position {
+                    cell: if i < hot_cohort {
+                        0
+                    } else {
+                        u32::try_from(dense).unwrap_or(u32::MAX)
+                    },
+                    ..Default::default()
                 },
+                inventory: sim_core::Inventory {
+                    food: 1 + (i % 3) as u32,
+                    water: 1 + (i % 4) as u32,
+                    medical: (i % 2) as u32,
+                },
+                ..SoldierSpec::default()
             },
-        )
+        });
+        assert!(outcome.error.is_none());
+        if i % 3 != 1 {
+            let id = match outcome.events[0].event {
+                Event::SoldierSpawned { id, .. } => id,
+                _ => unreachable!(),
+            };
+            apply_ok(
+                &mut w,
+                Command::SetActivity {
+                    id,
+                    activity: if i % 3 == 0 {
+                        Activity::March
+                    } else {
+                        Activity::Rest
+                    },
+                },
+            );
+        }
     }
     let init = t.elapsed();
     apply_ok(
@@ -553,8 +636,9 @@ fn benchmark() -> Result<(), Box<dyn std::error::Error>> {
             },
         )
     }
-    let advance = Instant::now();
+    let cold_start = Instant::now();
     let dense_out = w.apply(Command::AdvanceTo { target: 20 });
+    let cold_time = cold_start.elapsed();
     apply_ok(
         &mut w,
         Command::Schedule {
@@ -567,14 +651,23 @@ fn benchmark() -> Result<(), Box<dyn std::error::Error>> {
             },
         },
     );
+    let mixed_start = Instant::now();
     let sparse_out = w.apply(Command::AdvanceTo { target: 60 });
-    let advance_time = advance.elapsed();
+    let mixed_time = mixed_start.elapsed();
     assert!(dense_out.error.is_none() && sparse_out.error.is_none());
+    let repeated_start = Instant::now();
+    let mut repeated_events = 0;
+    for target in 61..=63 {
+        let outcome = w.apply(Command::AdvanceTo { target });
+        assert!(outcome.error.is_none());
+        repeated_events += outcome.events.len();
+    }
+    let repeated_time = repeated_start.elapsed();
     let needs = Instant::now();
     let checksum = w.needs_checksum();
     let needs_time = needs.elapsed();
-    let combined = advance_time + needs_time;
-    let rate = 60.0 / combined.as_secs_f64();
+    let combined = cold_time + mixed_time + repeated_time + needs_time;
+    let rate = 63.0 / combined.as_secs_f64();
     let st = Instant::now();
     let snapshot = w.snapshot();
     let snapshot_time = st.elapsed();
@@ -582,7 +675,8 @@ fn benchmark() -> Result<(), Box<dyn std::error::Error>> {
     let digest = w.state_digest();
     let digest_time = dt.elapsed();
     let (rss, peak) = memory_kib();
-    println!("soldiers={count}\ninitialization_seconds={:.6}\ndense_scheduler_commands={dense}\nadvance_simulated_seconds=60\nadvance_events={}\nhot_cell_steps_included=true\nfull_needs_pass_included=true\ncombined_advance_wall_seconds={:.6}\nsimulated_seconds_per_wall_second={rate:.3}\ndesign_goal_simulated_seconds_per_wall_second=1.000\ndesign_goal_met={}\nneeds_checksum={checksum:016x}\nsnapshot_seconds={:.6}\nsnapshot_bytes={}\ndigest_seconds={:.6}\ndigest={digest:016x}\ncurrent_rss_kib={rss}\npeak_rss_kib={peak}",init.as_secs_f64(),dense_out.events.len()+sparse_out.events.len(),combined.as_secs_f64(),rate>=1.0,snapshot_time.as_secs_f64(),snapshot.len(),digest_time.as_secs_f64());
+    let (cold_boundaries, hot_member_steps) = w.living_work_counters();
+    println!("soldiers={count}\ninitialization_seconds={:.6}\ndense_scheduler_commands={dense}\nadvance_simulated_seconds=63\ncold_advance_seconds={:.6}\nmixed_hot_due_advance_seconds={:.6}\nrepeated_one_second_advances=3\nrepeated_one_second_seconds={:.6}\nrepeated_one_second_events={repeated_events}\nadvance_events={}\ncold_due_transitions={cold_boundaries}\nhot_indexed_members={hot_cohort}\nhot_member_steps={hot_member_steps}\nfull_living_checksum_seconds={:.6}\nsimulated_seconds_per_wall_second={rate:.3}\ndesign_goal_simulated_seconds_per_wall_second=1.000\ndesign_goal_met={}\nliving_checksum={checksum:016x}\nsnapshot_seconds={:.6}\nsnapshot_bytes={}\ndigest_seconds={:.6}\ndigest={digest:016x}\ncurrent_rss_kib={rss}\npeak_rss_kib={peak}",init.as_secs_f64(),cold_time.as_secs_f64(),mixed_time.as_secs_f64(),repeated_time.as_secs_f64(),dense_out.events.len()+sparse_out.events.len()+repeated_events,needs_time.as_secs_f64(),rate>=1.0,snapshot_time.as_secs_f64(),snapshot.len(),digest_time.as_secs_f64());
     Ok(())
 }
 fn memory_kib() -> (u64, u64) {
