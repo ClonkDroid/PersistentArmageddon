@@ -1566,20 +1566,26 @@ impl World {
                     TreatmentKind::Hemostatic => HEMOSTATIC_COST,
                     TreatmentKind::Shock => SHOCK_TREATMENT_COST,
                 };
+                let mut visits = 0_u64;
                 let medic = self
                     .available_medics
                     .get(&(spec.faction, spec.position.cell, cost))
                     .and_then(|ids| {
                         ids.iter().copied().find(|candidate| {
-                            #[cfg(test)]
-                            {
-                                self.selection_candidates += 1;
-                            }
+                            visits += 1;
                             *candidate != patient
                         })
                     })
                     .ok_or(SimError::NoEligibleMedic)?;
-                self.start_treatment(medic, patient, wound, kind)
+                let event = self.start_treatment(medic, patient, wound, kind)?;
+                #[cfg(test)]
+                {
+                    self.selection_candidates = self
+                        .selection_candidates
+                        .checked_add(visits)
+                        .expect("test selection counter overflow");
+                }
+                Ok(event)
             }
             Command::InterruptTreatment { id } => {
                 self.interrupt_internal(id, InterruptionReason::Explicit)?;
@@ -1693,7 +1699,6 @@ impl World {
             && self.soldiers.living[medic.index()].activity != Activity::March
             && self.soldiers.living[patient.index()].activity != Activity::March
             && !self.is_incapacitated(medic)
-            && !self.is_incapacitated(patient)
             && !self.active_by_entity.contains_key(&medic)
             && !self.active_by_entity.contains_key(&patient)
     }
@@ -2356,9 +2361,7 @@ impl World {
                 && self.soldiers.living[t.medic.index()].activity != Activity::March
                 && self.soldiers.living[t.patient.index()].activity != Activity::March
                 && (self.soldiers.living[t.medic.index()].life != LifeState::Alive
-                    || !self.is_incapacitated(t.medic))
-                && (self.soldiers.living[t.patient.index()].life != LifeState::Alive
-                    || !self.is_incapacitated(t.patient));
+                    || !self.is_incapacitated(t.medic));
             if !relationship_valid {
                 let old_clock = self.clock;
                 self.clock = at;
@@ -7177,15 +7180,30 @@ mod private_invariants {
         );
         gate_wound(&mut world, patient, 0, 1);
         assert!(world.casualty[&patient].incapacitated);
-        let rejected = world.apply(Command::StartTreatment {
+        let started = world.apply(Command::StartTreatment {
             medic,
             patient,
             wound: None,
             kind: TreatmentKind::Shock,
         });
-        assert_eq!(rejected.error, Some(SimError::InvalidTreatment));
-        assert!(rejected.events.is_empty());
-        assert!(world.treatments.is_empty());
+        assert_eq!(started.error, None);
+        assert!(matches!(
+            started.events.as_slice(),
+            [TimedEvent {
+                event: Event::TreatmentStarted { .. },
+                ..
+            }]
+        ));
+        let completed = world.apply(Command::AdvanceTo { target: 15 });
+        assert_eq!(completed.error, None);
+        assert!(completed.events.iter().any(|event| matches!(
+            event.event,
+            Event::TreatmentCompleted {
+                kind: TreatmentKind::Shock,
+                ..
+            }
+        )));
+        assert_eq!(world.casualty[&patient].shock, 101);
         assert!(world.casualty[&patient].incapacitated);
     }
 
@@ -7393,5 +7411,37 @@ mod private_invariants {
             None,
         );
         assert!(matches!(result, Err(SimError::ArithmeticOverflow)));
+    }
+
+    #[test]
+    fn gate_b_failed_request_preserves_selection_counter_and_authority() {
+        let mut world = World::new(305);
+        let patient = spawn(&mut world, SoldierSpec::default());
+        let _medic = spawn(
+            &mut world,
+            SoldierSpec {
+                role: Role::Medic,
+                inventory: Inventory {
+                    medical: HEMOSTATIC_COST,
+                    ..Inventory::default()
+                },
+                ..SoldierSpec::default()
+            },
+        );
+        let before = world.snapshot();
+        let digest = world.state_digest();
+        let counter = world.selection_candidates;
+        let rejected = world.apply(Command::RequestTreatment {
+            patient,
+            wound: Some(WoundId(999)),
+            kind: TreatmentKind::Hemostatic,
+        });
+        assert_eq!(rejected.error, Some(SimError::InvalidTreatment));
+        assert!(rejected.events.is_empty());
+        assert_eq!(world.selection_candidates, counter);
+        assert_eq!(world.snapshot(), before);
+        assert_eq!(world.state_digest(), digest);
+        assert!(world.treatments.is_empty());
+        assert_eq!(world.next_treatment_id, 0);
     }
 }

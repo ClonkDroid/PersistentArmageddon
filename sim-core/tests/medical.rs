@@ -18,7 +18,7 @@ fn spawn(world: &mut World, role: Role, medical: u32) -> EntityId {
 }
 
 #[test]
-fn distinct_wounds_bleed_and_snapshot_deterministically() {
+fn gate_b_01_distinct_wounds_bleed_and_snapshot_deterministically() {
     let mut w = World::new(7);
     let patient = spawn(&mut w, Role::Rifle, 0);
     for trauma in [10, 20] {
@@ -45,7 +45,7 @@ fn distinct_wounds_bleed_and_snapshot_deterministically() {
 }
 
 #[test]
-fn lowest_eligible_medic_consumes_once_and_completion_controls_wound() {
+fn gate_b_02_lowest_eligible_medic_consumes_once_and_completion_controls_wound() {
     let mut w = World::new(1);
     let medic0 = spawn(&mut w, Role::Medic, 2);
     let _medic1 = spawn(&mut w, Role::Medic, 2);
@@ -88,7 +88,7 @@ fn lowest_eligible_medic_consumes_once_and_completion_controls_wound() {
 }
 
 #[test]
-fn interruption_releases_endpoints_without_refund() {
+fn gate_b_03_interruption_releases_endpoints_without_refund() {
     let mut w = World::new(1);
     let medic = spawn(&mut w, Role::Medic, 3);
     let patient = spawn(&mut w, Role::Rifle, 0);
@@ -125,7 +125,7 @@ fn interruption_releases_endpoints_without_refund() {
 }
 
 #[test]
-fn recovery_has_an_exact_material_boundary_and_heals_history() {
+fn gate_b_04_recovery_has_an_exact_material_boundary_and_heals_history() {
     let mut w = World::new(21);
     let medic = spawn(&mut w, Role::Medic, 1);
     let patient = spawn(&mut w, Role::Rifle, 0);
@@ -200,7 +200,7 @@ fn recovery_has_an_exact_material_boundary_and_heals_history() {
 }
 
 #[test]
-fn immediate_wounds_emit_complete_causal_arrays() {
+fn gate_b_05_immediate_wounds_emit_complete_causal_arrays() {
     let mut w = World::new(22);
     let patient = spawn(&mut w, Role::Rifle, 0);
     w.apply(Command::SetActivity {
@@ -272,7 +272,7 @@ fn immediate_wounds_emit_complete_causal_arrays() {
 }
 
 #[test]
-fn active_removal_emits_interruption_then_removal_and_reuse_is_clean() {
+fn gate_b_06_active_removal_emits_interruption_then_removal_and_reuse_is_clean() {
     let mut w = World::new(23);
     let medic = spawn(&mut w, Role::Medic, 1);
     let patient = spawn(&mut w, Role::Rifle, 0);
@@ -318,7 +318,7 @@ fn active_removal_emits_interruption_then_removal_and_reuse_is_clean() {
 }
 
 #[test]
-fn direct_advance_stamps_hemorrhage_at_the_causal_second() {
+fn gate_b_07_direct_advance_stamps_hemorrhage_at_the_causal_second() {
     let mut world = World::new(11);
     let patient = spawn(&mut world, Role::Rifle, 0);
     world.apply(Command::InflictWound {
@@ -356,7 +356,7 @@ fn direct_advance_stamps_hemorrhage_at_the_causal_second() {
 }
 
 #[test]
-fn wounding_a_lazy_soldier_preserves_living_projection() {
+fn gate_b_08_wounding_a_lazy_soldier_preserves_living_projection() {
     let mut world = World::new(12);
     let patient = spawn(&mut world, Role::Rifle, 0);
     world.apply(Command::AdvanceTo { target: 10 });
@@ -374,7 +374,7 @@ fn wounding_a_lazy_soldier_preserves_living_projection() {
 }
 
 #[test]
-fn shock_treatment_rejects_an_unaffected_patient_without_consumption() {
+fn gate_b_09_shock_treatment_rejects_an_unaffected_patient_without_consumption() {
     let mut world = World::new(13);
     let medic = spawn(&mut world, Role::Medic, SHOCK_TREATMENT_COST);
     let patient = spawn(&mut world, Role::Rifle, 0);
@@ -398,7 +398,7 @@ fn wound_event_id(outcome: &ApplyOutcome) -> WoundId {
 }
 
 #[test]
-fn bleeding_rate_seven_has_exact_hot_cold_remainder_and_death_fixture() {
+fn gate_b_10_bleeding_rate_seven_has_exact_hot_cold_remainder_and_death_fixture() {
     fn fixture(hot: bool) -> (CasualtyState, LifeState, Vec<TimedEvent>) {
         let mut world = World::new(71);
         let patient = match world
@@ -472,7 +472,7 @@ fn bleeding_rate_seven_has_exact_hot_cold_remainder_and_death_fixture() {
 }
 
 #[test]
-fn wound_added_at_nonzero_clock_never_bleeds_retroactively() {
+fn gate_b_11_wound_added_at_nonzero_clock_never_bleeds_retroactively() {
     let mut world = World::new(72);
     let patient = spawn(&mut world, Role::Rifle, 0);
     wound_event_id(&world.apply(Command::InflictWound {
@@ -507,7 +507,7 @@ fn wound_added_at_nonzero_clock_never_bleeds_retroactively() {
 }
 
 #[test]
-fn same_timestamp_hemorrhage_defeats_completion_and_cleans_relationship() {
+fn gate_b_12_same_timestamp_hemorrhage_defeats_completion_and_cleans_relationship() {
     let mut world = World::new(73);
     let medic = spawn(&mut world, Role::Medic, HEMOSTATIC_COST);
     let patient = spawn(&mut world, Role::Rifle, 0);
@@ -576,7 +576,7 @@ fn same_timestamp_hemorrhage_defeats_completion_and_cleans_relationship() {
 }
 
 #[test]
-fn sparse_boundary_across_empty_hot_cell_keeps_snapshot_accounting_valid() {
+fn gate_b_13_sparse_boundary_across_empty_hot_cell_keeps_snapshot_accounting_valid() {
     let mut world = World::new(74);
     assert!(world
         .apply(Command::SetRegionHot {
@@ -601,4 +601,44 @@ fn sparse_boundary_across_empty_hot_cell_keeps_snapshot_accounting_valid() {
     assert_eq!(world.hot_cell(99).unwrap().fixed_steps, 50);
     let bytes = world.snapshot();
     assert_eq!(World::from_snapshot(&bytes).unwrap().snapshot(), bytes);
+}
+
+#[test]
+fn gate_b_14_query_permutations_during_bleeding_and_recovery_are_pure() {
+    let mut world = World::new(314);
+    let medic = spawn(&mut world, Role::Medic, HEMOSTATIC_COST);
+    let patient = spawn(&mut world, Role::Rifle, 0);
+    let wound = wound_event_id(&world.apply(Command::InflictWound {
+        patient,
+        wound: WoundSpec {
+            trauma: 1,
+            bleeding_per_second: 2,
+            shock: 1,
+        },
+    }));
+    let before = world.snapshot();
+    let digest = world.state_digest();
+    assert!(world.casualty_state(patient).is_some());
+    assert_eq!(world.wounds_of(patient), vec![world.wound(wound).unwrap()]);
+    assert!(world.soldier(patient).is_some());
+    assert_eq!(world.snapshot(), before);
+    assert_eq!(world.state_digest(), digest);
+
+    world.apply(Command::StartTreatment {
+        medic,
+        patient,
+        wound: Some(wound),
+        kind: TreatmentKind::Hemostatic,
+    });
+    world.apply(Command::AdvanceTo {
+        target: HEMOSTATIC_DURATION,
+    });
+    let before = world.snapshot();
+    let digest = world.state_digest();
+    let _ = world.wounds_of(patient);
+    let _ = world.casualty_state(patient);
+    let _ = world.soldier(medic);
+    let _ = world.treatment(TreatmentId(0));
+    assert_eq!(world.snapshot(), before);
+    assert_eq!(world.state_digest(), digest);
 }
