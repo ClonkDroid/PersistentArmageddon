@@ -1267,7 +1267,52 @@ impl World {
             self.bleeding_rate_by_patient.get(&id).copied().unwrap_or(0),
             active,
         )?;
+        // Everything below this point mutates authoritative state.  Preflight
+        // every checked accumulator and relationship which the commit will
+        // touch so removal is a single, infallible transaction.
         let transition_interruption = transition.interruption;
+        let mut spec = self.soldiers.data[id.index()];
+        spec.inventory = transition.inventory;
+        spec.health = transition.living.health;
+        let lost_food = self
+            .lost_food
+            .checked_add(u128::from(transition.inventory.food))
+            .ok_or(SimError::ArithmeticOverflow)?;
+        let lost_water = self
+            .lost_water
+            .checked_add(u128::from(transition.inventory.water))
+            .ok_or(SimError::ArithmeticOverflow)?;
+        let lost_medical = self
+            .lost_medical
+            .checked_add(u128::from(transition.inventory.medical))
+            .ok_or(SimError::ArithmeticOverflow)?;
+        self.consumed_food
+            .checked_add(transition.consumed_food)
+            .ok_or(SimError::ArithmeticOverflow)?;
+        self.consumed_water
+            .checked_add(transition.consumed_water)
+            .ok_or(SimError::ArithmeticOverflow)?;
+        if let Some((tid, _)) = active.map(|(tid, is_medic)| {
+            (
+                tid,
+                if is_medic {
+                    InterruptionReason::MedicRemoved
+                } else {
+                    InterruptionReason::PatientRemoved
+                },
+            )
+        }) {
+            let treatment = self
+                .treatments
+                .get(&tid)
+                .ok_or(SimError::InvalidTreatment)?;
+            if treatment.status != TreatmentStatus::Active
+                || self.active_by_entity.get(&treatment.medic) != Some(&tid)
+                || self.active_by_entity.get(&treatment.patient) != Some(&tid)
+            {
+                return Err(SimError::InvalidTreatment);
+            }
+        }
         self.unschedule_due(id);
         self.commit_transition(id, transition, events);
         if let Some((tid, reason)) = transition_interruption {
@@ -1285,7 +1330,74 @@ impl World {
             };
             (tid, reason)
         });
-        let removed = self.apply_one(Command::DespawnSoldier { id })?;
+        // The fallible ledger and relationship work was proved above.  Do not
+        // call the general fallible command path after materialization events
+        // have committed.
+        if let Some(tid) = self.active_by_entity.get(&id).copied() {
+            self.interrupt_internal(tid, removal_interruption.expect("active removal").1)
+                .expect("despawn relationship preflighted");
+        }
+        if let Some(squad) = spec.squad {
+            let q = self.squads.get_mut(&squad).expect("valid relationship");
+            q.members.remove(&id);
+            if q.officer == Some(id) {
+                q.officer = None;
+            }
+        }
+        self.unschedule_due(id);
+        if let Some(members) = self.cell_members.get_mut(&spec.position.cell) {
+            members.remove(&id);
+        }
+        self.lost_food = lost_food;
+        self.lost_water = lost_water;
+        self.lost_medical = lost_medical;
+        if let Some(members) = self
+            .medic_index
+            .get_mut(&(spec.faction, spec.position.cell))
+        {
+            members.remove(&id);
+            if members.is_empty() {
+                self.medic_index.remove(&(spec.faction, spec.position.cell));
+            }
+        }
+        self.casualty.remove(&id);
+        if let Some(wounds) = self.wound_ids_by_patient.remove(&id) {
+            for wound in wounds {
+                self.wounds.remove(&wound);
+            }
+        }
+        self.bleeding_rate_by_patient.remove(&id);
+        if let Some(history) = self.treatment_ids_by_entity.remove(&id) {
+            for tid in history {
+                if let Some(treatment) = self.treatments.remove(&tid) {
+                    if let Some(at) = self.due_by_treatment.remove(&tid) {
+                        if let Some(bucket) = self.treatment_due.get_mut(&at) {
+                            bucket.remove(&tid);
+                            if bucket.is_empty() {
+                                self.treatment_due.remove(&at);
+                            }
+                        }
+                    }
+                    let other = if treatment.medic == id {
+                        treatment.patient
+                    } else {
+                        treatment.medic
+                    };
+                    if let Some(other_history) = self.treatment_ids_by_entity.get_mut(&other) {
+                        other_history.remove(&tid);
+                        if other_history.is_empty() {
+                            self.treatment_ids_by_entity.remove(&other);
+                        }
+                    }
+                }
+            }
+        }
+        self.soldiers.remove(id);
+        self.refresh_medic_availability(id);
+        let removed = Event::SoldierRemoved {
+            id,
+            loadout: spec.into(),
+        };
         if let Some((tid, reason)) = removal_interruption {
             events.push(TimedEvent {
                 at: self.clock,
@@ -7480,5 +7592,69 @@ mod private_invariants {
         assert_eq!(world.state_digest(), digest);
         assert!(world.treatments.is_empty());
         assert_eq!(world.next_treatment_id, 0);
+    }
+
+    #[test]
+    fn gate_b_despawn_loss_overflow_rolls_back_materialized_recovery() {
+        let mut world = World::new(306);
+        let id = spawn(
+            &mut world,
+            SoldierSpec {
+                inventory: Inventory {
+                    medical: 1,
+                    ..Inventory::default()
+                },
+                health: 500,
+                ..SoldierSpec::default()
+            },
+        );
+        world.casualty.insert(
+            id,
+            CasualtyState {
+                blood: 4_000,
+                shock: 100,
+                recovering: true,
+                recovery_next_at: Some(RECOVERY_INTERVAL),
+                ..CasualtyState::default()
+            },
+        );
+        world.clock = RECOVERY_INTERVAL;
+        world.lost_medical = u128::MAX;
+        let before = world.snapshot();
+        let digest = world.state_digest();
+        let counters = (
+            world.automatic_journal_visits,
+            world.automatic_execution_visits,
+            world.medical_entity_candidates,
+            world.wound_index_visits,
+            world.treatment_completion_candidates,
+            world.selection_candidates,
+        );
+
+        let outcome = world.apply(Command::DespawnSoldier { id });
+
+        assert_eq!(outcome.error, Some(SimError::ArithmeticOverflow));
+        assert!(outcome.events.is_empty());
+        assert_eq!(world.snapshot(), before);
+        assert_eq!(world.state_digest(), digest);
+        assert_eq!(
+            (
+                world.automatic_journal_visits,
+                world.automatic_execution_visits,
+                world.medical_entity_candidates,
+                world.wound_index_visits,
+                world.treatment_completion_candidates,
+                world.selection_candidates,
+            ),
+            counters
+        );
+        assert!(world.soldiers.valid(id));
+        assert!(world.casualty[&id].recovering);
+        assert_eq!(
+            world.casualty[&id].recovery_next_at,
+            Some(RECOVERY_INTERVAL)
+        );
+        assert_eq!(world.soldiers.data[id.index()].inventory.medical, 1);
+        assert_eq!(world.lost_medical, u128::MAX);
     }
 }
