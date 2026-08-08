@@ -23,7 +23,7 @@ Historical tests in `sim-core/tests/medical.rs` remain supplemental regression c
 
 ## Gate C1 — canonical snapshot v7 medical persistence
 
-Gate C1 strengthens the single v7 decoder; it does not introduce another format or accept v6. `World::from_snapshot` now checks canonical casualty, wound, and treatment ordering before authority is installed, requires retained IDs to precede their non-wrapping allocators, and validates physiology, wound ownership/specification/state, treatment endpoints/targets/cost/duration/status, active eligibility and coverage, history membership, reconstructed bleeding, due indexes, and all three resource ledgers.
+Gate C1 strengthens the single v7 decoder; it does not introduce another format or accept v6. `World::from_snapshot` checks canonical casualty, wound, and treatment ordering before authority is installed, requires retained IDs to be strictly below their allocators (including the reachable exhausted value `u64::MAX`), and validates physiology, nonempty casualty/wound ownership, wound specification/state, treatment endpoints/targets/temporal relationships/cost/duration/status, exact death interruption timestamps, active eligibility and coverage, history membership, reconstructed bleeding, due indexes, and all three resource ledgers.
 
 | Gate C1 cluster | Dedicated evidence |
 | --- | --- |
@@ -31,6 +31,7 @@ Gate C1 strengthens the single v7 decoder; it does not introduce another format 
 | Schema-class corruption and stable rejection categories | `gate_c1_medical_corruption_matrix_rejects_exact_categories` corrupts named authoritative casualty, wound, treatment, allocator, and ledger fields and pins each exact `SimError::Snapshot` category; it also pins truncation and trailing bytes. |
 | Completed and interrupted audit history | `gate_c1_completed_and_interrupted_history_round_trips_canonically` creates both statuses through public treatment commands and checks canonical bytes, digest, records, and reconstructed two-sided history. |
 | All persistent death causes with retained medical history | `gate_c1_all_six_death_causes_preserve_medical_history` round-trips dehydration, starvation, exhaustion, immediate trauma, hemorrhage, and traumatic shock twice with retained casualty, wound, and treatment audit records. |
-| Active recovery plus active treatment continuation | Gate B's independent `gate_b_acceptance_13_combined_snapshot_continuation_and_recovery_rejection` remains the continuation control and proves literal future events, bytes, digest, and private-index parity. |
+| Allocator exhaustion boundary | `gate_c1_medical_corruption_matrix_rejects_exact_categories` restores canonical snapshots with `next_wound_id` and `next_treatment_id` at `u64::MAX`, then proves the following public allocation fails atomically. |
+| Dedicated mixed-world continuation | Pending correction; Gate B scenario 13 is supplemental restore coverage and is not substituted for the required Gate C1 continuation. |
 
 Gate C1 is persistence-only. The server wire-protocol matrix, benchmark expansion/full manual workload, production review, readiness, overall M1.2 completion, M1.3, and merge remain out of scope.

@@ -3252,12 +3252,6 @@ impl World {
             }
             living_due.insert(at, ids);
         }
-        if next_wound_id == u64::MAX {
-            return Err(SimError::Snapshot("wound allocator"));
-        }
-        if next_treatment_id == u64::MAX {
-            return Err(SimError::Snapshot("treatment allocator"));
-        }
         let mut casualty = BTreeMap::new();
         let mut previous_casualty = None;
         for _ in 0..r.u32()? {
@@ -3602,6 +3596,13 @@ impl World {
         {
             return Err(SimError::Snapshot("wound index"));
         }
+        if self.casualty.keys().any(|patient| {
+            expected_wounds
+                .get(patient)
+                .is_none_or(|ids| ids.is_empty())
+        }) {
+            return Err(SimError::Snapshot("casualty wound ownership"));
+        }
         let mut expected_treatment_due = BTreeMap::<u64, BTreeSet<TreatmentId>>::new();
         let mut expected_due_by_treatment = BTreeMap::new();
         let mut expected_active = BTreeMap::new();
@@ -3621,6 +3622,9 @@ impl World {
                 || medic.position.cell != patient.position.cell
             {
                 return Err(SimError::Snapshot("treatment relationship"));
+            }
+            if !self.casualty.contains_key(&treatment.patient) {
+                return Err(SimError::Snapshot("treatment patient"));
             }
             let (expected_cost, expected_duration) = match treatment.kind {
                 TreatmentKind::Hemostatic => (HEMOSTATIC_COST, HEMOSTATIC_DURATION),
@@ -3642,6 +3646,9 @@ impl World {
                     };
                     if wound.patient != treatment.patient {
                         return Err(SimError::Snapshot("treatment target"));
+                    }
+                    if treatment.started_at < wound.created_at {
+                        return Err(SimError::Snapshot("treatment target time"));
                     }
                 }
                 TreatmentKind::Shock if treatment.wound.is_some() => {
@@ -3695,7 +3702,8 @@ impl World {
                     }
                 }
                 TreatmentStatus::Interrupted { at, reason } => {
-                    if at < treatment.started_at || at > treatment.completes_at || at > self.clock {
+                    if at < treatment.started_at || at >= treatment.completes_at || at > self.clock
+                    {
                         return Err(SimError::Snapshot("treatment interruption time"));
                     }
                     if matches!(
@@ -3707,7 +3715,7 @@ impl World {
                     if reason == InterruptionReason::MedicDied
                         && !matches!(
                             self.soldiers.living[treatment.medic.index()].life,
-                            LifeState::Dead { at: death_at, .. } if death_at <= at
+                            LifeState::Dead { at: death_at, .. } if death_at == at
                         )
                     {
                         return Err(SimError::Snapshot("treatment interruption reason"));
@@ -3715,7 +3723,7 @@ impl World {
                     if reason == InterruptionReason::PatientDied
                         && !matches!(
                             self.soldiers.living[treatment.patient.index()].life,
-                            LifeState::Dead { at: death_at, .. } if death_at <= at
+                            LifeState::Dead { at: death_at, .. } if death_at == at
                         )
                     {
                         return Err(SimError::Snapshot("treatment interruption reason"));
@@ -10664,10 +10672,41 @@ mod private_invariants {
                 );
             }};
         }
-        corrupt!("wound allocator", |w: &mut World| w.next_wound_id =
-            u64::MAX);
-        corrupt!("treatment allocator", |w: &mut World| w.next_treatment_id =
-            u64::MAX);
+        for allocator in ["wound", "treatment"] {
+            let mut exhausted = control.clone();
+            if allocator == "wound" {
+                exhausted.next_wound_id = u64::MAX;
+            } else {
+                assert!(exhausted
+                    .apply(Command::InterruptTreatment { id: treatment })
+                    .error
+                    .is_none());
+                exhausted.next_treatment_id = u64::MAX;
+            }
+            let canonical = exhausted.snapshot();
+            let mut restored = World::from_snapshot(&canonical).unwrap();
+            assert_eq!(restored.snapshot(), canonical);
+            let outcome = if allocator == "wound" {
+                restored.apply(Command::InflictWound {
+                    patient,
+                    wound: WoundSpec {
+                        trauma: 1,
+                        bleeding_per_second: 0,
+                        shock: 0,
+                    },
+                })
+            } else {
+                restored.apply(Command::StartTreatment {
+                    medic,
+                    patient,
+                    wound: Some(wound),
+                    kind: TreatmentKind::Hemostatic,
+                })
+            };
+            assert_eq!(outcome.error, Some(SimError::ArithmeticOverflow));
+            assert!(outcome.events.is_empty());
+            assert_eq!(restored.snapshot(), canonical);
+        }
         corrupt!("medical materialization", |w: &mut World| w
             .casualty
             .get_mut(&patient)
