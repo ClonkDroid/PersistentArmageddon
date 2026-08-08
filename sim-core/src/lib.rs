@@ -13700,6 +13700,384 @@ mod private_invariants {
     }
 
     #[test]
+    fn gate_c1_2a_r4_casualty_and_wound_numeric_boundaries() {
+        fn canonical(world: &World) -> (Vec<u8>, V7MedicalLayout) {
+            let bytes = world.snapshot();
+            let restored = World::from_snapshot(&bytes).unwrap();
+            assert_eq!(restored.snapshot(), bytes);
+            assert_eq!(restored.state_digest(), world.state_digest());
+            assert_eq!(restored.casualty, world.casualty);
+            assert_eq!(restored.wounds, world.wounds);
+            assert_eq!(restored.wound_ids_by_patient, world.wound_ids_by_patient);
+            let mut expected_bleeding = BTreeMap::new();
+            for wound in world.wounds.values() {
+                let rate = expected_bleeding.entry(wound.patient).or_insert(0u64);
+                if !wound.controlled && !wound.healed {
+                    *rate += u64::from(wound.spec.bleeding_per_second);
+                }
+            }
+            assert_eq!(restored.bleeding_rate_by_patient, expected_bleeding);
+            (bytes.clone(), V7MedicalLayout::parse(&bytes))
+        }
+
+        fn scalar_case(
+            bytes: &[u8],
+            at: usize,
+            width: usize,
+            before: u64,
+            after: u64,
+            category: &'static str,
+        ) {
+            let mut changed = bytes.to_vec();
+            let encoded = match width {
+                1 => u64::from(changed[at]),
+                2 => u64::from(u16::from_le_bytes(changed[at..at + 2].try_into().unwrap())),
+                4 => u64::from(u32::from_le_bytes(changed[at..at + 4].try_into().unwrap())),
+                8 => u64::from_le_bytes(changed[at..at + 8].try_into().unwrap()),
+                _ => unreachable!(),
+            };
+            assert_eq!(encoded, before);
+            match width {
+                1 => changed[at] = after as u8,
+                2 => put_u16(&mut changed, at, after as u16),
+                4 => put_u32(&mut changed, at, after as u32),
+                8 => put_u64(&mut changed, at, after),
+                _ => unreachable!(),
+            }
+            let reparsed = V7MedicalLayout::parse(&changed);
+            assert_eq!(reparsed.end, changed.len());
+            assert_eq!(
+                bytes
+                    .iter()
+                    .zip(&changed)
+                    .enumerate()
+                    .filter_map(|(i, (a, b))| (a != b).then_some(i))
+                    .collect::<Vec<_>>(),
+                (at..at + width)
+                    .filter(|i| bytes[*i] != changed[*i])
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                World::from_snapshot(&changed).err(),
+                Some(SimError::Snapshot(category))
+            );
+        }
+
+        fn schema_casualty(blood: u32, shock: u32, remainder: u8, incapacitated: bool) -> World {
+            let mut world = World::new(403);
+            let patient = spawn(&mut world, SoldierSpec::default());
+            world.apply(Command::AdvanceTo { target: 1 });
+            world.apply(Command::InflictWound {
+                patient,
+                wound: WoundSpec {
+                    trauma: 40,
+                    bleeding_per_second: 3,
+                    shock: 20,
+                },
+            });
+            let c = world.casualty.get_mut(&patient).unwrap();
+            c.blood = blood;
+            c.shock = shock;
+            c.shock_remainder = remainder;
+            c.incapacitated = incapacitated;
+            c.materialized_at = world.clock;
+            world.soldiers.living[patient.index()].materialized_at = world.clock;
+            world.unschedule_due(patient);
+            world.schedule_due(patient).unwrap();
+            world
+        }
+
+        // Every representable nonterminal casualty edge is a canonical schema-level
+        // control with a generation-valid owner and a complete retained wound/index.
+        for (blood, shock, remainder, incapacitated) in [
+            (BLOOD_MAX, 0, 0, false),
+            (BLOOD_MAX / 3 + 1, 0, 0, false),
+            (BLOOD_MAX / 3, 0, 0, true),
+            (BLOOD_MAX, INCAPACITATED_SHOCK - 1, 0, false),
+            (BLOOD_MAX, INCAPACITATED_SHOCK, 0, true),
+            (BLOOD_MAX, 999, 9, true),
+        ] {
+            let world = schema_casualty(blood, shock, remainder, incapacitated);
+            let patient = *world.casualty.keys().next().unwrap();
+            assert!(world.soldiers.valid(patient));
+            assert_eq!(
+                world.soldiers.living[patient.index()].life,
+                LifeState::Alive
+            );
+            assert_eq!(world.clock, 1);
+            assert_eq!(world.casualty[&patient].materialized_at, 1);
+            assert_eq!(
+                world.casualty[&patient].materialized_at,
+                world.soldiers.living[patient.index()].materialized_at
+            );
+            assert_eq!(world.wound_ids_by_patient[&patient].len(), 1);
+            assert_eq!(world.bleeding_rate_by_patient[&patient], 3);
+            canonical(&world);
+        }
+
+        let max = schema_casualty(BLOOD_MAX, 0, 0, false);
+        let (max_bytes, max_layout) = canonical(&max);
+        scalar_case(
+            &max_bytes,
+            max_layout.casualties[0].blood,
+            4,
+            u64::from(BLOOD_MAX),
+            u64::from(BLOOD_MAX) + 1,
+            "casualty",
+        );
+        scalar_case(
+            &max_bytes,
+            max_layout.casualties[0].shock,
+            4,
+            0,
+            1001,
+            "casualty",
+        );
+        scalar_case(
+            &max_bytes,
+            max_layout.casualties[0].shock_remainder,
+            1,
+            0,
+            10,
+            "casualty",
+        );
+
+        // Both incapacity truth directions change only the paired scalar set, which
+        // is listed explicitly here rather than relying on validator order.
+        for (blood, shock, incap, new_incap) in [
+            (BLOOD_MAX / 3, 0, true, false),
+            (BLOOD_MAX, INCAPACITATED_SHOCK, true, false),
+            (BLOOD_MAX, INCAPACITATED_SHOCK - 1, false, true),
+        ] {
+            let world = schema_casualty(blood, shock, 0, incap);
+            let (bytes, layout) = canonical(&world);
+            scalar_case(
+                &bytes,
+                layout.casualties[0].incapacitated,
+                1,
+                u64::from(incap),
+                u64::from(new_incap),
+                "casualty incapacity",
+            );
+        }
+
+        // Fatal zero/maximum controls are produced by public commands so their
+        // matching death authority, event, materialization, and retained audit data
+        // are independently pinned.
+        for (spec, cause, field) in [
+            (
+                WoundSpec {
+                    trauma: 0,
+                    bleeding_per_second: 1000,
+                    shock: 0,
+                },
+                DeathCause::Hemorrhage,
+                "blood",
+            ),
+            (
+                WoundSpec {
+                    trauma: 0,
+                    bleeding_per_second: 0,
+                    shock: 1000,
+                },
+                DeathCause::TraumaticShock,
+                "shock",
+            ),
+        ] {
+            let mut world = World::new(404);
+            let patient = spawn(&mut world, SoldierSpec::default());
+            let inflicted = world.apply(Command::InflictWound {
+                patient,
+                wound: spec,
+            });
+            let outcome = if cause == DeathCause::Hemorrhage {
+                world.apply(Command::AdvanceTo { target: 5 })
+            } else {
+                inflicted
+            };
+            assert!(outcome.events.iter().any(|e| matches!(e.event, Event::SoldierDied { id, cause: c, .. } if id == patient && c == cause)));
+            assert_eq!(
+                world.soldiers.living[patient.index()].life,
+                LifeState::Dead {
+                    at: if cause == DeathCause::Hemorrhage {
+                        5
+                    } else {
+                        0
+                    },
+                    cause
+                }
+            );
+            assert_eq!(world.casualty[&patient].blood == 0, field == "blood");
+            assert_eq!(world.casualty[&patient].shock == 1000, field == "shock");
+            canonical(&world);
+        }
+
+        // Independently prove each wound component's zero and maximum.  A second
+        // nonzero component keeps each zero case a valid wound specification.
+        for spec in [
+            WoundSpec {
+                trauma: 0,
+                bleeding_per_second: 1,
+                shock: 0,
+            },
+            WoundSpec {
+                trauma: 1,
+                bleeding_per_second: 0,
+                shock: 0,
+            },
+            WoundSpec {
+                trauma: 1,
+                bleeding_per_second: 0,
+                shock: 0,
+            },
+            WoundSpec {
+                trauma: 1000,
+                bleeding_per_second: 0,
+                shock: 0,
+            },
+            WoundSpec {
+                trauma: 0,
+                bleeding_per_second: 1000,
+                shock: 0,
+            },
+            WoundSpec {
+                trauma: 0,
+                bleeding_per_second: 0,
+                shock: 1000,
+            },
+        ] {
+            let mut world = World::new(405);
+            let patient = spawn(&mut world, SoldierSpec::default());
+            let outcome = world.apply(Command::InflictWound {
+                patient,
+                wound: spec,
+            });
+            assert!(outcome.error.is_none());
+            let wound = match outcome.events[0].event {
+                Event::WoundInflicted { id, .. } => id,
+                _ => unreachable!(),
+            };
+            assert_eq!(world.wounds[&wound].spec, spec);
+            if spec.trauma == 1000 {
+                assert_eq!(
+                    world.soldiers.living[patient.index()].life,
+                    LifeState::Dead {
+                        at: 0,
+                        cause: DeathCause::ImmediateTrauma
+                    }
+                );
+            } else if spec.shock == 1000 {
+                assert_eq!(
+                    world.soldiers.living[patient.index()].life,
+                    LifeState::Dead {
+                        at: 0,
+                        cause: DeathCause::TraumaticShock
+                    }
+                );
+            } else {
+                assert_eq!(
+                    world.soldiers.living[patient.index()].life,
+                    LifeState::Alive
+                );
+            }
+            canonical(&world);
+        }
+
+        let mut wound_control = World::new(406);
+        let patient = spawn(&mut wound_control, SoldierSpec::default());
+        wound_control.apply(Command::InflictWound {
+            patient,
+            wound: WoundSpec {
+                trauma: 1,
+                bleeding_per_second: 1,
+                shock: 1,
+            },
+        });
+        let (wound_bytes, wound_layout) = canonical(&wound_control);
+        for (at, name) in [
+            (wound_layout.wounds[0].trauma, "trauma"),
+            (wound_layout.wounds[0].bleeding, "bleeding"),
+            (wound_layout.wounds[0].shock, "shock"),
+        ] {
+            scalar_case(&wound_bytes, at, 2, 1, 1001, "wound specification");
+            assert!(!name.is_empty());
+        }
+        let mut all_zero = wound_bytes.clone();
+        let wl = V7MedicalLayout::parse(&all_zero);
+        put_u16(&mut all_zero, wl.wounds[0].trauma, 0);
+        put_u16(&mut all_zero, wl.wounds[0].bleeding, 0);
+        put_u16(&mut all_zero, wl.wounds[0].shock, 0);
+        assert_eq!(
+            wound_bytes
+                .iter()
+                .zip(&all_zero)
+                .enumerate()
+                .filter_map(|(i, (a, b))| (a != b).then_some(i))
+                .collect::<Vec<_>>(),
+            vec![
+                wl.wounds[0].trauma,
+                wl.wounds[0].bleeding,
+                wl.wounds[0].shock
+            ]
+        );
+        assert_eq!(
+            World::from_snapshot(&all_zero).err(),
+            Some(SimError::Snapshot("wound specification"))
+        );
+
+        // Public nonzero equality control, then isolated future and creation-order
+        // corruptions with all owner/index/allocator relationships retained.
+        let mut timed = World::new(407);
+        let patient = spawn(&mut timed, SoldierSpec::default());
+        timed.apply(Command::AdvanceTo { target: 3 });
+        timed.apply(Command::InflictWound {
+            patient,
+            wound: WoundSpec {
+                trauma: 1,
+                bleeding_per_second: 0,
+                shock: 0,
+            },
+        });
+        assert_eq!(timed.casualty[&patient].materialized_at, 3);
+        assert_eq!(timed.wounds[&WoundId(0)].created_at, 3);
+        canonical(&timed);
+        timed.apply(Command::AdvanceTo { target: 4 });
+        let (timed_bytes, timed_layout) = canonical(&timed);
+        scalar_case(
+            &timed_bytes,
+            timed_layout.casualties[0].materialized_at,
+            8,
+            3,
+            5,
+            "casualty",
+        );
+        scalar_case(
+            &timed_bytes,
+            timed_layout.wounds[0].created_at,
+            8,
+            3,
+            5,
+            "wound",
+        );
+        let mut older_casualty = timed_bytes.clone();
+        put_u64(
+            &mut older_casualty,
+            timed_layout.casualties[0].materialized_at,
+            4,
+        );
+        assert_eq!(
+            World::from_snapshot(&older_casualty).err(),
+            Some(SimError::Snapshot("medical materialization"))
+        );
+        let mut later_wound = timed_bytes.clone();
+        put_u64(&mut later_wound, timed_layout.wounds[0].created_at, 4);
+        assert_eq!(
+            World::from_snapshot(&later_wound).err(),
+            Some(SimError::Snapshot("wound creation time"))
+        );
+    }
+
+    #[test]
     fn gate_c1_all_six_death_causes_preserve_medical_history() {
         fn history_world(food: u32, water: u32) -> (World, EntityId, WoundId, TreatmentId) {
             let mut world = World::new(91);
