@@ -1,6 +1,6 @@
 # M1.2 contract-to-test map
 
-Gate B acceptance is **not complete or accepted**. Acceptance tranche 1 implements recovery scenarios 01–05, tranche 2A implements scenarios 06–08, tranche 2B implements scenarios 09–10, and tranche 3A implements scenarios 11–12. Scenarios 13–14 remain pending and no Gate C or M1.3 work is claimed.
+**Gate B acceptance evidence is complete.** Acceptance tranche 1 implements recovery scenarios 01–05, tranche 2A implements scenarios 06–08, tranche 2B implements scenarios 09–10, tranche 3A implements scenarios 11–12, and tranche 3B implements scenarios 13–14. Gate C, medical benchmarks, production review, overall M1.2 completion, and M1.3 remain out of scope and are not claimed.
 
 | Gate B scenario | Status | Dedicated evidence | Private structural evidence |
 | --- | --- | --- | --- |
@@ -16,7 +16,7 @@ Gate B acceptance is **not complete or accepted**. Acceptance tranche 1 implemen
 | 10 medic/patient removal, conservation, and generation cleanup | Implemented in tranche 2B | — | `gate_b_acceptance_10_materialized_removal_cleans_both_endpoint_roles` |
 | 11 elapsed hot/cold treatment and recovery cycles | Corrected after Gate B audit | — | `gate_b_acceptance_11_repeated_fidelity_cycles_preserve_medical_deadlines` (nonzero hot/cold intervals, literal fidelity/advance arrays, exact private due/hot state) |
 | 12 rollback after recovery/healing/availability/interruption work | Corrected after Gate B audit | — | `gate_b_acceptance_12_late_recovery_overflow_rolls_back_all_earlier_medical_work` (literal control commit and full failed-segment rollback) |
-| 13 combined active-treatment/recovery snapshot continuation and corruption rejection | Pending | — | — |
-| 14 bleeding/recovery query purity including private authority | Pending | — | — |
+| 13 combined active-treatment/recovery snapshot continuation and corruption rejection | Implemented in tranche 3B | — | `gate_b_acceptance_13_combined_snapshot_continuation_and_recovery_rejection` (one v7 image, literal future events, byte/digest/index parity, four exact recovery-state rejections) |
+| 14 bleeding/recovery query purity including private authority | Implemented in tranche 3B | — | `gate_b_acceptance_14_bleeding_and_recovery_queries_are_fully_pure` (repeated permutations, literal projections, unchanged authority/indexes/counters) |
 
-Historical tests in `sim-core/tests/medical.rs` remain supplemental regression coverage only; they are not substitutes for pending dedicated acceptance scenarios.
+Historical tests in `sim-core/tests/medical.rs` remain supplemental regression coverage only; they are not substitutes for the dedicated acceptance scenarios above.
