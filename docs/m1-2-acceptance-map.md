@@ -20,3 +20,17 @@
 | 14 bleeding/recovery query purity including private authority | Implemented in tranche 3B | — | `gate_b_acceptance_14_bleeding_and_recovery_queries_are_fully_pure` (repeated permutations, literal projections, unchanged authority/indexes/counters) |
 
 Historical tests in `sim-core/tests/medical.rs` remain supplemental regression coverage only; they are not substitutes for the dedicated acceptance scenarios above.
+
+## Gate C1 — canonical snapshot v7 medical persistence
+
+Gate C1 strengthens the single v7 decoder; it does not introduce another format or accept v6. `World::from_snapshot` now checks canonical casualty, wound, and treatment ordering before authority is installed, requires retained IDs to precede their non-wrapping allocators, and validates physiology, wound ownership/specification/state, treatment endpoints/targets/cost/duration/status, active eligibility and coverage, history membership, reconstructed bleeding, due indexes, and all three resource ledgers.
+
+| Gate C1 cluster | Dedicated evidence |
+| --- | --- |
+| Canonical valid restore and exact derived-index reconstruction | `gate_c1_medical_corruption_matrix_rejects_exact_categories` first restores its public-command control byte-for-byte and compares active, due/reverse, history, wound/bleeding, and availability indexes. |
+| Schema-class corruption and stable rejection categories | `gate_c1_medical_corruption_matrix_rejects_exact_categories` corrupts named authoritative casualty, wound, treatment, allocator, and ledger fields and pins each exact `SimError::Snapshot` category; it also pins truncation and trailing bytes. |
+| Completed and interrupted audit history | `gate_c1_completed_and_interrupted_history_round_trips_canonically` creates both statuses through public treatment commands and checks canonical bytes, digest, records, and reconstructed two-sided history. |
+| All persistent death causes with retained medical history | `gate_c1_all_six_death_causes_preserve_medical_history` round-trips dehydration, starvation, exhaustion, immediate trauma, hemorrhage, and traumatic shock twice with retained casualty, wound, and treatment audit records. |
+| Active recovery plus active treatment continuation | Gate B's independent `gate_b_acceptance_13_combined_snapshot_continuation_and_recovery_rejection` remains the continuation control and proves literal future events, bytes, digest, and private-index parity. |
+
+Gate C1 is persistence-only. The server wire-protocol matrix, benchmark expansion/full manual workload, production review, readiness, overall M1.2 completion, M1.3, and merge remain out of scope.

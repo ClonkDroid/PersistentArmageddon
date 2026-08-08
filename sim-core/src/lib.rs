@@ -3252,9 +3252,20 @@ impl World {
             }
             living_due.insert(at, ids);
         }
+        if next_wound_id == u64::MAX {
+            return Err(SimError::Snapshot("wound allocator"));
+        }
+        if next_treatment_id == u64::MAX {
+            return Err(SimError::Snapshot("treatment allocator"));
+        }
         let mut casualty = BTreeMap::new();
+        let mut previous_casualty = None;
         for _ in 0..r.u32()? {
             let id = EntityId(r.u64()?);
+            if previous_casualty.is_some_and(|previous| id <= previous) {
+                return Err(SimError::Snapshot("noncanonical casualty order"));
+            }
+            previous_casualty = Some(id);
             let c = CasualtyState {
                 blood: r.u32()?,
                 shock: r.u32()?,
@@ -3280,8 +3291,13 @@ impl World {
             }
         }
         let mut wounds = BTreeMap::new();
+        let mut previous_wound = None;
         for _ in 0..r.u32()? {
             let id = WoundId(r.u64()?);
+            if previous_wound.is_some_and(|previous| id <= previous) {
+                return Err(SimError::Snapshot("noncanonical wound order"));
+            }
+            previous_wound = Some(id);
             let wound = Wound {
                 id,
                 patient: EntityId(r.u64()?),
@@ -3304,8 +3320,13 @@ impl World {
         }
         let mut treatments = BTreeMap::new();
         let mut active_by_entity = BTreeMap::new();
+        let mut previous_treatment = None;
         for _ in 0..r.u32()? {
             let id = TreatmentId(r.u64()?);
+            if previous_treatment.is_some_and(|previous| id <= previous) {
+                return Err(SimError::Snapshot("noncanonical treatment order"));
+            }
+            previous_treatment = Some(id);
             let medic = EntityId(r.u64()?);
             let patient = EntityId(r.u64()?);
             let wound = if r.bool()? {
@@ -3350,6 +3371,9 @@ impl World {
                 consumed,
                 status,
             };
+            if medic == patient {
+                return Err(SimError::Snapshot("treatment endpoints"));
+            }
             if id.0 >= next_treatment_id || treatments.insert(id, t).is_some() {
                 return Err(SimError::Snapshot("treatment"));
             }
@@ -3486,6 +3510,58 @@ impl World {
         Ok(w)
     }
     fn validate(&self) -> Result<(), SimError> {
+        for (id, casualty) in &self.casualty {
+            if !self.soldiers.valid(*id) {
+                return Err(SimError::Snapshot("casualty owner"));
+            }
+            let living = self.soldiers.living[id.index()];
+            if casualty.materialized_at != living.materialized_at {
+                return Err(SimError::Snapshot("medical materialization"));
+            }
+            let expected_incapacitated =
+                casualty.shock >= INCAPACITATED_SHOCK || casualty.blood <= BLOOD_MAX / 3;
+            if casualty.incapacitated != expected_incapacitated {
+                return Err(SimError::Snapshot("casualty incapacity"));
+            }
+            match living.life {
+                LifeState::Alive
+                    if casualty.blood == 0 || casualty.shock >= 1000 || living.health == 0 =>
+                {
+                    return Err(SimError::Snapshot("casualty life"));
+                }
+                LifeState::Dead {
+                    cause: DeathCause::ImmediateTrauma,
+                    ..
+                } if living.health != 0 => {
+                    return Err(SimError::Snapshot("casualty life"));
+                }
+                LifeState::Dead {
+                    cause: DeathCause::Hemorrhage,
+                    ..
+                } if casualty.blood != 0 => {
+                    return Err(SimError::Snapshot("casualty life"));
+                }
+                LifeState::Dead {
+                    cause: DeathCause::TraumaticShock,
+                    ..
+                } if casualty.shock != 1000 => {
+                    return Err(SimError::Snapshot("casualty life"));
+                }
+                _ => {}
+            }
+            if casualty.recovering
+                && (living.life != LifeState::Alive
+                    || casualty.recovery_next_at.is_none()
+                    || casualty.recovery_next_at.is_some_and(|at| {
+                        at <= self.clock
+                            || at
+                                .checked_sub(casualty.materialized_at)
+                                .is_none_or(|delta| delta == 0 || delta > RECOVERY_INTERVAL)
+                    }))
+            {
+                return Err(SimError::Snapshot("recovery state"));
+            }
+        }
         let mut expected_wounds: BTreeMap<EntityId, BTreeSet<WoundId>> = BTreeMap::new();
         let mut expected_bleeding: BTreeMap<EntityId, u64> = BTreeMap::new();
         for (id, wound) in &self.wounds {
@@ -3493,7 +3569,22 @@ impl World {
                 || !self.soldiers.valid(wound.patient)
                 || !self.casualty.contains_key(&wound.patient)
             {
-                return Err(SimError::Snapshot("wound index"));
+                return Err(SimError::Snapshot("wound owner"));
+            }
+            if wound.spec.trauma > 1000
+                || wound.spec.bleeding_per_second > 1000
+                || wound.spec.shock > 1000
+                || (wound.spec.trauma == 0
+                    && wound.spec.bleeding_per_second == 0
+                    && wound.spec.shock == 0)
+            {
+                return Err(SimError::Snapshot("wound specification"));
+            }
+            if wound.created_at > self.casualty[&wound.patient].materialized_at {
+                return Err(SimError::Snapshot("wound creation time"));
+            }
+            if wound.healed && !wound.controlled {
+                return Err(SimError::Snapshot("wound state"));
             }
             expected_wounds
                 .entry(wound.patient)
@@ -3513,7 +3604,124 @@ impl World {
         }
         let mut expected_treatment_due = BTreeMap::<u64, BTreeSet<TreatmentId>>::new();
         let mut expected_due_by_treatment = BTreeMap::new();
+        let mut expected_active = BTreeMap::new();
+        let mut expected_history = BTreeMap::<EntityId, BTreeSet<TreatmentId>>::new();
         for (id, treatment) in &self.treatments {
+            if *id != treatment.id
+                || treatment.medic == treatment.patient
+                || !self.soldiers.valid(treatment.medic)
+                || !self.soldiers.valid(treatment.patient)
+            {
+                return Err(SimError::Snapshot("treatment endpoints"));
+            }
+            let medic = self.soldiers.data[treatment.medic.index()];
+            let patient = self.soldiers.data[treatment.patient.index()];
+            if medic.role != Role::Medic
+                || medic.faction != patient.faction
+                || medic.position.cell != patient.position.cell
+            {
+                return Err(SimError::Snapshot("treatment relationship"));
+            }
+            let (expected_cost, expected_duration) = match treatment.kind {
+                TreatmentKind::Hemostatic => (HEMOSTATIC_COST, HEMOSTATIC_DURATION),
+                TreatmentKind::Shock => (SHOCK_TREATMENT_COST, SHOCK_TREATMENT_DURATION),
+            };
+            if treatment.consumed != expected_cost {
+                return Err(SimError::Snapshot("treatment cost"));
+            }
+            if treatment.started_at.checked_add(expected_duration) != Some(treatment.completes_at) {
+                return Err(SimError::Snapshot("treatment duration"));
+            }
+            if treatment.started_at > self.clock {
+                return Err(SimError::Snapshot("treatment time"));
+            }
+            match treatment.kind {
+                TreatmentKind::Hemostatic => {
+                    let Some(wound) = treatment.wound.and_then(|wid| self.wounds.get(&wid)) else {
+                        return Err(SimError::Snapshot("treatment target"));
+                    };
+                    if wound.patient != treatment.patient {
+                        return Err(SimError::Snapshot("treatment target"));
+                    }
+                }
+                TreatmentKind::Shock if treatment.wound.is_some() => {
+                    return Err(SimError::Snapshot("treatment target"));
+                }
+                TreatmentKind::Shock => {}
+            }
+            expected_history
+                .entry(treatment.medic)
+                .or_default()
+                .insert(*id);
+            expected_history
+                .entry(treatment.patient)
+                .or_default()
+                .insert(*id);
+            match treatment.status {
+                TreatmentStatus::Active => {
+                    if treatment.completes_at <= self.clock
+                        || self.soldiers.living[treatment.medic.index()].life != LifeState::Alive
+                        || self.soldiers.living[treatment.patient.index()].life != LifeState::Alive
+                        || self.soldiers.living[treatment.medic.index()].activity == Activity::March
+                        || self.soldiers.living[treatment.patient.index()].activity
+                            == Activity::March
+                        || self.is_incapacitated(treatment.medic)
+                        || (treatment.kind == TreatmentKind::Hemostatic
+                            && treatment.wound.is_none_or(|wid| {
+                                self.wounds
+                                    .get(&wid)
+                                    .is_none_or(|w| w.controlled || w.healed)
+                            }))
+                    {
+                        return Err(SimError::Snapshot("active treatment eligibility"));
+                    }
+                    if expected_active.insert(treatment.medic, *id).is_some()
+                        || expected_active.insert(treatment.patient, *id).is_some()
+                    {
+                        return Err(SimError::Snapshot("active treatment conflict"));
+                    }
+                }
+                TreatmentStatus::Completed { at } => {
+                    if at != treatment.completes_at || at > self.clock {
+                        return Err(SimError::Snapshot("treatment completion time"));
+                    }
+                    if treatment.kind == TreatmentKind::Hemostatic
+                        && treatment
+                            .wound
+                            .and_then(|wid| self.wounds.get(&wid))
+                            .is_none_or(|w| !w.controlled)
+                    {
+                        return Err(SimError::Snapshot("treatment completion state"));
+                    }
+                }
+                TreatmentStatus::Interrupted { at, reason } => {
+                    if at < treatment.started_at || at > treatment.completes_at || at > self.clock {
+                        return Err(SimError::Snapshot("treatment interruption time"));
+                    }
+                    if matches!(
+                        reason,
+                        InterruptionReason::MedicRemoved | InterruptionReason::PatientRemoved
+                    ) {
+                        return Err(SimError::Snapshot("treatment interruption reason"));
+                    }
+                    if reason == InterruptionReason::MedicDied
+                        && !matches!(
+                            self.soldiers.living[treatment.medic.index()].life,
+                            LifeState::Dead { at: death_at, .. } if death_at <= at
+                        )
+                    {
+                        return Err(SimError::Snapshot("treatment interruption reason"));
+                    }
+                    if reason == InterruptionReason::PatientDied
+                        && !matches!(
+                            self.soldiers.living[treatment.patient.index()].life,
+                            LifeState::Dead { at: death_at, .. } if death_at <= at
+                        )
+                    {
+                        return Err(SimError::Snapshot("treatment interruption reason"));
+                    }
+                }
+            }
             if treatment.status == TreatmentStatus::Active {
                 expected_treatment_due
                     .entry(treatment.completes_at)
@@ -3526,6 +3734,12 @@ impl World {
             || expected_due_by_treatment != self.due_by_treatment
         {
             return Err(SimError::Snapshot("treatment due coverage"));
+        }
+        if expected_active != self.active_by_entity {
+            return Err(SimError::Snapshot("active treatment coverage"));
+        }
+        if expected_history != self.treatment_ids_by_entity {
+            return Err(SimError::Snapshot("treatment history"));
         }
         let mut membership = BTreeSet::new();
         for (id, q) in &self.squads {
@@ -10360,6 +10574,281 @@ mod private_invariants {
                     world.lost_medical,
                 ),
                 authority_indexes
+            );
+        }
+    }
+
+    fn gate_c1_active_world() -> (World, EntityId, EntityId, WoundId, TreatmentId) {
+        let mut world = World::new(71);
+        let medic = spawn(
+            &mut world,
+            SoldierSpec {
+                role: Role::Medic,
+                inventory: Inventory {
+                    medical: 8,
+                    ..Inventory::default()
+                },
+                ..SoldierSpec::default()
+            },
+        );
+        let patient = spawn(&mut world, SoldierSpec::default());
+        let wound = match world
+            .apply(Command::InflictWound {
+                patient,
+                wound: WoundSpec {
+                    trauma: 40,
+                    bleeding_per_second: 3,
+                    shock: 20,
+                },
+            })
+            .events[0]
+            .event
+        {
+            Event::WoundInflicted { id, .. } => id,
+            _ => unreachable!(),
+        };
+        let treatment = match world
+            .apply(Command::StartTreatment {
+                medic,
+                patient,
+                wound: Some(wound),
+                kind: TreatmentKind::Hemostatic,
+            })
+            .events[0]
+            .event
+        {
+            Event::TreatmentStarted { id, .. } => id,
+            _ => unreachable!(),
+        };
+        assert!(world
+            .apply(Command::AdvanceTo { target: 1 })
+            .error
+            .is_none());
+        (world, medic, patient, wound, treatment)
+    }
+
+    #[test]
+    fn gate_c1_medical_corruption_matrix_rejects_exact_categories() {
+        let (control, medic, patient, wound, treatment) = gate_c1_active_world();
+        let bytes = control.snapshot();
+        let restored = World::from_snapshot(&bytes).unwrap();
+        assert_eq!(restored.snapshot(), bytes);
+        assert_eq!(restored.state_digest(), control.state_digest());
+        assert_eq!(restored.active_by_entity, control.active_by_entity);
+        assert_eq!(restored.treatment_due, control.treatment_due);
+        assert_eq!(restored.due_by_treatment, control.due_by_treatment);
+        assert_eq!(
+            restored.treatment_ids_by_entity,
+            control.treatment_ids_by_entity
+        );
+        assert_eq!(restored.wound_ids_by_patient, control.wound_ids_by_patient);
+        assert_eq!(
+            restored.bleeding_rate_by_patient,
+            control.bleeding_rate_by_patient
+        );
+        assert_eq!(restored.available_medics, control.available_medics);
+        assert_eq!(
+            restored.availability_by_medic,
+            control.availability_by_medic
+        );
+
+        macro_rules! corrupt {
+            ($expected:literal, $body:expr) => {{
+                let mut corrupt = control.clone();
+                $body(&mut corrupt);
+                assert_eq!(
+                    World::from_snapshot(&corrupt.snapshot()).err(),
+                    Some(SimError::Snapshot($expected)),
+                    "corruption category {}",
+                    $expected
+                );
+            }};
+        }
+        corrupt!("wound allocator", |w: &mut World| w.next_wound_id =
+            u64::MAX);
+        corrupt!("treatment allocator", |w: &mut World| w.next_treatment_id =
+            u64::MAX);
+        corrupt!("medical materialization", |w: &mut World| w
+            .casualty
+            .get_mut(&patient)
+            .unwrap()
+            .materialized_at +=
+            1);
+        corrupt!("casualty incapacity", |w: &mut World| w
+            .casualty
+            .get_mut(&patient)
+            .unwrap()
+            .incapacitated =
+            true);
+        corrupt!("casualty life", |w: &mut World| {
+            let casualty = w.casualty.get_mut(&patient).unwrap();
+            casualty.blood = 0;
+            casualty.incapacitated = true;
+        });
+        corrupt!("wound owner", |w: &mut World| w
+            .wounds
+            .get_mut(&wound)
+            .unwrap()
+            .patient = medic);
+        corrupt!("wound specification", |w: &mut World| w
+            .wounds
+            .get_mut(&wound)
+            .unwrap()
+            .spec =
+            WoundSpec {
+                trauma: 0,
+                bleeding_per_second: 0,
+                shock: 0,
+            });
+        corrupt!("wound creation time", |w: &mut World| w
+            .wounds
+            .get_mut(&wound)
+            .unwrap()
+            .created_at = 1);
+        corrupt!("wound state", |w: &mut World| {
+            let wound = w.wounds.get_mut(&wound).unwrap();
+            wound.healed = true;
+            wound.controlled = false;
+        });
+        corrupt!("treatment endpoints", |w: &mut World| w
+            .treatments
+            .get_mut(&treatment)
+            .unwrap()
+            .patient = medic);
+        corrupt!("treatment relationship", |w: &mut World| w.soldiers.data
+            [medic.index()]
+        .role =
+            Role::Rifle);
+        corrupt!("treatment target", |w: &mut World| w
+            .treatments
+            .get_mut(&treatment)
+            .unwrap()
+            .wound = None);
+        corrupt!("treatment cost", |w: &mut World| w
+            .treatments
+            .get_mut(&treatment)
+            .unwrap()
+            .consumed = 2);
+        corrupt!("treatment duration", |w: &mut World| w
+            .treatments
+            .get_mut(&treatment)
+            .unwrap()
+            .completes_at += 1);
+        corrupt!("active treatment eligibility", |w: &mut World| w
+            .wounds
+            .get_mut(&wound)
+            .unwrap()
+            .controlled =
+            true);
+        corrupt!("resource ledger", |w: &mut World| w.consumed_medical += 1);
+
+        let mut truncated = bytes.clone();
+        truncated.pop();
+        assert_eq!(
+            World::from_snapshot(&truncated).err(),
+            Some(SimError::Snapshot("truncated"))
+        );
+        let mut trailing = bytes;
+        trailing.push(0);
+        assert_eq!(
+            World::from_snapshot(&trailing).err(),
+            Some(SimError::Snapshot("trailing bytes"))
+        );
+    }
+
+    #[test]
+    fn gate_c1_completed_and_interrupted_history_round_trips_canonically() {
+        let (mut world, medic, patient, wound, active) = gate_c1_active_world();
+        assert!(world
+            .apply(Command::InterruptTreatment { id: active })
+            .error
+            .is_none());
+        let completed = match world
+            .apply(Command::StartTreatment {
+                medic,
+                patient,
+                wound: Some(wound),
+                kind: TreatmentKind::Hemostatic,
+            })
+            .events[0]
+            .event
+        {
+            Event::TreatmentStarted { id, .. } => id,
+            _ => unreachable!(),
+        };
+        assert!(world
+            .apply(Command::AdvanceTo { target: 11 })
+            .error
+            .is_none());
+        assert_eq!(
+            world.treatments[&active].status,
+            TreatmentStatus::Interrupted {
+                at: 1,
+                reason: InterruptionReason::Explicit
+            }
+        );
+        assert_eq!(
+            world.treatments[&completed].status,
+            TreatmentStatus::Completed { at: 11 }
+        );
+        let bytes = world.snapshot();
+        let restored = World::from_snapshot(&bytes).unwrap();
+        assert_eq!(restored.snapshot(), bytes);
+        assert_eq!(restored.state_digest(), world.state_digest());
+        assert_eq!(restored.treatments, world.treatments);
+        assert_eq!(
+            restored.treatment_ids_by_entity,
+            world.treatment_ids_by_entity
+        );
+    }
+
+    #[test]
+    fn gate_c1_all_six_death_causes_preserve_medical_history() {
+        for cause in [
+            DeathCause::Dehydration,
+            DeathCause::Starvation,
+            DeathCause::Exhaustion,
+            DeathCause::ImmediateTrauma,
+            DeathCause::Hemorrhage,
+            DeathCause::TraumaticShock,
+        ] {
+            let (mut world, _, patient, wound, treatment) = gate_c1_active_world();
+            assert!(world
+                .apply(Command::InterruptTreatment { id: treatment })
+                .error
+                .is_none());
+            {
+                let living = &mut world.soldiers.living[patient.index()];
+                living.life = LifeState::Dead { at: 1, cause };
+                living.health = 0;
+                living.materialized_at = 1;
+            }
+            world.soldiers.data[patient.index()].health = 0;
+            let casualty = world.casualty.get_mut(&patient).unwrap();
+            casualty.materialized_at = 1;
+            casualty.recovering = false;
+            casualty.recovery_next_at = None;
+            match cause {
+                DeathCause::Hemorrhage => casualty.blood = 0,
+                DeathCause::TraumaticShock => casualty.shock = 1000,
+                _ => {}
+            }
+            casualty.incapacitated =
+                casualty.shock >= INCAPACITATED_SHOCK || casualty.blood <= BLOOD_MAX / 3;
+            world.unschedule_due(patient);
+            world.refresh_medic_availability(patient);
+
+            let canonical = world.snapshot();
+            let once = World::from_snapshot(&canonical).unwrap();
+            let twice = World::from_snapshot(&once.snapshot()).unwrap();
+            assert_eq!(once.snapshot(), canonical, "{cause:?}");
+            assert_eq!(twice.snapshot(), canonical, "{cause:?}");
+            assert_eq!(twice.state_digest(), world.state_digest(), "{cause:?}");
+            assert_eq!(twice.wounds[&wound], world.wounds[&wound]);
+            assert_eq!(twice.treatments[&treatment], world.treatments[&treatment]);
+            assert_eq!(
+                twice.soldiers.living[patient.index()].life,
+                LifeState::Dead { at: 1, cause }
             );
         }
     }
