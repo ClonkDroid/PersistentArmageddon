@@ -10638,6 +10638,17 @@ mod private_invariants {
         reason: Option<usize>,
     }
 
+    #[derive(Clone, Debug)]
+    struct V7SoldierLayout {
+        range: std::ops::Range<usize>,
+        slot: u32,
+        generation: usize,
+        alive: usize,
+        food: usize,
+        water: usize,
+        medical: usize,
+    }
+
     /// Test-only schema walk for canonical v7.  Every raw corruption below is
     /// addressed by a named field or record range.  Parsing the canonical image
     /// (including all variable-length prefixes) makes an encoding change fail at
@@ -10647,6 +10658,10 @@ mod private_invariants {
         clock: usize,
         sourced_food: usize,
         sourced_water: usize,
+        consumed_food: usize,
+        consumed_water: usize,
+        lost_food: usize,
+        lost_water: usize,
         sourced_medical: usize,
         consumed_medical: usize,
         lost_medical: usize,
@@ -10655,6 +10670,7 @@ mod private_invariants {
         casualty_count: usize,
         wound_count: usize,
         treatment_count: usize,
+        soldiers: Vec<V7SoldierLayout>,
         casualties: Vec<V7CasualtyLayout>,
         wounds: Vec<V7WoundLayout>,
         treatments: Vec<V7TreatmentLayout>,
@@ -10674,9 +10690,14 @@ mod private_invariants {
             r.u128().unwrap();
             let sourced_water = r.p;
             r.u128().unwrap();
-            for _ in 0..4 {
-                r.u128().unwrap();
-            }
+            let consumed_food = r.p;
+            r.u128().unwrap();
+            let consumed_water = r.p;
+            r.u128().unwrap();
+            let lost_food = r.p;
+            r.u128().unwrap();
+            let lost_water = r.p;
+            r.u128().unwrap();
             let sourced_medical = r.p;
             r.u128().unwrap();
             let consumed_medical = r.p;
@@ -10689,11 +10710,40 @@ mod private_invariants {
             r.u64().unwrap();
             r.u64().unwrap();
             r.u64().unwrap();
-            for _ in 0..r.u32().unwrap() {
+            let mut soldiers = Vec::new();
+            for slot in 0..r.u32().unwrap() {
+                let start = r.p;
+                let generation = r.p;
                 r.u32().unwrap();
+                let alive = r.p;
                 if r.bool().unwrap() {
-                    r.spec().unwrap();
+                    r.u16().unwrap();
+                    r.i32().unwrap();
+                    r.i32().unwrap();
+                    r.u32().unwrap();
+                    if r.bool().unwrap() {
+                        r.u32().unwrap();
+                    }
+                    r.u8().unwrap();
+                    r.u8().unwrap();
+                    r.u16().unwrap();
+                    r.u32().unwrap();
+                    let food = r.p;
+                    r.u32().unwrap();
+                    let water = r.p;
+                    r.u32().unwrap();
+                    let medical = r.p;
+                    r.u32().unwrap();
                     r.living().unwrap();
+                    soldiers.push(V7SoldierLayout {
+                        range: start..r.p,
+                        slot,
+                        generation,
+                        alive,
+                        food,
+                        water,
+                        medical,
+                    });
                 }
             }
             for _ in 0..r.u32().unwrap() {
@@ -10869,6 +10919,10 @@ mod private_invariants {
                 clock,
                 sourced_food,
                 sourced_water,
+                consumed_food,
+                consumed_water,
+                lost_food,
+                lost_water,
                 sourced_medical,
                 consumed_medical,
                 lost_medical,
@@ -10877,6 +10931,7 @@ mod private_invariants {
                 casualty_count,
                 wound_count,
                 treatment_count,
+                soldiers,
                 casualties,
                 wounds,
                 treatments,
@@ -15567,6 +15622,683 @@ mod private_invariants {
                 World::from_snapshot(&changed).err(),
                 Some(SimError::Snapshot("active treatment conflict"))
             );
+        }
+    }
+
+    #[test]
+    fn gate_c1_2a_r7_combined_nonzero_resource_ledgers() {
+        fn read_u32(bytes: &[u8], at: usize) -> u32 {
+            u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())
+        }
+        fn read_u128(bytes: &[u8], at: usize) -> u128 {
+            u128::from_le_bytes(bytes[at..at + 16].try_into().unwrap())
+        }
+        fn changed_bytes(before: &[u8], after: &[u8]) -> Vec<usize> {
+            before
+                .iter()
+                .zip(after)
+                .enumerate()
+                .filter_map(|(i, (a, b))| (a != b).then_some(i))
+                .collect()
+        }
+        fn scalar_changes<const N: usize>(
+            at: usize,
+            before: [u8; N],
+            after: [u8; N],
+        ) -> Vec<usize> {
+            (0..N)
+                .filter_map(|i| (before[i] != after[i]).then_some(at + i))
+                .collect()
+        }
+
+        let mut world = World::new(607);
+        let consumer = spawn(
+            &mut world,
+            SoldierSpec {
+                inventory: Inventory {
+                    food: 3,
+                    water: 4,
+                    medical: 0,
+                },
+                ..SoldierSpec::default()
+            },
+        );
+        let advanced = world.apply(Command::AdvanceTo { target: 100 });
+        assert_eq!(advanced.error, None);
+        assert_eq!(
+            advanced.events,
+            vec![
+                TimedEvent {
+                    at: 50,
+                    event: Event::RationConsumed {
+                        id: consumer,
+                        food: 0,
+                        water: 1,
+                        hunger_before: 50,
+                        hunger_after: 50,
+                        thirst_before: 100,
+                        thirst_after: 0
+                    }
+                },
+                TimedEvent {
+                    at: 100,
+                    event: Event::RationConsumed {
+                        id: consumer,
+                        food: 1,
+                        water: 1,
+                        hunger_before: 100,
+                        hunger_after: 0,
+                        thirst_before: 100,
+                        thirst_after: 0
+                    }
+                },
+                TimedEvent {
+                    at: 100,
+                    event: Event::TimeAdvanced {
+                        from: 0,
+                        to: 100,
+                        hot_cells_stepped: 0,
+                        fixed_steps_per_hot_cell: 0
+                    }
+                },
+            ]
+        );
+        let medic = spawn(
+            &mut world,
+            SoldierSpec {
+                role: Role::Medic,
+                inventory: Inventory {
+                    food: 1,
+                    water: 1,
+                    medical: 5,
+                },
+                ..SoldierSpec::default()
+            },
+        );
+        let patient = spawn(
+            &mut world,
+            SoldierSpec {
+                inventory: Inventory {
+                    food: 2,
+                    water: 3,
+                    medical: 4,
+                },
+                ..SoldierSpec::default()
+            },
+        );
+        let removed = spawn(
+            &mut world,
+            SoldierSpec {
+                inventory: Inventory {
+                    food: 7,
+                    water: 8,
+                    medical: 9,
+                },
+                ..SoldierSpec::default()
+            },
+        );
+        let carrier = spawn(
+            &mut world,
+            SoldierSpec {
+                inventory: Inventory {
+                    food: 11,
+                    water: 12,
+                    medical: 13,
+                },
+                ..SoldierSpec::default()
+            },
+        );
+        let wound_spec = WoundSpec {
+            trauma: 0,
+            bleeding_per_second: 0,
+            shock: 400,
+        };
+        let wound_outcome = world.apply(Command::InflictWound {
+            patient,
+            wound: wound_spec,
+        });
+        let wound = WoundId(0);
+        assert_eq!(
+            wound_outcome.events,
+            vec![TimedEvent {
+                at: 100,
+                event: Event::WoundInflicted {
+                    id: wound,
+                    patient,
+                    wound: wound_spec
+                }
+            }]
+        );
+        let treatment_outcome = world.apply(Command::StartTreatment {
+            medic,
+            patient,
+            wound: None,
+            kind: TreatmentKind::Shock,
+        });
+        let treatment = TreatmentId(0);
+        assert_eq!(
+            treatment_outcome.events,
+            vec![TimedEvent {
+                at: 100,
+                event: Event::TreatmentStarted {
+                    id: treatment,
+                    medic,
+                    patient,
+                    wound: None,
+                    kind: TreatmentKind::Shock,
+                    completes_at: 115,
+                    consumed: SHOCK_TREATMENT_COST
+                }
+            }]
+        );
+        let removed_loadout = Loadout {
+            ammunition: 0,
+            food: 7,
+            water: 8,
+            medical: 9,
+        };
+        let removal = world.apply(Command::DespawnSoldier { id: removed });
+        assert_eq!(
+            removal.events,
+            vec![TimedEvent {
+                at: 100,
+                event: Event::SoldierRemoved {
+                    id: removed,
+                    loadout: removed_loadout
+                }
+            }]
+        );
+
+        let living_consumer = LivingState {
+            hunger: 0,
+            thirst: 0,
+            fatigue: 100,
+            sleep_debt: 100,
+            morale: 1000,
+            health: 1000,
+            activity: Activity::Idle,
+            life: LifeState::Alive,
+            materialized_at: 100,
+        };
+        let living_fresh = LivingState {
+            materialized_at: 100,
+            ..LivingState::default()
+        };
+        let casualty = CasualtyState {
+            blood: BLOOD_MAX,
+            shock: 400,
+            shock_remainder: 0,
+            incapacitated: false,
+            recovering: false,
+            recovery_next_at: None,
+            materialized_at: 100,
+        };
+        let wound_record = Wound {
+            id: wound,
+            patient,
+            created_at: 100,
+            spec: wound_spec,
+            controlled: false,
+            healed: false,
+        };
+        let treatment_record = Treatment {
+            id: treatment,
+            medic,
+            patient,
+            wound: None,
+            kind: TreatmentKind::Shock,
+            started_at: 100,
+            completes_at: 115,
+            consumed: SHOCK_TREATMENT_COST,
+            status: TreatmentStatus::Active,
+        };
+        let survivor_inventory = BTreeMap::from([
+            (
+                consumer,
+                Inventory {
+                    food: 2,
+                    water: 2,
+                    medical: 0,
+                },
+            ),
+            (
+                medic,
+                Inventory {
+                    food: 1,
+                    water: 1,
+                    medical: 3,
+                },
+            ),
+            (
+                patient,
+                Inventory {
+                    food: 2,
+                    water: 3,
+                    medical: 4,
+                },
+            ),
+            (
+                carrier,
+                Inventory {
+                    food: 11,
+                    water: 12,
+                    medical: 13,
+                },
+            ),
+        ]);
+        let expected_totals = ResourceTotals {
+            ammunition: 0,
+            stockpile_supplies: 0,
+            carried_food: 16,
+            carried_water: 18,
+            carried_medical: 20,
+            sourced_food: 24,
+            sourced_water: 28,
+            consumed_food: 1,
+            consumed_water: 2,
+            lost_food: 7,
+            lost_water: 8,
+            sourced_medical: 31,
+            consumed_medical: 2,
+            lost_medical: 9,
+        };
+        let expected_living_due =
+            BTreeMap::from([(150, BTreeSet::from([consumer, medic, patient, carrier]))]);
+        let expected_due_by_entity = HashMap::from([
+            (consumer, 150),
+            (medic, 150),
+            (patient, 150),
+            (carrier, 150),
+        ]);
+        let expected_active = BTreeMap::from([(medic, treatment), (patient, treatment)]);
+        let expected_treatment_due = BTreeMap::from([(115, BTreeSet::from([treatment]))]);
+        let expected_history = BTreeMap::from([
+            (medic, BTreeSet::from([treatment])),
+            (patient, BTreeSet::from([treatment])),
+        ]);
+        let assert_control = |control: &World| {
+            assert_eq!(control.clock, 100);
+            assert!(!control.soldiers.valid(removed));
+            assert!(!control
+                .cell_members
+                .values()
+                .any(|ids| ids.contains(&removed)));
+            assert_eq!(control.soldiers.generation[removed.index()], 1);
+            for (id, inventory) in &survivor_inventory {
+                assert!(control.soldiers.valid(*id));
+                let spec = control.soldiers.data[id.index()];
+                let living = control.soldiers.living[id.index()];
+                assert_eq!(spec.inventory, *inventory);
+                assert_eq!((spec.faction, spec.position.cell), (0, 0));
+                assert_eq!(
+                    spec.role,
+                    if *id == medic {
+                        Role::Medic
+                    } else {
+                        Role::Rifle
+                    }
+                );
+                assert_eq!(
+                    living,
+                    if *id == consumer {
+                        living_consumer
+                    } else {
+                        living_fresh
+                    }
+                );
+                assert_eq!(spec.health, living.health);
+            }
+            assert_eq!(control.casualty, BTreeMap::from([(patient, casualty)]));
+            assert_eq!(control.wounds, BTreeMap::from([(wound, wound_record)]));
+            assert_eq!(
+                control.treatments,
+                BTreeMap::from([(treatment, treatment_record)])
+            );
+            assert_eq!((control.next_wound_id, control.next_treatment_id), (1, 1));
+            assert_eq!(control.living_due, expected_living_due);
+            assert_eq!(control.due_by_entity, expected_due_by_entity);
+            assert_eq!(control.active_by_entity, expected_active);
+            assert_eq!(control.treatment_due, expected_treatment_due);
+            assert_eq!(control.due_by_treatment, BTreeMap::from([(treatment, 115)]));
+            assert_eq!(control.treatment_ids_by_entity, expected_history);
+            assert_eq!(
+                control.wound_ids_by_patient,
+                BTreeMap::from([(patient, BTreeSet::from([wound]))])
+            );
+            assert_eq!(control.bleeding_rate_by_patient, BTreeMap::new());
+            assert_eq!(control.available_medics, BTreeMap::new());
+            assert_eq!(control.availability_by_medic, BTreeMap::new());
+            assert_eq!(control.resource_totals(), expected_totals);
+            assert_eq!(
+                (
+                    control.sourced_food,
+                    control.consumed_food,
+                    control.lost_food
+                ),
+                (24, 1, 7)
+            );
+            assert_eq!(
+                (
+                    control.sourced_water,
+                    control.consumed_water,
+                    control.lost_water
+                ),
+                (28, 2, 8)
+            );
+            assert_eq!(
+                (
+                    control.sourced_medical,
+                    control.consumed_medical,
+                    control.lost_medical
+                ),
+                (31, 2, 9)
+            );
+            assert_eq!(
+                16,
+                survivor_inventory
+                    .values()
+                    .map(|i| u128::from(i.food))
+                    .sum::<u128>()
+            );
+            assert_eq!(
+                18,
+                survivor_inventory
+                    .values()
+                    .map(|i| u128::from(i.water))
+                    .sum::<u128>()
+            );
+            assert_eq!(
+                20,
+                survivor_inventory
+                    .values()
+                    .map(|i| u128::from(i.medical))
+                    .sum::<u128>()
+            );
+            assert_eq!(24, 16 + 1 + 7);
+            assert_eq!(28, 18 + 2 + 8);
+            assert_eq!(31, 20 + 2 + 9);
+        };
+        assert_control(&world);
+        let bytes = world.snapshot();
+        let digest = world.state_digest();
+        let layout = V7MedicalLayout::parse(&bytes);
+        assert_eq!(layout.end, bytes.len());
+        let restored = World::from_snapshot(&bytes).unwrap();
+        assert_control(&restored);
+        assert_eq!(restored.snapshot(), bytes);
+        assert_eq!(restored.state_digest(), digest);
+
+        let carrier_layout = layout
+            .soldiers
+            .iter()
+            .find(|s| s.slot as usize == carrier.index())
+            .unwrap();
+        assert_eq!(
+            read_u32(&bytes, carrier_layout.generation),
+            carrier.generation()
+        );
+        assert_eq!(bytes[carrier_layout.alive], 1);
+        assert!(carrier_layout.range.contains(&carrier_layout.food));
+        assert_eq!(
+            (
+                read_u32(&bytes, carrier_layout.food),
+                read_u32(&bytes, carrier_layout.water),
+                read_u32(&bytes, carrier_layout.medical)
+            ),
+            (11, 12, 13)
+        );
+        let ledger_fields = [
+            layout.sourced_food,
+            layout.sourced_water,
+            layout.consumed_food,
+            layout.consumed_water,
+            layout.lost_food,
+            layout.lost_water,
+            layout.sourced_medical,
+            layout.consumed_medical,
+            layout.lost_medical,
+        ];
+        let ledger_values = [24_u128, 28, 1, 2, 7, 8, 31, 2, 9];
+        for (at, value) in ledger_fields.into_iter().zip(ledger_values) {
+            assert_eq!(read_u128(&bytes, at), value);
+        }
+
+        #[derive(Clone, Copy)]
+        struct Case {
+            at: usize,
+            width: usize,
+            before: u128,
+            family: usize,
+            term: usize,
+        }
+        let families = [
+            (24_u128, 16_u128, 1_u128, 7_u128),
+            (28, 18, 2, 8),
+            (31, 20, 2, 9),
+        ];
+        let cases = [
+            Case {
+                at: layout.sourced_food,
+                width: 16,
+                before: 24,
+                family: 0,
+                term: 0,
+            },
+            Case {
+                at: carrier_layout.food,
+                width: 4,
+                before: 11,
+                family: 0,
+                term: 1,
+            },
+            Case {
+                at: layout.consumed_food,
+                width: 16,
+                before: 1,
+                family: 0,
+                term: 2,
+            },
+            Case {
+                at: layout.lost_food,
+                width: 16,
+                before: 7,
+                family: 0,
+                term: 3,
+            },
+            Case {
+                at: layout.sourced_water,
+                width: 16,
+                before: 28,
+                family: 1,
+                term: 0,
+            },
+            Case {
+                at: carrier_layout.water,
+                width: 4,
+                before: 12,
+                family: 1,
+                term: 1,
+            },
+            Case {
+                at: layout.consumed_water,
+                width: 16,
+                before: 2,
+                family: 1,
+                term: 2,
+            },
+            Case {
+                at: layout.lost_water,
+                width: 16,
+                before: 8,
+                family: 1,
+                term: 3,
+            },
+            Case {
+                at: layout.sourced_medical,
+                width: 16,
+                before: 31,
+                family: 2,
+                term: 0,
+            },
+            Case {
+                at: carrier_layout.medical,
+                width: 4,
+                before: 13,
+                family: 2,
+                term: 1,
+            },
+            Case {
+                at: layout.consumed_medical,
+                width: 16,
+                before: 2,
+                family: 2,
+                term: 2,
+            },
+            Case {
+                at: layout.lost_medical,
+                width: 16,
+                before: 9,
+                family: 2,
+                term: 3,
+            },
+        ];
+        for case in cases {
+            let mut changed = bytes.clone();
+            if case.width == 16 {
+                put_u128(&mut changed, case.at, case.before + 1);
+            } else {
+                put_u32(
+                    &mut changed,
+                    case.at,
+                    u32::try_from(case.before + 1).unwrap(),
+                );
+            }
+            let changed_layout = V7MedicalLayout::parse(&changed);
+            assert_eq!(changed_layout.end, changed.len());
+            let changed_carrier = changed_layout
+                .soldiers
+                .iter()
+                .find(|s| s.slot as usize == carrier.index())
+                .unwrap();
+            assert_eq!(changed_carrier.range, carrier_layout.range);
+            assert_eq!(
+                read_u32(&changed, changed_carrier.generation),
+                carrier.generation()
+            );
+            assert_eq!(changed[changed_carrier.alive], 1);
+            for (at, value) in ledger_fields.into_iter().zip(ledger_values) {
+                assert_eq!(
+                    read_u128(&changed, at),
+                    if at == case.at { value + 1 } else { value }
+                );
+            }
+            for (at, value) in [
+                (carrier_layout.food, 11_u32),
+                (carrier_layout.water, 12),
+                (carrier_layout.medical, 13),
+            ] {
+                assert_eq!(
+                    read_u32(&changed, at),
+                    if at == case.at { value + 1 } else { value }
+                );
+            }
+            let mut equations = families;
+            equations[case.family].0 += u128::from(case.term == 0);
+            equations[case.family].1 += u128::from(case.term == 1);
+            equations[case.family].2 += u128::from(case.term == 2);
+            equations[case.family].3 += u128::from(case.term == 3);
+            for (i, (source, carried, consumed, lost)) in equations.into_iter().enumerate() {
+                let rhs = carried
+                    .checked_add(consumed)
+                    .and_then(|v| v.checked_add(lost))
+                    .unwrap();
+                assert_eq!(source.abs_diff(rhs), u128::from(i == case.family));
+            }
+            let expected_changes = if case.width == 16 {
+                scalar_changes(
+                    case.at,
+                    case.before.to_le_bytes(),
+                    (case.before + 1).to_le_bytes(),
+                )
+            } else {
+                scalar_changes(
+                    case.at,
+                    (case.before as u32).to_le_bytes(),
+                    (case.before as u32 + 1).to_le_bytes(),
+                )
+            };
+            assert_eq!(changed_bytes(&bytes, &changed), expected_changes);
+            assert_eq!(
+                World::from_snapshot(&changed).err(),
+                Some(SimError::Snapshot("resource ledger"))
+            );
+        }
+
+        for family in 0..3 {
+            for term in [2_usize, 3] {
+                let at = [
+                    [layout.consumed_food, layout.lost_food],
+                    [layout.consumed_water, layout.lost_water],
+                    [layout.consumed_medical, layout.lost_medical],
+                ][family][term - 2];
+                let before = families[family].2
+                    + if term == 3 {
+                        families[family].3 - families[family].2
+                    } else {
+                        0
+                    };
+                let mut changed = bytes.clone();
+                put_u128(&mut changed, at, u128::MAX);
+                let parsed = V7MedicalLayout::parse(&changed);
+                assert_eq!(parsed.end, changed.len());
+                let parsed_carrier = parsed
+                    .soldiers
+                    .iter()
+                    .find(|s| s.slot as usize == carrier.index())
+                    .unwrap();
+                assert_eq!(parsed_carrier.range, carrier_layout.range);
+                assert_eq!(
+                    read_u32(&changed, parsed_carrier.generation),
+                    carrier.generation()
+                );
+                assert_eq!(changed[parsed_carrier.alive], 1);
+                assert_eq!(read_u128(&changed, at), u128::MAX);
+                let (_, carried, consumed, _) = families[family];
+                for (field, value) in ledger_fields.into_iter().zip(ledger_values) {
+                    assert_eq!(
+                        read_u128(&changed, field),
+                        if field == at { u128::MAX } else { value }
+                    );
+                }
+                assert_eq!(
+                    (
+                        read_u32(&changed, carrier_layout.food),
+                        read_u32(&changed, carrier_layout.water),
+                        read_u32(&changed, carrier_layout.medical),
+                    ),
+                    (11, 12, 13)
+                );
+                if term == 2 {
+                    assert_eq!(carried.checked_add(u128::MAX), None);
+                } else {
+                    let intermediate = carried.checked_add(consumed).unwrap();
+                    assert!(intermediate > 0);
+                    assert_eq!(intermediate.checked_add(u128::MAX), None);
+                }
+                for (i, (s, c, x, l)) in families.into_iter().enumerate() {
+                    if i != family {
+                        assert_eq!(s, c + x + l);
+                    }
+                }
+                assert_eq!(
+                    changed_bytes(&bytes, &changed),
+                    scalar_changes(at, before.to_le_bytes(), u128::MAX.to_le_bytes())
+                );
+                assert_eq!(
+                    World::from_snapshot(&changed).err(),
+                    Some(SimError::Snapshot("resource ledger"))
+                );
+            }
         }
     }
 
