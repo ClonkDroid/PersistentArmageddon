@@ -2,7 +2,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use sim_core::{
     Activity, BlockedCommand, Command, DeathCause, Event, ScheduledCommand, SimError, SoldierSpec,
-    Stock, TimedEvent, World,
+    Stock, TimedEvent, TreatmentId, TreatmentKind, World, WoundId, WoundSpec,
 };
 use std::env;
 use std::io::{Read, Write};
@@ -357,6 +357,14 @@ struct Wire {
     hot: Option<bool>,
     at: Option<u64>,
     activity: Option<String>,
+    patient: Option<u64>,
+    medic: Option<u64>,
+    wound: Option<u64>,
+    trauma: Option<u16>,
+    bleeding_per_second: Option<u16>,
+    shock: Option<u16>,
+    kind: Option<String>,
+    treatment: Option<u64>,
 }
 impl Wire {
     fn into_command(self) -> Result<Command, ()> {
@@ -412,8 +420,37 @@ impl Wire {
                     _ => return Err(()),
                 },
             }),
+            "inflict_wound" => Ok(Command::InflictWound {
+                patient: sim_core::EntityId::from_raw(self.patient.ok_or(())?),
+                wound: WoundSpec {
+                    trauma: self.trauma.ok_or(())?,
+                    bleeding_per_second: self.bleeding_per_second.ok_or(())?,
+                    shock: self.shock.ok_or(())?,
+                },
+            }),
+            "start_treatment" => Ok(Command::StartTreatment {
+                medic: sim_core::EntityId::from_raw(self.medic.ok_or(())?),
+                patient: sim_core::EntityId::from_raw(self.patient.ok_or(())?),
+                wound: self.wound.map(WoundId),
+                kind: parse_kind(self.kind.as_deref())?,
+            }),
+            "request_treatment" => Ok(Command::RequestTreatment {
+                patient: sim_core::EntityId::from_raw(self.patient.ok_or(())?),
+                wound: self.wound.map(WoundId),
+                kind: parse_kind(self.kind.as_deref())?,
+            }),
+            "interrupt_treatment" => Ok(Command::InterruptTreatment {
+                id: TreatmentId(self.treatment.ok_or(())?),
+            }),
             _ => Err(()),
         }
+    }
+}
+fn parse_kind(k: Option<&str>) -> Result<TreatmentKind, ()> {
+    match k {
+        Some("hemostatic") => Ok(TreatmentKind::Hemostatic),
+        Some("shock") => Ok(TreatmentKind::Shock),
+        _ => Err(()),
     }
 }
 fn outcome_json(
@@ -467,6 +504,11 @@ fn error_code(e: &SimError) -> &'static str {
         SimError::Snapshot(_) => "snapshot_invalid",
         SimError::DeadEntity => "dead_entity",
         SimError::InvalidHealth => "invalid_health",
+        SimError::InvalidWound => "invalid_wound",
+        SimError::InvalidTreatment => "invalid_treatment",
+        SimError::NoEligibleMedic => "no_eligible_medic",
+        SimError::BusyEntity => "busy_entity",
+        SimError::InsufficientMedical => "insufficient_medical",
     }
 }
 fn event_json(x: &TimedEvent) -> Value {
@@ -538,10 +580,41 @@ fn event_json(x: &TimedEvent) -> Value {
             cause,
             health_before,
         } => {
-            json!({"type":"soldier_died","id":id.raw(),"cause":match cause{DeathCause::Dehydration=>"dehydration",DeathCause::Starvation=>"starvation",DeathCause::Exhaustion=>"exhaustion"},"health_before":health_before})
+            json!({"type":"soldier_died","id":id.raw(),"cause":match cause{DeathCause::Dehydration=>"dehydration",DeathCause::Starvation=>"starvation",DeathCause::Exhaustion=>"exhaustion",DeathCause::ImmediateTrauma=>"immediate_trauma",DeathCause::Hemorrhage=>"hemorrhage",DeathCause::TraumaticShock=>"traumatic_shock"},"health_before":health_before})
+        }
+        Event::WoundInflicted { id, patient, wound } => {
+            json!({"type":"wound_inflicted","id":id.0,"patient":patient.raw(),"trauma":wound.trauma,"bleeding_per_second":wound.bleeding_per_second,"shock":wound.shock})
+        }
+        Event::TreatmentStarted {
+            id,
+            medic,
+            patient,
+            wound,
+            kind,
+            completes_at,
+            consumed,
+        } => {
+            json!({"type":"treatment_started","id":id.0,"medic":medic.raw(),"patient":patient.raw(),"wound":wound.map(|x|x.0),"kind":treatment_kind(kind),"completes_at":completes_at,"consumed":consumed})
+        }
+        Event::TreatmentCompleted {
+            id,
+            medic,
+            patient,
+            kind,
+        } => {
+            json!({"type":"treatment_completed","id":id.0,"medic":medic.raw(),"patient":patient.raw(),"kind":treatment_kind(kind)})
+        }
+        Event::TreatmentInterrupted { id, reason } => {
+            json!({"type":"treatment_interrupted","id":id.0,"reason":format!("{reason:?}").to_lowercase()})
         }
     };
     json!({"at":x.at,"event":payload})
+}
+fn treatment_kind(k: TreatmentKind) -> &'static str {
+    match k {
+        TreatmentKind::Hemostatic => "hemostatic",
+        TreatmentKind::Shock => "shock",
+    }
 }
 fn activity_name(a: Activity) -> &'static str {
     match a {

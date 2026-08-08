@@ -65,3 +65,9 @@ peak_rss_kib=8624
 ## Environment and limitations
 
 The run used the configured Linux x86-64 cloud container and Rust release profile. RSS values come from `/proc/self/status`. Results cover deterministic living physiology, scheduling, fidelity membership, persistence, and digest work only. They exclude combat, AI, pathfinding, graphics, durable networking, vehicles, and the remainder of M1.
+
+## M1.2 verification run (2026-08-08)
+
+After the snapshot-v7 casualty state addition, the bounded run reported 10,000 soldiers, 0.048688 seconds for mixed hot/due advance, 1,197.700 simulated-seconds per wall-second, an 807,528-byte snapshot, digest `bb18096f2ade74a1`, and 9,328 KiB peak RSS. The full run reported 2,410,000 soldiers, 11.791486 seconds for mixed hot/due advance, 5.073 simulated-seconds per wall-second, a 190,772,328-byte snapshot, digest `587d42fff34e035c`, and 1,523,808 KiB peak RSS.
+
+The existing benchmark still measures real living-state population work and snapshot/digest coverage. It does **not** yet create a representative wounded/medic/treatment cohort or report M1.2-specific boundary and selection counters, so these results are not evidence for the M1.2 casualty performance requirement and must not be described as such.

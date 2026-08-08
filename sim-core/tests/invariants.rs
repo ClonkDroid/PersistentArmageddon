@@ -52,6 +52,9 @@ fn lifecycle_is_observable_and_conserved_by_explicit_sources_and_losses() {
             consumed_water: 0,
             lost_food: 0,
             lost_water: 0,
+            sourced_medical: 1,
+            consumed_medical: 0,
+            lost_medical: 0,
         }
     );
     let e = ok(&mut w, Command::DespawnSoldier { id });
