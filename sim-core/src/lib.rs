@@ -881,7 +881,11 @@ impl World {
             let was_incapacitated = c.incapacitated;
             c.incapacitated = c.shock >= INCAPACITATED_SHOCK || c.blood <= BLOOD_MAX / 3;
             c.materialized_at = at;
-            if c.incapacitated && !was_incapacitated && l.activity != Activity::Idle {
+            if l.life == LifeState::Alive
+                && c.incapacitated
+                && !was_incapacitated
+                && l.activity != Activity::Idle
+            {
                 let before = l.activity;
                 l.activity = Activity::Idle;
                 events.push(TimedEvent {
@@ -2071,6 +2075,14 @@ impl World {
     /// whose clocks advance.  It deliberately does not clone `World` or either
     /// world-sized entity index.
     fn automatic_to(&mut self, t: u64, out: &mut Vec<TimedEvent>) -> Result<(u64, u64), SimError> {
+        #[cfg(test)]
+        let structural_counters = (
+            self.automatic_journal_visits,
+            self.automatic_execution_visits,
+            self.medical_entity_candidates,
+            self.wound_index_visits,
+            self.treatment_completion_candidates,
+        );
         let mut touched = BTreeSet::new();
         for (_, ids) in self.living_due.range(..=t) {
             #[cfg(test)]
@@ -2153,12 +2165,6 @@ impl World {
             self.consumed_water,
             self.cold_boundaries,
             self.hot_member_steps,
-        );
-        #[cfg(test)]
-        let medical_counters = (
-            self.medical_entity_candidates,
-            self.wound_index_visits,
-            self.treatment_completion_candidates,
         );
         let out_len = out.len();
 
@@ -2246,9 +2252,11 @@ impl World {
                 self.hot_member_steps = counters.3;
                 #[cfg(test)]
                 {
-                    self.medical_entity_candidates = medical_counters.0;
-                    self.wound_index_visits = medical_counters.1;
-                    self.treatment_completion_candidates = medical_counters.2;
+                    self.automatic_journal_visits = structural_counters.0;
+                    self.automatic_execution_visits = structural_counters.1;
+                    self.medical_entity_candidates = structural_counters.2;
+                    self.wound_index_visits = structural_counters.3;
+                    self.treatment_completion_candidates = structural_counters.4;
                 }
                 out.truncate(out_len);
                 Err(error)
@@ -6074,29 +6082,36 @@ mod private_invariants {
             .map(|_| spawn(&mut world, SoldierSpec::default()))
             .collect();
         for patient in &patients {
-            gate_wound(&mut world, *patient, 100, 0);
-            assert_eq!(world.due_by_entity.get(patient), Some(&34));
+            gate_wound(&mut world, *patient, 68, 0);
+            assert_eq!(world.due_by_entity.get(patient), Some(&50));
         }
         world.medical_entity_candidates = 0;
-        for at in 1..34 {
-            world.apply(Command::Schedule {
+        for at in 1..50 {
+            let scheduled = world.apply(Command::Schedule {
                 at,
                 command: ScheduledCommand::CreateStockpile {
                     id: at as u32,
                     initial: Stock::default(),
                 },
             });
+            assert_eq!(scheduled.error, None);
+            let segment = world.apply(Command::AdvanceTo { target: at });
+            assert_eq!(segment.error, None);
+            assert_eq!(world.medical_entity_candidates, 0, "segment {at}");
         }
-        world.apply(Command::AdvanceTo { target: 33 });
-        assert_eq!(world.medical_entity_candidates, 0);
-        let out = world.apply(Command::AdvanceTo { target: 34 });
+        let out = world.apply(Command::AdvanceTo { target: 50 });
         assert_eq!(world.medical_entity_candidates, 7);
         assert_eq!(
-            out.events
-                .iter()
-                .filter(|e| matches!(e.event, Event::ActivityChanged { .. }))
-                .count(),
-            0
+            out.events,
+            vec![TimedEvent {
+                at: 50,
+                event: Event::TimeAdvanced {
+                    from: 49,
+                    to: 50,
+                    hot_cells_stepped: 0,
+                    fixed_steps_per_hot_cell: 0
+                }
+            }]
         );
         for patient in patients {
             assert_eq!(world.casualty[&patient].blood, 1_600);
@@ -6199,7 +6214,7 @@ mod private_invariants {
             activity: Activity::Rest,
         });
         gate_wound(&mut world, patient, 7, 0);
-        world.apply(Command::AdvanceTo { target: 477 });
+        let incapacity = world.apply(Command::AdvanceTo { target: 477 });
         assert_eq!(
             world.casualty[&patient],
             CasualtyState {
@@ -6215,6 +6230,40 @@ mod private_invariants {
             world.soldiers.living[patient.index()].activity,
             Activity::Idle
         );
+        let mut expected = Vec::new();
+        for at in [100, 200, 300, 400] {
+            expected.push(TimedEvent {
+                at,
+                event: Event::RationConsumed {
+                    id: patient,
+                    food: 1,
+                    water: 1,
+                    hunger_before: 100,
+                    hunger_after: 0,
+                    thirst_before: 100,
+                    thirst_after: 0,
+                },
+            });
+        }
+        expected.push(TimedEvent {
+            at: 477,
+            event: Event::ActivityChanged {
+                id: patient,
+                before: Activity::Rest,
+                after: Activity::Idle,
+                forced: true,
+            },
+        });
+        expected.push(TimedEvent {
+            at: 477,
+            event: Event::TimeAdvanced {
+                from: 0,
+                to: 477,
+                hot_cells_stepped: 0,
+                fixed_steps_per_hot_cell: 0,
+            },
+        });
+        assert_eq!(incapacity.events, expected);
         let death = world.apply(Command::AdvanceTo { target: 715 });
         assert_eq!(
             world.casualty[&patient],
@@ -6227,28 +6276,124 @@ mod private_invariants {
                 materialized_at: 715
             }
         );
-        assert_eq!(death.events.len(), 10);
-        assert!(matches!(
-            death.events[8],
-            TimedEvent {
-                at: 715,
-                event: Event::SoldierDied {
-                    cause: DeathCause::Hemorrhage,
-                    ..
-                }
-            }
-        ));
-        assert!(matches!(
-            death.events[9],
-            TimedEvent {
-                at: 715,
-                event: Event::TimeAdvanced {
-                    from: 477,
-                    to: 715,
-                    ..
-                }
-            }
-        ));
+        assert_eq!(
+            death.events,
+            vec![
+                TimedEvent {
+                    at: 489,
+                    event: Event::RationConsumed {
+                        id: patient,
+                        food: 0,
+                        water: 1,
+                        hunger_before: 89,
+                        hunger_after: 89,
+                        thirst_before: 101,
+                        thirst_after: 1
+                    }
+                },
+                TimedEvent {
+                    at: 500,
+                    event: Event::RationConsumed {
+                        id: patient,
+                        food: 1,
+                        water: 0,
+                        hunger_before: 100,
+                        hunger_after: 0,
+                        thirst_before: 23,
+                        thirst_after: 23
+                    }
+                },
+                TimedEvent {
+                    at: 539,
+                    event: Event::RationConsumed {
+                        id: patient,
+                        food: 0,
+                        water: 1,
+                        hunger_before: 39,
+                        hunger_after: 39,
+                        thirst_before: 101,
+                        thirst_after: 1
+                    }
+                },
+                TimedEvent {
+                    at: 589,
+                    event: Event::RationConsumed {
+                        id: patient,
+                        food: 0,
+                        water: 1,
+                        hunger_before: 89,
+                        hunger_after: 89,
+                        thirst_before: 101,
+                        thirst_after: 1
+                    }
+                },
+                TimedEvent {
+                    at: 600,
+                    event: Event::RationConsumed {
+                        id: patient,
+                        food: 1,
+                        water: 0,
+                        hunger_before: 100,
+                        hunger_after: 0,
+                        thirst_before: 23,
+                        thirst_after: 23
+                    }
+                },
+                TimedEvent {
+                    at: 639,
+                    event: Event::RationConsumed {
+                        id: patient,
+                        food: 0,
+                        water: 1,
+                        hunger_before: 39,
+                        hunger_after: 39,
+                        thirst_before: 101,
+                        thirst_after: 1
+                    }
+                },
+                TimedEvent {
+                    at: 689,
+                    event: Event::RationConsumed {
+                        id: patient,
+                        food: 0,
+                        water: 1,
+                        hunger_before: 89,
+                        hunger_after: 89,
+                        thirst_before: 101,
+                        thirst_after: 1
+                    }
+                },
+                TimedEvent {
+                    at: 700,
+                    event: Event::RationConsumed {
+                        id: patient,
+                        food: 1,
+                        water: 0,
+                        hunger_before: 100,
+                        hunger_after: 0,
+                        thirst_before: 23,
+                        thirst_after: 23
+                    }
+                },
+                TimedEvent {
+                    at: 715,
+                    event: Event::SoldierDied {
+                        id: patient,
+                        cause: DeathCause::Hemorrhage,
+                        health_before: 1000
+                    }
+                },
+                TimedEvent {
+                    at: 715,
+                    event: Event::TimeAdvanced {
+                        from: 477,
+                        to: 715,
+                        hot_cells_stepped: 0,
+                        fixed_steps_per_hot_cell: 0
+                    }
+                },
+            ]
+        );
     }
 
     #[test]
@@ -6269,12 +6414,29 @@ mod private_invariants {
         world.medical_entity_candidates = 0;
         let out = world.apply(Command::AdvanceTo { target: 1 });
         assert_eq!(world.medical_entity_candidates, 1);
+        assert_eq!(world.cold_boundaries, 1);
         assert_eq!(
-            out.events
-                .iter()
-                .filter(|e| matches!(e.event, Event::ActivityChanged { .. }))
-                .count(),
-            1
+            out.events,
+            vec![
+                TimedEvent {
+                    at: 1,
+                    event: Event::ActivityChanged {
+                        id: patient,
+                        before: Activity::March,
+                        after: Activity::Idle,
+                        forced: true
+                    }
+                },
+                TimedEvent {
+                    at: 1,
+                    event: Event::TimeAdvanced {
+                        from: 0,
+                        to: 1,
+                        hot_cells_stepped: 0,
+                        fixed_steps_per_hot_cell: 0
+                    }
+                },
+            ]
         );
         assert_eq!(world.casualty[&patient].blood, 1_666);
     }
@@ -6296,6 +6458,7 @@ mod private_invariants {
         let patient = spawn(&mut world, SoldierSpec::default());
         let wound = gate_wound(&mut world, patient, 1, 0);
         let tid = gate_start(&mut world, medic, patient, wound);
+        world.casualty.get_mut(&patient).unwrap().blood = BLOOD_MAX / 3 + 10;
         let l = &mut world.soldiers.living[patient.index()];
         l.health = 10;
         l.thirst = SEVERE_THIRST - 30;
@@ -6303,6 +6466,50 @@ mod private_invariants {
         world.soldiers.data[patient.index()].health = 10;
         world.schedule_due(patient).unwrap();
         let out = world.apply(Command::AdvanceTo { target: 10 });
+        assert_eq!(
+            out.events,
+            vec![
+                TimedEvent {
+                    at: 10,
+                    event: Event::LivingDeteriorated {
+                        id: patient,
+                        morale_before: 1000,
+                        morale_after: 999,
+                        health_before: 10,
+                        health_after: 0
+                    }
+                },
+                TimedEvent {
+                    at: 10,
+                    event: Event::SoldierDied {
+                        id: patient,
+                        cause: DeathCause::Dehydration,
+                        health_before: 10
+                    }
+                },
+                TimedEvent {
+                    at: 10,
+                    event: Event::TreatmentInterrupted {
+                        id: tid,
+                        reason: InterruptionReason::PatientDied
+                    }
+                },
+                TimedEvent {
+                    at: 10,
+                    event: Event::TimeAdvanced {
+                        from: 0,
+                        to: 10,
+                        hot_cells_stepped: 0,
+                        fixed_steps_per_hot_cell: 0
+                    }
+                },
+            ]
+        );
+        assert!(world.casualty[&patient].incapacitated);
+        assert_eq!(
+            world.soldiers.living[patient.index()].activity,
+            Activity::March
+        );
         assert!(matches!(
             world.treatments[&tid].status,
             TreatmentStatus::Interrupted {
@@ -6406,16 +6613,85 @@ mod private_invariants {
             },
         );
         let patient = spawn(&mut world, SoldierSpec::default());
-        let wound = gate_wound(&mut world, patient, 500, 0);
+        world.apply(Command::SetActivity {
+            id: patient,
+            activity: Activity::Rest,
+        });
+        let wound = gate_wound(&mut world, patient, 1_000, 0);
         let tid = gate_start(&mut world, medic, patient, wound);
-        world.cold_boundaries = u64::MAX;
+        let unrelated = spawn(&mut world, SoldierSpec::default());
+        world.soldiers.living[unrelated.index()].activity = Activity::March;
+        world.soldiers.living[unrelated.index()].fatigue = 882;
+        world.schedule_due(unrelated).unwrap();
+        assert_eq!(world.due_by_entity.get(&patient), Some(&4));
+        assert_eq!(world.due_by_entity.get(&unrelated), Some(&6));
+        assert_eq!(world.due_by_treatment.get(&tid), Some(&10));
+
+        let mut control = World::from_snapshot(&world.snapshot()).unwrap();
+        let control_out = control.apply(Command::AdvanceTo { target: 6 });
+        assert_eq!(control_out.error, None);
+        assert!(matches!(
+            control.soldiers.living[patient.index()].life,
+            LifeState::Dead {
+                at: 5,
+                cause: DeathCause::Hemorrhage
+            }
+        ));
+        assert_eq!(
+            control.treatments[&tid].status,
+            TreatmentStatus::Interrupted {
+                at: 5,
+                reason: InterruptionReason::PatientDied
+            }
+        );
+        assert_eq!(control_out.events.iter().filter(|event| matches!(event.event, Event::TreatmentInterrupted { id, .. } if id == tid)).count(), 1);
+
+        world.cold_boundaries = u64::MAX - 2;
         let before = world.snapshot();
         let digest = world.state_digest();
+        let counters = (
+            world.hot_member_steps,
+            world.cold_boundaries,
+            world.automatic_journal_visits,
+            world.automatic_execution_visits,
+            world.medical_entity_candidates,
+            world.treatment_completion_candidates,
+            world.wound_index_visits,
+        );
         let out = world.apply(Command::AdvanceTo { target: 10 });
         assert_eq!(out.error, Some(SimError::ArithmeticOverflow));
+        assert!(out.events.is_empty());
         assert_eq!(world.snapshot(), before);
         assert_eq!(world.state_digest(), digest);
+        assert_eq!(world.clock, 0);
+        assert_eq!(world.treatments[&tid].status, TreatmentStatus::Active);
         assert_eq!(world.due_by_treatment.get(&tid), Some(&10));
+        assert_eq!(world.treatment_due.get(&10), Some(&BTreeSet::from([tid])));
+        assert_eq!(world.active_by_entity.get(&medic), Some(&tid));
+        assert_eq!(world.active_by_entity.get(&patient), Some(&tid));
+        assert_eq!(
+            world.casualty[&patient],
+            CasualtyState {
+                blood: BLOOD_MAX,
+                ..CasualtyState::default()
+            }
+        );
+        assert_eq!(
+            world.soldiers.living[patient.index()].life,
+            LifeState::Alive
+        );
+        assert_eq!(
+            (
+                world.hot_member_steps,
+                world.cold_boundaries,
+                world.automatic_journal_visits,
+                world.automatic_execution_visits,
+                world.medical_entity_candidates,
+                world.treatment_completion_candidates,
+                world.wound_index_visits,
+            ),
+            counters
+        );
     }
 
     #[test]
