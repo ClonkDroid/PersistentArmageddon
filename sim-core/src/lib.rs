@@ -1225,28 +1225,7 @@ impl World {
                     }));
                 })
             }
-            Command::DespawnSoldier { id } => {
-                let interruption = self.active_by_entity.get(&id).copied().map(|tid| {
-                    let reason = if self.treatments[&tid].medic == id {
-                        InterruptionReason::MedicRemoved
-                    } else {
-                        InterruptionReason::PatientRemoved
-                    };
-                    (tid, reason)
-                });
-                self.apply_one(Command::DespawnSoldier { id }).map(|event| {
-                    if let Some((id, reason)) = interruption {
-                        events.push(TimedEvent {
-                            at: self.clock,
-                            event: Event::TreatmentInterrupted { id, reason },
-                        });
-                    }
-                    events.push(TimedEvent {
-                        at: self.clock,
-                        event,
-                    });
-                })
-            }
+            Command::DespawnSoldier { id } => self.despawn_materialized(id, &mut events),
             _ => self.apply_one(c).map(|e| {
                 events.push(TimedEvent {
                     at: self.clock,
@@ -1262,6 +1241,64 @@ impl World {
             blocked,
         }
     }
+    /// Materialize an endpoint through the authoritative clock before removing
+    /// it.  The transition is fully staged before mutation, so projection
+    /// failures cannot partially clean relationships or resource accounting.
+    fn despawn_materialized(
+        &mut self,
+        id: EntityId,
+        events: &mut Vec<TimedEvent>,
+    ) -> Result<(), SimError> {
+        if !self.soldiers.valid(id) {
+            return Err(SimError::InvalidEntity);
+        }
+        let active = self.active_by_entity.get(&id).copied().map(|tid| {
+            (
+                tid,
+                self.treatments.get(&tid).is_some_and(|t| t.medic == id),
+            )
+        });
+        let transition = Self::transition_second(
+            self.soldiers.living[id.index()],
+            self.soldiers.data[id.index()].inventory,
+            id,
+            self.clock,
+            self.casualty.get(&id).copied(),
+            self.bleeding_rate_by_patient.get(&id).copied().unwrap_or(0),
+            active,
+        )?;
+        let transition_interruption = transition.interruption;
+        self.unschedule_due(id);
+        self.commit_transition(id, transition, events);
+        if let Some((tid, reason)) = transition_interruption {
+            self.interrupt_internal(tid, reason)?;
+            events.push(TimedEvent {
+                at: self.clock,
+                event: Event::TreatmentInterrupted { id: tid, reason },
+            });
+        }
+        let removal_interruption = self.active_by_entity.get(&id).copied().map(|tid| {
+            let reason = if self.treatments[&tid].medic == id {
+                InterruptionReason::MedicRemoved
+            } else {
+                InterruptionReason::PatientRemoved
+            };
+            (tid, reason)
+        });
+        let removed = self.apply_one(Command::DespawnSoldier { id })?;
+        if let Some((tid, reason)) = removal_interruption {
+            events.push(TimedEvent {
+                at: self.clock,
+                event: Event::TreatmentInterrupted { id: tid, reason },
+            });
+        }
+        events.push(TimedEvent {
+            at: self.clock,
+            event: removed,
+        });
+        Ok(())
+    }
+
     fn apply_one(&mut self, c: Command) -> Result<Event, SimError> {
         match c {
             Command::SpawnSoldier { spec } => {
