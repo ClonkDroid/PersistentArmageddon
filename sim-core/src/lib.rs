@@ -10950,6 +10950,59 @@ mod private_invariants {
         (world, medic, patient, wound, treatment)
     }
 
+    fn gate_c1_recovering_world() -> (World, EntityId, EntityId, WoundId, TreatmentId) {
+        let mut world = World::new(73);
+        let medic = spawn(
+            &mut world,
+            SoldierSpec {
+                role: Role::Medic,
+                inventory: Inventory {
+                    medical: 4,
+                    ..Inventory::default()
+                },
+                ..SoldierSpec::default()
+            },
+        );
+        let patient = spawn(&mut world, SoldierSpec::default());
+        let wound = match world
+            .apply(Command::InflictWound {
+                patient,
+                wound: WoundSpec {
+                    trauma: 25,
+                    bleeding_per_second: 10,
+                    shock: 50,
+                },
+            })
+            .events[0]
+            .event
+        {
+            Event::WoundInflicted { id, .. } => id,
+            _ => unreachable!(),
+        };
+        let treatment = match world
+            .apply(Command::StartTreatment {
+                medic,
+                patient,
+                wound: Some(wound),
+                kind: TreatmentKind::Hemostatic,
+            })
+            .events[0]
+            .event
+        {
+            Event::TreatmentStarted { id, .. } => id,
+            _ => unreachable!(),
+        };
+        let completed = world.apply(Command::AdvanceTo { target: 10 });
+        assert!(completed.error.is_none());
+        assert_eq!(
+            world.treatments[&treatment].status,
+            TreatmentStatus::Completed { at: 10 }
+        );
+        assert!(world.casualty[&patient].recovering);
+        assert_eq!(world.casualty[&patient].recovery_next_at, Some(15));
+        (world, medic, patient, wound, treatment)
+    }
+
     #[test]
     fn gate_c1_medical_corruption_matrix_rejects_exact_categories() {
         let (control, medic, patient, wound, treatment) = gate_c1_active_world();
@@ -11388,8 +11441,13 @@ mod private_invariants {
             );
             put_u64(b, l.treatments[0].patient, x)
         });
-        mutate("future treatment start", "treatment duration", &|b, l| {
-            put_u64(b, l.treatments[1].started_at, world.clock + 1)
+        mutate("future treatment start", "treatment time", &|b, l| {
+            put_u64(b, l.treatments[1].started_at, world.clock + 1);
+            put_u64(
+                b,
+                l.treatments[1].completes_at,
+                world.clock + 1 + HEMOSTATIC_DURATION,
+            )
         });
         mutate("wrong treatment cost", "treatment cost", &|b, l| {
             put_u32(b, l.treatments[1].consumed, 9)
@@ -11677,6 +11735,454 @@ mod private_invariants {
                 "named truncation {name}"
             );
         }
+    }
+
+    #[test]
+    fn gate_c1_2a_r1_recovery_treatment_status_timing_and_truncation() {
+        let (recovery, _recovery_medic, recovering, recovery_wound, _) = gate_c1_recovering_world();
+        let recovery_bytes = recovery.snapshot();
+        let recovery_layout = V7MedicalLayout::parse(&recovery_bytes);
+        assert_eq!(recovery_layout.casualties.len(), 1);
+        assert!(recovery_layout.casualties[0].recovery_deadline.is_some());
+        assert_eq!(
+            World::from_snapshot(&recovery_bytes).unwrap().snapshot(),
+            recovery_bytes
+        );
+
+        let (active, _, _, _, _) = gate_c1_active_world();
+        let active_bytes = active.snapshot();
+        let active_layout = V7MedicalLayout::parse(&active_bytes);
+        assert!(active_layout.treatments[0].wound.is_some());
+        assert_eq!(active_layout.treatments[0].status_at, None);
+        assert_eq!(
+            World::from_snapshot(&active_bytes).unwrap().snapshot(),
+            active_bytes
+        );
+
+        let (mut completed, completed_medic, completed_patient, completed_wound, completed_id) =
+            gate_c1_active_world();
+        let completed_outcome = completed.apply(Command::AdvanceTo { target: 11 });
+        assert!(completed_outcome.error.is_none());
+        assert_eq!(
+            completed.treatments[&completed_id].status,
+            TreatmentStatus::Completed { at: 10 }
+        );
+        let completed_bytes = completed.snapshot();
+        let completed_layout = V7MedicalLayout::parse(&completed_bytes);
+        assert!(completed_layout.treatments[0].status_at.is_some());
+        assert_eq!(
+            World::from_snapshot(&completed_bytes).unwrap().snapshot(),
+            completed_bytes
+        );
+
+        let (
+            mut interrupted,
+            _interrupted_medic,
+            _interrupted_patient,
+            interrupted_wound,
+            interrupted_id,
+        ) = gate_c1_active_world();
+        let interrupted_outcome =
+            interrupted.apply(Command::InterruptTreatment { id: interrupted_id });
+        assert_eq!(
+            interrupted_outcome
+                .events
+                .iter()
+                .map(|x| x.event)
+                .collect::<Vec<_>>(),
+            vec![Event::TreatmentInterrupted {
+                id: interrupted_id,
+                reason: InterruptionReason::Explicit,
+            }]
+        );
+        let interrupted_bytes = interrupted.snapshot();
+        let interrupted_layout = V7MedicalLayout::parse(&interrupted_bytes);
+        assert!(interrupted_layout.treatments[0].status_at.is_some());
+        assert!(interrupted_layout.treatments[0].reason.is_some());
+        assert_eq!(
+            World::from_snapshot(&interrupted_bytes).unwrap().snapshot(),
+            interrupted_bytes
+        );
+
+        macro_rules! state_error {
+            ($base:expr, $name:literal, $category:literal, $edit:expr) => {{
+                let mut invalid = $base.clone();
+                $edit(&mut invalid);
+                assert_eq!(
+                    World::from_snapshot(&invalid.snapshot()).err(),
+                    Some(SimError::Snapshot($category)),
+                    "named 2A-R1 state {}",
+                    $name
+                );
+            }};
+        }
+
+        // Recovery option shape and exact clock/materialization interval matrix.
+        state_error!(
+            recovery,
+            "recovering without deadline",
+            "recovery state",
+            |w: &mut World| {
+                w.casualty.get_mut(&recovering).unwrap().recovery_next_at = None;
+            }
+        );
+        state_error!(
+            recovery,
+            "deadline without recovering",
+            "recovery state",
+            |w: &mut World| {
+                w.casualty.get_mut(&recovering).unwrap().recovering = false;
+            }
+        );
+        state_error!(
+            recovery,
+            "deadline at world clock",
+            "recovery state",
+            |w: &mut World| {
+                w.casualty.get_mut(&recovering).unwrap().recovery_next_at = Some(w.clock);
+            }
+        );
+        state_error!(
+            recovery,
+            "deadline before world clock",
+            "recovery state",
+            |w: &mut World| {
+                w.casualty.get_mut(&recovering).unwrap().recovery_next_at = Some(w.clock - 1);
+            }
+        );
+        assert_eq!(recovery.casualty[&recovering].recovery_next_at, Some(15));
+        assert_eq!(
+            recovery.casualty[&recovering].recovery_next_at.unwrap()
+                - recovery.casualty[&recovering].materialized_at,
+            RECOVERY_INTERVAL
+        );
+        state_error!(
+            recovery,
+            "zero recovery interval",
+            "recovery state",
+            |w: &mut World| {
+                let c = w.casualty.get_mut(&recovering).unwrap();
+                c.recovery_next_at = Some(c.materialized_at);
+            }
+        );
+        state_error!(
+            recovery,
+            "excess recovery interval",
+            "recovery state",
+            |w: &mut World| {
+                let c = w.casualty.get_mut(&recovering).unwrap();
+                c.recovery_next_at = Some(c.materialized_at + RECOVERY_INTERVAL + 1);
+            }
+        );
+        state_error!(
+            recovery,
+            "dead recovering casualty",
+            "recovery state",
+            |w: &mut World| {
+                w.soldiers.living[recovering.index()].life = LifeState::Dead {
+                    at: w.clock,
+                    cause: DeathCause::Exhaustion,
+                };
+                w.soldiers.living[recovering.index()].health = 0;
+                w.soldiers.data[recovering.index()].health = 0;
+                w.unschedule_due(recovering);
+            }
+        );
+        state_error!(
+            recovery,
+            "recovering with zero blood",
+            "recovery state",
+            |w: &mut World| {
+                let c = w.casualty.get_mut(&recovering).unwrap();
+                c.blood = 0;
+                c.incapacitated = true;
+            }
+        );
+        state_error!(
+            recovery,
+            "recovering with fatal shock",
+            "recovery state",
+            |w: &mut World| {
+                let c = w.casualty.get_mut(&recovering).unwrap();
+                c.shock = 1000;
+                c.incapacitated = true;
+            }
+        );
+        state_error!(
+            recovery,
+            "recovering with active bleeding",
+            "recovery state",
+            |w: &mut World| {
+                w.wounds.get_mut(&recovery_wound).unwrap().controlled = false;
+            }
+        );
+        state_error!(
+            recovery,
+            "recovering without retained wounds",
+            "recovery state",
+            |w: &mut World| {
+                w.wounds.clear();
+            }
+        );
+        state_error!(
+            recovery,
+            "recovering with unstable retained wound",
+            "recovery state",
+            |w: &mut World| {
+                let x = w.wounds.get_mut(&recovery_wound).unwrap();
+                x.controlled = false;
+                x.healed = false;
+                x.spec.bleeding_per_second = 0;
+            }
+        );
+        let mut all_healed = recovery.clone();
+        all_healed.wounds.get_mut(&recovery_wound).unwrap().healed = true;
+        assert!(World::from_snapshot(&all_healed.snapshot()).is_ok());
+
+        // Preserve exact duration in the future-start case so time validation wins.
+        state_error!(
+            active,
+            "future treatment start",
+            "treatment time",
+            |w: &mut World| {
+                let t = w.treatments.values_mut().next().unwrap();
+                t.started_at = w.clock + 1;
+                t.completes_at = t.started_at + HEMOSTATIC_DURATION;
+            }
+        );
+        state_error!(
+            active,
+            "active completion already due",
+            "active treatment",
+            |w: &mut World| {
+                let t = w.treatments.values_mut().next().unwrap();
+                t.started_at = 0;
+                t.completes_at = w.clock;
+            }
+        );
+
+        // Completed status is reachable only at the exact kind deadline.
+        assert_eq!(completed.treatments[&completed_id].completes_at, 10);
+        state_error!(
+            completed,
+            "completion before deadline",
+            "treatment completion time",
+            |w: &mut World| {
+                w.treatments.get_mut(&completed_id).unwrap().status =
+                    TreatmentStatus::Completed { at: 9 };
+            }
+        );
+        state_error!(
+            completed,
+            "completion after deadline",
+            "treatment completion time",
+            |w: &mut World| {
+                w.treatments.get_mut(&completed_id).unwrap().status =
+                    TreatmentStatus::Completed { at: 11 };
+            }
+        );
+        state_error!(
+            completed,
+            "completion in future",
+            "treatment completion time",
+            |w: &mut World| {
+                let t = w.treatments.get_mut(&completed_id).unwrap();
+                t.started_at = 2;
+                t.completes_at = 12;
+                t.status = TreatmentStatus::Completed { at: 12 };
+            }
+        );
+        state_error!(
+            completed,
+            "completed hemostasis without control",
+            "treatment completion state",
+            |w: &mut World| {
+                w.wounds.get_mut(&completed_wound).unwrap().controlled = false;
+                let c = w.casualty.get_mut(&completed_patient).unwrap();
+                c.recovering = false;
+                c.recovery_next_at = None;
+            }
+        );
+
+        // Explicit interruption is publicly reachable; all invalid time/reason peers retain valid endpoints.
+        state_error!(
+            interrupted,
+            "interruption before start",
+            "treatment interruption time",
+            |w: &mut World| {
+                w.treatments.get_mut(&interrupted_id).unwrap().status =
+                    TreatmentStatus::Interrupted {
+                        at: 0,
+                        reason: InterruptionReason::Explicit,
+                    };
+                w.treatments.get_mut(&interrupted_id).unwrap().started_at = 1;
+                w.treatments.get_mut(&interrupted_id).unwrap().completes_at = 11;
+            }
+        );
+        state_error!(
+            interrupted,
+            "interruption exactly at completion",
+            "treatment interruption time",
+            |w: &mut World| {
+                w.treatments.get_mut(&interrupted_id).unwrap().status =
+                    TreatmentStatus::Interrupted {
+                        at: 10,
+                        reason: InterruptionReason::Explicit,
+                    };
+                w.clock = 10;
+            }
+        );
+        state_error!(
+            interrupted,
+            "interruption after completion",
+            "treatment interruption time",
+            |w: &mut World| {
+                w.treatments.get_mut(&interrupted_id).unwrap().status =
+                    TreatmentStatus::Interrupted {
+                        at: 11,
+                        reason: InterruptionReason::Explicit,
+                    };
+                w.clock = 11;
+            }
+        );
+        state_error!(
+            interrupted,
+            "interruption in future",
+            "treatment interruption time",
+            |w: &mut World| {
+                w.treatments.get_mut(&interrupted_id).unwrap().status =
+                    TreatmentStatus::Interrupted {
+                        at: 2,
+                        reason: InterruptionReason::Explicit,
+                    };
+            }
+        );
+        for reason in [
+            InterruptionReason::MedicRemoved,
+            InterruptionReason::PatientRemoved,
+        ] {
+            let mut invalid = interrupted.clone();
+            invalid.treatments.get_mut(&interrupted_id).unwrap().status =
+                TreatmentStatus::Interrupted { at: 1, reason };
+            invalid.clock = 1;
+            assert_eq!(
+                World::from_snapshot(&invalid.snapshot()).err(),
+                Some(SimError::Snapshot("treatment interruption reason"))
+            );
+        }
+
+        for (endpoint_is_medic, reason) in [
+            (true, InterruptionReason::MedicDied),
+            (false, InterruptionReason::PatientDied),
+        ] {
+            let mut alive = interrupted.clone();
+            alive.treatments.get_mut(&interrupted_id).unwrap().status =
+                TreatmentStatus::Interrupted { at: 0, reason };
+            assert_eq!(
+                World::from_snapshot(&alive.snapshot()).err(),
+                Some(SimError::Snapshot("treatment interruption reason"))
+            );
+            let (mut death_control, death_medic, death_patient, _, death_treatment) =
+                gate_c1_active_world();
+            let endpoint = if endpoint_is_medic {
+                death_medic
+            } else {
+                death_patient
+            };
+            let fatal = death_control.apply(Command::InflictWound {
+                patient: endpoint,
+                wound: WoundSpec {
+                    trauma: 1000,
+                    bleeding_per_second: 0,
+                    shock: 0,
+                },
+            });
+            assert!(fatal.error.is_none());
+            assert_eq!(
+                death_control.treatments[&death_treatment].status,
+                TreatmentStatus::Interrupted { at: 1, reason }
+            );
+            assert!(World::from_snapshot(&death_control.snapshot()).is_ok());
+            death_control
+                .treatments
+                .get_mut(&death_treatment)
+                .unwrap()
+                .status = TreatmentStatus::Interrupted { at: 0, reason };
+            assert_eq!(
+                World::from_snapshot(&death_control.snapshot()).err(),
+                Some(SimError::Snapshot("treatment interruption reason"))
+            );
+        }
+
+        // Exact payload and complete-record truncation boundaries use fixtures where each payload exists.
+        for (name, bytes, cut) in [
+            (
+                "recovery option tag",
+                &recovery_bytes,
+                recovery_layout.casualties[0].recovery_option,
+            ),
+            (
+                "recovery u64 payload",
+                &recovery_bytes,
+                recovery_layout.casualties[0].recovery_deadline.unwrap() + 7,
+            ),
+            (
+                "active wound option tag",
+                &active_bytes,
+                active_layout.treatments[0].wound_option,
+            ),
+            (
+                "active wound id payload",
+                &active_bytes,
+                active_layout.treatments[0].wound.unwrap() + 7,
+            ),
+            (
+                "active status tag",
+                &active_bytes,
+                active_layout.treatments[0].status,
+            ),
+            (
+                "active record end",
+                &active_bytes,
+                active_layout.treatments[0].range.end - 1,
+            ),
+            (
+                "completed status timestamp",
+                &completed_bytes,
+                completed_layout.treatments[0].status_at.unwrap() + 7,
+            ),
+            (
+                "completed record end",
+                &completed_bytes,
+                completed_layout.treatments[0].range.end - 1,
+            ),
+            (
+                "interrupted status timestamp",
+                &interrupted_bytes,
+                interrupted_layout.treatments[0].status_at.unwrap() + 7,
+            ),
+            (
+                "interruption reason",
+                &interrupted_bytes,
+                interrupted_layout.treatments[0].reason.unwrap(),
+            ),
+            (
+                "interrupted record end",
+                &interrupted_bytes,
+                interrupted_layout.treatments[0].range.end - 1,
+            ),
+        ] {
+            assert_eq!(
+                World::from_snapshot(&bytes[..cut]).err(),
+                Some(SimError::Snapshot("truncated")),
+                "named payload truncation {name}"
+            );
+        }
+
+        // Keep endpoint variables live as explicit proof that all status controls retain real relationships.
+        assert!(completed.soldiers.valid(completed_medic));
+        assert!(completed.soldiers.valid(completed_patient));
+        assert!(interrupted.wounds.contains_key(&interrupted_wound));
     }
 
     #[test]
