@@ -12266,6 +12266,377 @@ mod private_invariants {
     }
 
     #[test]
+    fn gate_c1_2a_r2_treatment_order_entity_references_and_wound_targets() {
+        // Two retained records, deliberately with different status payload lengths, prove
+        // that ordering applies to complete records rather than just their fixed prefixes.
+        let mut ordered = World::new(91);
+        let medic0 = spawn(
+            &mut ordered,
+            SoldierSpec {
+                role: Role::Medic,
+                inventory: Inventory {
+                    medical: 8,
+                    ..Inventory::default()
+                },
+                ..SoldierSpec::default()
+            },
+        );
+        let patient0 = spawn(&mut ordered, SoldierSpec::default());
+        let medic1 = spawn(
+            &mut ordered,
+            SoldierSpec {
+                role: Role::Medic,
+                inventory: Inventory {
+                    medical: 8,
+                    ..Inventory::default()
+                },
+                ..SoldierSpec::default()
+            },
+        );
+        let patient1 = spawn(&mut ordered, SoldierSpec::default());
+        let wound0 = match ordered
+            .apply(Command::InflictWound {
+                patient: patient0,
+                wound: WoundSpec {
+                    trauma: 10,
+                    bleeding_per_second: 2,
+                    shock: 3,
+                },
+            })
+            .events[0]
+            .event
+        {
+            Event::WoundInflicted { id, .. } => id,
+            _ => unreachable!(),
+        };
+        let wound1 = match ordered
+            .apply(Command::InflictWound {
+                patient: patient1,
+                wound: WoundSpec {
+                    trauma: 11,
+                    bleeding_per_second: 2,
+                    shock: 4,
+                },
+            })
+            .events[0]
+            .event
+        {
+            Event::WoundInflicted { id, .. } => id,
+            _ => unreachable!(),
+        };
+        let treatment0 = match ordered
+            .apply(Command::StartTreatment {
+                medic: medic0,
+                patient: patient0,
+                wound: Some(wound0),
+                kind: TreatmentKind::Hemostatic,
+            })
+            .events[0]
+            .event
+        {
+            Event::TreatmentStarted { id, .. } => id,
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            ordered
+                .apply(Command::InterruptTreatment { id: treatment0 })
+                .events[0]
+                .event,
+            Event::TreatmentInterrupted {
+                id: treatment0,
+                reason: InterruptionReason::Explicit,
+            }
+        );
+        let treatment1 = match ordered
+            .apply(Command::StartTreatment {
+                medic: medic1,
+                patient: patient1,
+                wound: Some(wound1),
+                kind: TreatmentKind::Hemostatic,
+            })
+            .events[0]
+            .event
+        {
+            Event::TreatmentStarted { id, .. } => id,
+            _ => unreachable!(),
+        };
+        assert_eq!((treatment0, treatment1), (TreatmentId(0), TreatmentId(1)));
+        assert_eq!(
+            ordered.treatments[&treatment0].status,
+            TreatmentStatus::Interrupted {
+                at: 0,
+                reason: InterruptionReason::Explicit,
+            }
+        );
+        assert_eq!(
+            ordered.treatments[&treatment1].status,
+            TreatmentStatus::Active
+        );
+        let ordered_bytes = ordered.snapshot();
+        assert_eq!(
+            World::from_snapshot(&ordered_bytes).unwrap().snapshot(),
+            ordered_bytes
+        );
+        let ordered_layout = V7MedicalLayout::parse(&ordered_bytes);
+        assert_eq!(ordered_layout.treatments.len(), 2);
+        assert_eq!(
+            ordered_layout.treatments[0].status_at,
+            Some(ordered_layout.treatments[0].status + 1)
+        );
+        assert_eq!(ordered_layout.treatments[1].status_at, None);
+        let first = ordered_layout.treatments[0].range.clone();
+        let second = ordered_layout.treatments[1].range.clone();
+        let mut reordered = Vec::with_capacity(ordered_bytes.len());
+        reordered.extend_from_slice(&ordered_bytes[..first.start]);
+        reordered.extend_from_slice(&ordered_bytes[second.clone()]);
+        reordered.extend_from_slice(&ordered_bytes[first.clone()]);
+        reordered.extend_from_slice(&ordered_bytes[second.end..]);
+        assert_eq!(reordered.len(), ordered_bytes.len());
+        assert_eq!(&reordered[..first.start], &ordered_bytes[..first.start]);
+        assert_eq!(&reordered[second.end..], &ordered_bytes[second.end..]);
+        assert_snapshot_category(&reordered, "noncanonical treatment order");
+
+        // One public fixture gives every reference a named classification: live
+        // endpoints, a free slot, a stale generation plus its replacement, and a
+        // small bounded slot index outside the arena.
+        let (mut references, live_medic, live_patient, live_wound, live_treatment) =
+            gate_c1_active_world();
+        let free_original = spawn(&mut references, SoldierSpec::default());
+        let stale = spawn(&mut references, SoldierSpec::default());
+        assert!(references
+            .apply(Command::DespawnSoldier { id: free_original })
+            .error
+            .is_none());
+        assert!(references
+            .apply(Command::DespawnSoldier { id: stale })
+            .error
+            .is_none());
+        let replacement = spawn(&mut references, SoldierSpec::default());
+        assert_eq!(replacement.index(), stale.index());
+        assert_ne!(replacement.generation(), stale.generation());
+        assert!(!references.soldiers.alive[free_original.index()]);
+        assert!(references.soldiers.valid(replacement));
+        assert!(!references.soldiers.valid(stale));
+        let out_of_range = EntityId::from_parts(references.soldiers.alive.len() as u32 + 7, 0);
+        assert!(out_of_range.index() > references.soldiers.alive.len());
+        assert!(!references.soldiers.valid(out_of_range));
+        assert!(references.soldiers.valid(live_medic));
+        assert!(references.soldiers.valid(live_patient));
+        assert_eq!(references.wounds[&live_wound].patient, live_patient);
+        assert_eq!(references.treatments[&live_treatment].medic, live_medic);
+        assert_eq!(references.treatments[&live_treatment].patient, live_patient);
+        let reference_bytes = references.snapshot();
+        assert_eq!(
+            World::from_snapshot(&reference_bytes).unwrap().snapshot(),
+            reference_bytes
+        );
+        let reference_layout = V7MedicalLayout::parse(&reference_bytes);
+        let reference_case = |name: &str, category: &'static str, field: usize, id: EntityId| {
+            let mut bytes = reference_bytes.clone();
+            put_u64(&mut bytes, field, id.raw());
+            assert_eq!(
+                World::from_snapshot(&bytes).err(),
+                Some(SimError::Snapshot(category)),
+                "{name}"
+            );
+        };
+        for (name, id) in [
+            ("free", free_original),
+            ("bounded out of range", out_of_range),
+        ] {
+            reference_case(name, "casualty", reference_layout.casualties[0].owner, id);
+            reference_case(name, "wound", reference_layout.wounds[0].patient, id);
+            reference_case(
+                name,
+                "active treatment",
+                reference_layout.treatments[0].medic,
+                id,
+            );
+            reference_case(
+                name,
+                "active treatment",
+                reference_layout.treatments[0].patient,
+                id,
+            );
+        }
+
+        // An allocator-valid absent historical wound is produced by removal, not
+        // guessed.  Only the treatment target is then changed.
+        let mut absent = World::new(92);
+        let removed_patient = spawn(&mut absent, SoldierSpec::default());
+        let absent_wound = match absent
+            .apply(Command::InflictWound {
+                patient: removed_patient,
+                wound: WoundSpec {
+                    trauma: 1,
+                    bleeding_per_second: 1,
+                    shock: 1,
+                },
+            })
+            .events[0]
+            .event
+        {
+            Event::WoundInflicted { id, .. } => id,
+            _ => unreachable!(),
+        };
+        assert!(absent
+            .apply(Command::DespawnSoldier {
+                id: removed_patient
+            })
+            .error
+            .is_none());
+        let absent_medic = spawn(
+            &mut absent,
+            SoldierSpec {
+                role: Role::Medic,
+                inventory: Inventory {
+                    medical: 8,
+                    ..Inventory::default()
+                },
+                ..SoldierSpec::default()
+            },
+        );
+        let absent_patient = spawn(&mut absent, SoldierSpec::default());
+        let present_wound = match absent
+            .apply(Command::InflictWound {
+                patient: absent_patient,
+                wound: WoundSpec {
+                    trauma: 2,
+                    bleeding_per_second: 2,
+                    shock: 2,
+                },
+            })
+            .events[0]
+            .event
+        {
+            Event::WoundInflicted { id, .. } => id,
+            _ => unreachable!(),
+        };
+        let absent_treatment = match absent
+            .apply(Command::StartTreatment {
+                medic: absent_medic,
+                patient: absent_patient,
+                wound: Some(present_wound),
+                kind: TreatmentKind::Hemostatic,
+            })
+            .events[0]
+            .event
+        {
+            Event::TreatmentStarted { id, .. } => id,
+            _ => unreachable!(),
+        };
+        assert!(absent_wound.0 < absent.next_wound_id);
+        assert!(!absent.wounds.contains_key(&absent_wound));
+        assert_eq!(absent.wounds[&present_wound].patient, absent_patient);
+        assert_eq!(
+            absent.treatments[&absent_treatment].wound,
+            Some(present_wound)
+        );
+        let absent_bytes = absent.snapshot();
+        assert_eq!(
+            World::from_snapshot(&absent_bytes).unwrap().snapshot(),
+            absent_bytes
+        );
+        let absent_layout = V7MedicalLayout::parse(&absent_bytes);
+        let mut absent_target = absent_bytes.clone();
+        put_u64(
+            &mut absent_target,
+            absent_layout.treatments[0].wound.unwrap(),
+            absent_wound.0,
+        );
+        assert_snapshot_category(&absent_target, "treatment target");
+
+        // Both target IDs exist, but the second belongs to another patient.
+        let mut cross = World::new(93);
+        let cross_medic = spawn(
+            &mut cross,
+            SoldierSpec {
+                role: Role::Medic,
+                inventory: Inventory {
+                    medical: 8,
+                    ..Inventory::default()
+                },
+                ..SoldierSpec::default()
+            },
+        );
+        let cross_patient0 = spawn(&mut cross, SoldierSpec::default());
+        let cross_patient1 = spawn(&mut cross, SoldierSpec::default());
+        let cross_wound0 = match cross
+            .apply(Command::InflictWound {
+                patient: cross_patient0,
+                wound: WoundSpec {
+                    trauma: 3,
+                    bleeding_per_second: 2,
+                    shock: 1,
+                },
+            })
+            .events[0]
+            .event
+        {
+            Event::WoundInflicted { id, .. } => id,
+            _ => unreachable!(),
+        };
+        let cross_wound1 = match cross
+            .apply(Command::InflictWound {
+                patient: cross_patient1,
+                wound: WoundSpec {
+                    trauma: 4,
+                    bleeding_per_second: 2,
+                    shock: 1,
+                },
+            })
+            .events[0]
+            .event
+        {
+            Event::WoundInflicted { id, .. } => id,
+            _ => unreachable!(),
+        };
+        let cross_treatment = match cross
+            .apply(Command::StartTreatment {
+                medic: cross_medic,
+                patient: cross_patient0,
+                wound: Some(cross_wound0),
+                kind: TreatmentKind::Hemostatic,
+            })
+            .events[0]
+            .event
+        {
+            Event::TreatmentStarted { id, .. } => id,
+            _ => unreachable!(),
+        };
+        assert_eq!(cross.wounds[&cross_wound0].patient, cross_patient0);
+        assert_eq!(cross.wounds[&cross_wound1].patient, cross_patient1);
+        assert_eq!(cross.treatments[&cross_treatment].patient, cross_patient0);
+        assert_eq!(
+            cross.treatments[&cross_treatment].kind,
+            TreatmentKind::Hemostatic
+        );
+        assert_eq!(
+            cross.treatments[&cross_treatment].status,
+            TreatmentStatus::Active
+        );
+        assert_eq!(cross.treatments[&cross_treatment].consumed, HEMOSTATIC_COST);
+        assert_eq!(
+            cross.treatments[&cross_treatment].completes_at
+                - cross.treatments[&cross_treatment].started_at,
+            HEMOSTATIC_DURATION
+        );
+        let cross_bytes = cross.snapshot();
+        assert_eq!(
+            World::from_snapshot(&cross_bytes).unwrap().snapshot(),
+            cross_bytes
+        );
+        let cross_layout = V7MedicalLayout::parse(&cross_bytes);
+        let mut wrong_owner = cross_bytes.clone();
+        put_u64(
+            &mut wrong_owner,
+            cross_layout.treatments[0].wound.unwrap(),
+            cross_wound1.0,
+        );
+        assert_snapshot_category(&wrong_owner, "treatment target");
+    }
+
+    #[test]
     fn gate_c1_all_six_death_causes_preserve_medical_history() {
         fn history_world(food: u32, water: u32) -> (World, EntityId, WoundId, TreatmentId) {
             let mut world = World::new(91);
