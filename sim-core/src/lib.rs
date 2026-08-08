@@ -7657,4 +7657,104 @@ mod private_invariants {
         assert_eq!(world.soldiers.data[id.index()].inventory.medical, 1);
         assert_eq!(world.lost_medical, u128::MAX);
     }
+
+    fn gate_b_recovering_world(hot: bool) -> (World, EntityId) {
+        let mut world = World::new(8_001 + u64::from(hot));
+        let medic = spawn(
+            &mut world,
+            SoldierSpec {
+                role: Role::Medic,
+                inventory: Inventory {
+                    medical: HEMOSTATIC_COST,
+                    ..Inventory::default()
+                },
+                ..SoldierSpec::default()
+            },
+        );
+        let patient = spawn(&mut world, SoldierSpec::default());
+        let wound = match world
+            .apply(Command::InflictWound {
+                patient,
+                wound: WoundSpec {
+                    trauma: 100,
+                    bleeding_per_second: 10,
+                    shock: 200,
+                },
+            })
+            .events[0]
+            .event
+        {
+            Event::WoundInflicted { id, .. } => id,
+            _ => unreachable!(),
+        };
+        assert!(world
+            .apply(Command::StartTreatment {
+                medic,
+                patient,
+                wound: Some(wound),
+                kind: TreatmentKind::Hemostatic,
+            })
+            .error
+            .is_none());
+        if hot {
+            assert!(world
+                .apply(Command::SetRegionHot { cell: 0, hot: true })
+                .error
+                .is_none());
+        }
+        assert!(world
+            .apply(Command::AdvanceTo {
+                target: HEMOSTATIC_DURATION,
+            })
+            .error
+            .is_none());
+        (world, patient)
+    }
+
+    #[test]
+    fn gate_b_acceptance_private_01_canonical_recovery_due_is_exact() {
+        let (world, patient) = gate_b_recovering_world(false);
+        assert_eq!(world.due_by_entity.get(&patient), Some(&15));
+        assert_eq!(world.living_due.get(&15), Some(&BTreeSet::from([patient])));
+
+        let checkpoint = world.snapshot();
+        let mut before = World::from_snapshot(&checkpoint).unwrap();
+        assert!(before
+            .apply(Command::AdvanceTo { target: 14 })
+            .error
+            .is_none());
+        assert_eq!(before.due_by_entity.get(&patient), Some(&15));
+        assert_eq!(before.living_due.get(&15), Some(&BTreeSet::from([patient])));
+
+        let mut exact = World::from_snapshot(&checkpoint).unwrap();
+        assert!(exact
+            .apply(Command::AdvanceTo { target: 15 })
+            .error
+            .is_none());
+        assert_eq!(exact.due_by_entity.get(&patient), Some(&20));
+        assert_eq!(exact.living_due.get(&20), Some(&BTreeSet::from([patient])));
+        assert_eq!(exact.living_due.len(), 2); // the untreated medic plus the patient
+    }
+
+    #[test]
+    fn gate_b_acceptance_private_02_hot_and_cold_recovery_work_is_exact() {
+        let (mut cold, cold_patient) = gate_b_recovering_world(false);
+        let cold_candidates = cold.medical_entity_candidates;
+        let cold_steps = cold.hot_member_steps;
+        assert!(cold
+            .apply(Command::AdvanceTo { target: 35 })
+            .error
+            .is_none());
+        assert_eq!(cold.medical_entity_candidates - cold_candidates, 5);
+        assert_eq!(cold.hot_member_steps - cold_steps, 0);
+        assert!(!cold.casualty[&cold_patient].recovering);
+
+        let (mut hot, hot_patient) = gate_b_recovering_world(true);
+        let hot_candidates = hot.medical_entity_candidates;
+        let hot_steps = hot.hot_member_steps;
+        assert!(hot.apply(Command::AdvanceTo { target: 35 }).error.is_none());
+        assert_eq!(hot.hot_member_steps - hot_steps, 50);
+        assert_eq!(hot.medical_entity_candidates - hot_candidates, 25);
+        assert!(!hot.casualty[&hot_patient].recovering);
+    }
 }

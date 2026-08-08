@@ -1,22 +1,22 @@
 # M1.2 contract-to-test map
 
-Each Gate B requirement has one newly added, dedicated acceptance fixture. Historical tests retain their descriptive names and are supplemental only.
+Gate B acceptance is **not complete or accepted**. Acceptance tranche 1 implements only recovery scenarios 01–05. Scenarios 06–14 remain pending and no Gate C or M1.3 work is claimed.
 
-| Gate B requirement | Dedicated fixture | Supplemental historical evidence |
-| --- | --- | --- |
-| Recovery boundary -1/exact/+1 and canonical due state | `gate_b_acceptance_01_recovery_boundary_minus_exact_plus_one` | `recovery_has_an_exact_material_boundary_and_heals_history` |
-| Independent hot recovery and cold large-leap recovery | `gate_b_acceptance_02_independent_hot_and_cold_large_leap_recovery` | — |
-| Two-wound final-control gating and distinct healing | `gate_b_acceptance_03_two_wound_final_control_gates_distinct_healing` | `distinct_wounds_bleed_and_snapshot_deterministically` |
-| Successful shock care while another wound bleeds | `gate_b_acceptance_04_shock_care_while_bleeding_never_starts_recovery` | `shock_treatment_rejects_an_unaffected_patient_without_consumption` |
-| Nonfatal recovery cancellation and absolute-deadline restart | `gate_b_acceptance_05_new_wound_cancels_and_restarts_absolute_recovery` | `wound_added_at_nonzero_clock_never_bleeds_retroactively` |
-| Immediate wound and active-endpoint interruption matrices | `gate_b_acceptance_06_immediate_and_endpoint_interruption_matrix` | `immediate_wounds_emit_complete_causal_arrays` |
-| Authoritative hot/cold command failure atomicity | `gate_b_acceptance_07_hot_cold_command_failure_atomicity` | — |
-| Automatic medic/patient interruption and death precedence | `gate_b_acceptance_08_automatic_medic_patient_interruption_and_death_precedence` | `same_timestamp_hemorrhage_defeats_completion_and_cleans_relationship` |
-| Real-entity availability churn and exact candidate visits | `gate_b_acceptance_09_real_entity_medic_churn_has_exact_visits` | — |
-| Medic and patient despawn materialization and indexed cleanup | `gate_b_acceptance_10_medic_patient_despawn_materializes_and_cleans` | `active_removal_emits_interruption_then_removal_and_reuse_is_clean` |
-| Hot/cold cycles during treatment and recovery | `gate_b_acceptance_11_hot_cold_cycles_preserve_treatment_and_recovery` | `sparse_boundary_across_empty_hot_cell_keeps_snapshot_accounting_valid` |
-| Rollback after recovery/healing/availability/interruption commits | `gate_b_acceptance_12_rollback_restores_recovery_healing_and_availability` | — |
-| Combined active-treatment/recovery snapshot continuation and corruption rejection | `gate_b_acceptance_13_active_treatment_recovery_snapshot_and_corruption` | — |
-| Bleeding/recovery query purity, including indexes and counters | `gate_b_acceptance_14_bleeding_recovery_queries_preserve_authority` | `query_permutations_during_bleeding_and_recovery_are_pure` |
+| Gate B scenario | Status | Dedicated evidence | Private structural evidence |
+| --- | --- | --- | --- |
+| 01 recovery boundary −1/exact/+1 | Implemented in tranche 1 | `gate_b_acceptance_01_recovery_boundary_minus_exact_plus_one` | `gate_b_acceptance_private_01_canonical_recovery_due_is_exact` |
+| 02 independent hot/cold large-leap recovery | Implemented in tranche 1 | `gate_b_acceptance_02_independent_hot_and_cold_large_leap_recovery` | `gate_b_acceptance_private_02_hot_and_cold_recovery_work_is_exact` |
+| 03 two-wound final-control gating and ordered healing | Implemented in tranche 1 | `gate_b_acceptance_03_two_wound_final_control_gates_distinct_healing` | — |
+| 04 successful shock care while a separate wound bleeds | Implemented in tranche 1 | `gate_b_acceptance_04_shock_care_while_bleeding_never_starts_recovery` | — |
+| 05 nonfatal recovery cancellation and absolute-deadline restart | Implemented in tranche 1 | `gate_b_acceptance_05_new_wound_cancels_and_restarts_absolute_recovery` | — |
+| 06 immediate wound and endpoint-interruption matrices | Pending | — | — |
+| 07 authoritative hot/cold command failure atomicity | Pending | — | — |
+| 08 automatic medic/patient interruption and death precedence | Pending | — | — |
+| 09 real-entity availability churn and exact candidate visits | Pending | — | — |
+| 10 medic/patient removal, conservation, and generation cleanup | Pending | — | — |
+| 11 hot/cold cycles during treatment and recovery | Pending | — | — |
+| 12 rollback after recovery/healing/availability/interruption work | Pending | — | — |
+| 13 combined active-treatment/recovery snapshot continuation and corruption rejection | Pending | — | — |
+| 14 bleeding/recovery query purity including private authority | Pending | — | — |
 
-Gate C, exhaustive protocol/persistence matrices, representative medical benchmark expansion, production review, and M1.3 remain out of scope.
+Historical tests in `sim-core/tests/medical.rs` remain supplemental regression coverage only; they are not substitutes for pending dedicated acceptance scenarios.
