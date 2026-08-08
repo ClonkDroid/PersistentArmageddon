@@ -853,63 +853,66 @@ impl World {
         }
         let mut casualty = casualty;
         let mut interruption = None;
-        if l.life == LifeState::Alive {
-            if let Some(mut c) = casualty {
-                let elapsed = at
-                    .checked_sub(c.materialized_at)
-                    .ok_or(SimError::TimeReversal)?;
-                let loss = bleeding_rate
-                    .checked_mul(elapsed)
-                    .ok_or(SimError::ArithmeticOverflow)?;
-                c.blood = c.blood.saturating_sub(
-                    u32::try_from(loss.min(u64::from(u32::MAX)))
-                        .map_err(|_| SimError::ArithmeticOverflow)?,
-                );
-                let shock_numerator = u64::from(c.shock_remainder)
-                    .checked_add(loss)
-                    .ok_or(SimError::ArithmeticOverflow)?;
-                c.shock = c
-                    .shock
-                    .saturating_add(u32::try_from(shock_numerator / 10).unwrap_or(u32::MAX))
-                    .min(1000);
-                c.shock_remainder =
-                    u8::try_from(shock_numerator % 10).expect("remainder below ten");
-                let was_incapacitated = c.incapacitated;
-                c.incapacitated = c.shock >= INCAPACITATED_SHOCK || c.blood <= BLOOD_MAX / 3;
-                c.materialized_at = at;
-                if c.incapacitated && !was_incapacitated && l.activity != Activity::Idle {
-                    let before = l.activity;
-                    l.activity = Activity::Idle;
-                    events.push(TimedEvent {
-                        at,
-                        event: Event::ActivityChanged {
-                            id,
-                            before,
-                            after: Activity::Idle,
-                            forced: true,
-                        },
-                    });
-                }
-                if c.blood == 0 || c.shock >= 1000 {
-                    let cause = if c.blood == 0 {
-                        DeathCause::Hemorrhage
-                    } else {
-                        DeathCause::TraumaticShock
-                    };
-                    let health_before = l.health;
-                    l.health = 0;
-                    l.life = LifeState::Dead { at, cause };
-                    events.push(TimedEvent {
-                        at,
-                        event: Event::SoldierDied {
-                            id,
-                            cause,
-                            health_before,
-                        },
-                    });
-                }
-                casualty = Some(c);
+        // Living needs and casualty physiology share this materialization
+        // boundary.  In particular, a needs death at `at` must not leave the
+        // casualty half of the authoritative record at an older timestamp.
+        // Living death has precedence when both mechanisms become fatal in
+        // the same second; casualty state is still fully materialized, but a
+        // second death event is never emitted.
+        if let Some(mut c) = casualty {
+            let elapsed = at
+                .checked_sub(c.materialized_at)
+                .ok_or(SimError::TimeReversal)?;
+            let loss = bleeding_rate
+                .checked_mul(elapsed)
+                .ok_or(SimError::ArithmeticOverflow)?;
+            c.blood = c.blood.saturating_sub(
+                u32::try_from(loss.min(u64::from(u32::MAX)))
+                    .map_err(|_| SimError::ArithmeticOverflow)?,
+            );
+            let shock_numerator = u64::from(c.shock_remainder)
+                .checked_add(loss)
+                .ok_or(SimError::ArithmeticOverflow)?;
+            c.shock = c
+                .shock
+                .saturating_add(u32::try_from(shock_numerator / 10).unwrap_or(u32::MAX))
+                .min(1000);
+            c.shock_remainder = u8::try_from(shock_numerator % 10).expect("remainder below ten");
+            let was_incapacitated = c.incapacitated;
+            c.incapacitated = c.shock >= INCAPACITATED_SHOCK || c.blood <= BLOOD_MAX / 3;
+            c.materialized_at = at;
+            if c.incapacitated && !was_incapacitated && l.activity != Activity::Idle {
+                let before = l.activity;
+                l.activity = Activity::Idle;
+                events.push(TimedEvent {
+                    at,
+                    event: Event::ActivityChanged {
+                        id,
+                        before,
+                        after: Activity::Idle,
+                        forced: true,
+                    },
+                });
             }
+            if l.life == LifeState::Alive && (c.blood == 0 || c.shock >= 1000) {
+                let cause = if c.blood == 0 {
+                    DeathCause::Hemorrhage
+                } else {
+                    DeathCause::TraumaticShock
+                };
+                let health_before = l.health;
+                l.health = 0;
+                l.life = LifeState::Dead { at, cause };
+                events.push(TimedEvent {
+                    at,
+                    event: Event::SoldierDied {
+                        id,
+                        cause,
+                        health_before,
+                    },
+                });
+            }
+            casualty = Some(c);
         }
         if l.life != LifeState::Alive {
             interruption = active_treatment.map(|(tid, is_medic)| {
@@ -1487,7 +1490,8 @@ impl World {
             .checked_add(u32::from(spec.shock))
             .ok_or(SimError::ArithmeticOverflow)?
             .min(1000);
-        casualty.incapacitated = casualty.shock >= INCAPACITATED_SHOCK;
+        casualty.incapacitated =
+            casualty.shock >= INCAPACITATED_SHOCK || casualty.blood <= BLOOD_MAX / 3;
         casualty.recovering = false;
         let mut replacement = old;
         replacement.health = health;
@@ -1928,8 +1932,9 @@ impl World {
             for (tid, reason) in interruptions {
                 let old_clock = self.clock;
                 self.clock = at;
-                self.interrupt_internal(tid, reason)?;
+                let interrupted = self.interrupt_internal(tid, reason);
                 self.clock = old_clock;
+                interrupted?;
                 out.push(TimedEvent {
                     at,
                     event: Event::TreatmentInterrupted { id: tid, reason },
@@ -1988,6 +1993,20 @@ impl World {
             if self.soldiers.living[t.medic.index()].life != LifeState::Alive
                 || self.soldiers.living[t.patient.index()].life != LifeState::Alive
             {
+                let reason = if self.soldiers.living[t.medic.index()].life != LifeState::Alive {
+                    InterruptionReason::MedicDied
+                } else {
+                    InterruptionReason::PatientDied
+                };
+                let old_clock = self.clock;
+                self.clock = at;
+                let interrupted = self.interrupt_internal(tid, reason);
+                self.clock = old_clock;
+                interrupted?;
+                out.push(TimedEvent {
+                    at,
+                    event: Event::TreatmentInterrupted { id: tid, reason },
+                });
                 continue;
             }
             match t.kind {
@@ -2024,7 +2043,7 @@ impl World {
                         .get_mut(&t.patient)
                         .ok_or(SimError::InvalidTreatment)?;
                     c.shock = c.shock.saturating_sub(300);
-                    c.incapacitated = c.shock >= INCAPACITATED_SHOCK;
+                    c.incapacitated = c.shock >= INCAPACITATED_SHOCK || c.blood <= BLOOD_MAX / 3;
                     c.recovering = true;
                 }
             }
@@ -6004,5 +6023,512 @@ mod private_invariants {
         }
         assert_eq!(world.snapshot(), restored.snapshot());
         assert_eq!(world.state_digest(), restored.state_digest());
+    }
+
+    fn gate_wound(world: &mut World, patient: EntityId, rate: u16, shock: u16) -> WoundId {
+        match world
+            .apply(Command::InflictWound {
+                patient,
+                wound: WoundSpec {
+                    trauma: 0,
+                    bleeding_per_second: rate,
+                    shock,
+                },
+            })
+            .events[0]
+            .event
+        {
+            Event::WoundInflicted { id, .. } => id,
+            _ => unreachable!(),
+        }
+    }
+
+    fn gate_start(
+        world: &mut World,
+        medic: EntityId,
+        patient: EntityId,
+        wound: WoundId,
+    ) -> TreatmentId {
+        match world
+            .apply(Command::StartTreatment {
+                medic,
+                patient,
+                wound: Some(wound),
+                kind: TreatmentKind::Hemostatic,
+            })
+            .events[0]
+            .event
+        {
+            Event::TreatmentStarted { id, .. } => id,
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn gate_a_sparse_seven_casualties_ignore_two_thousand_cold_entities() {
+        let mut world = World::new(201);
+        for _ in 0..2_000 {
+            spawn(&mut world, SoldierSpec::default());
+        }
+        let patients: Vec<_> = (0..7)
+            .map(|_| spawn(&mut world, SoldierSpec::default()))
+            .collect();
+        for patient in &patients {
+            gate_wound(&mut world, *patient, 100, 0);
+            assert_eq!(world.due_by_entity.get(patient), Some(&34));
+        }
+        world.medical_entity_candidates = 0;
+        for at in 1..34 {
+            world.apply(Command::Schedule {
+                at,
+                command: ScheduledCommand::CreateStockpile {
+                    id: at as u32,
+                    initial: Stock::default(),
+                },
+            });
+        }
+        world.apply(Command::AdvanceTo { target: 33 });
+        assert_eq!(world.medical_entity_candidates, 0);
+        let out = world.apply(Command::AdvanceTo { target: 34 });
+        assert_eq!(world.medical_entity_candidates, 7);
+        assert_eq!(
+            out.events
+                .iter()
+                .filter(|e| matches!(e.event, Event::ActivityChanged { .. }))
+                .count(),
+            0
+        );
+        for patient in patients {
+            assert_eq!(world.casualty[&patient].blood, 1_600);
+            assert!(world.casualty[&patient].incapacitated);
+        }
+    }
+
+    #[test]
+    fn gate_a_completion_bucket_never_traverses_treatment_history() {
+        let mut world = World::new(202);
+        for raw in 10_000..13_000 {
+            world.treatments.insert(
+                TreatmentId(raw),
+                Treatment {
+                    id: TreatmentId(raw),
+                    medic: EntityId::from_raw(0),
+                    patient: EntityId::from_raw(0),
+                    wound: None,
+                    kind: TreatmentKind::Shock,
+                    started_at: 0,
+                    completes_at: 1,
+                    consumed: SHOCK_TREATMENT_COST,
+                    status: TreatmentStatus::Interrupted {
+                        at: 0,
+                        reason: InterruptionReason::Explicit,
+                    },
+                },
+            );
+        }
+        for _ in 0..3 {
+            let medic = spawn(
+                &mut world,
+                SoldierSpec {
+                    role: Role::Medic,
+                    inventory: Inventory {
+                        medical: 1,
+                        ..Inventory::default()
+                    },
+                    ..SoldierSpec::default()
+                },
+            );
+            let patient = spawn(&mut world, SoldierSpec::default());
+            let wound = gate_wound(&mut world, patient, 1, 0);
+            gate_start(&mut world, medic, patient, wound);
+        }
+        world.treatment_completion_candidates = 0;
+        world.apply(Command::AdvanceTo {
+            target: HEMOSTATIC_DURATION,
+        });
+        assert_eq!(world.treatment_completion_candidates, 3);
+    }
+
+    #[test]
+    fn gate_a_wound_membership_aggregate_control_and_removal_are_exact() {
+        let mut world = World::new(203);
+        let medic = spawn(
+            &mut world,
+            SoldierSpec {
+                role: Role::Medic,
+                inventory: Inventory {
+                    medical: 2,
+                    ..Inventory::default()
+                },
+                ..SoldierSpec::default()
+            },
+        );
+        let patient = spawn(&mut world, SoldierSpec::default());
+        let a = gate_wound(&mut world, patient, 3, 0);
+        let b = gate_wound(&mut world, patient, 5, 0);
+        assert_eq!(world.wound_ids_by_patient[&patient], BTreeSet::from([a, b]));
+        assert_eq!(world.bleeding_rate_by_patient[&patient], 8);
+        gate_start(&mut world, medic, patient, a);
+        world.wound_index_visits = 0;
+        world.apply(Command::AdvanceTo {
+            target: HEMOSTATIC_DURATION,
+        });
+        assert_eq!(world.bleeding_rate_by_patient[&patient], 5);
+        assert_eq!(world.wound_index_visits, 1);
+        world.apply(Command::DespawnSoldier { id: patient });
+        assert!(!world.wound_ids_by_patient.contains_key(&patient));
+        assert!(!world.bleeding_rate_by_patient.contains_key(&patient));
+    }
+
+    #[test]
+    fn gate_a_rate_seven_literal_non_idle_state_and_events() {
+        let mut world = World::new(204);
+        let patient = spawn(
+            &mut world,
+            SoldierSpec {
+                inventory: Inventory {
+                    food: 100,
+                    water: 100,
+                    medical: 0,
+                },
+                ..SoldierSpec::default()
+            },
+        );
+        world.apply(Command::SetActivity {
+            id: patient,
+            activity: Activity::Rest,
+        });
+        gate_wound(&mut world, patient, 7, 0);
+        world.apply(Command::AdvanceTo { target: 477 });
+        assert_eq!(
+            world.casualty[&patient],
+            CasualtyState {
+                blood: 1_661,
+                shock: 333,
+                shock_remainder: 9,
+                incapacitated: true,
+                recovering: false,
+                materialized_at: 477
+            }
+        );
+        assert_eq!(
+            world.soldiers.living[patient.index()].activity,
+            Activity::Idle
+        );
+        let death = world.apply(Command::AdvanceTo { target: 715 });
+        assert_eq!(
+            world.casualty[&patient],
+            CasualtyState {
+                blood: 0,
+                shock: 500,
+                shock_remainder: 5,
+                incapacitated: true,
+                recovering: false,
+                materialized_at: 715
+            }
+        );
+        assert_eq!(death.events.len(), 10);
+        assert!(matches!(
+            death.events[8],
+            TimedEvent {
+                at: 715,
+                event: Event::SoldierDied {
+                    cause: DeathCause::Hemorrhage,
+                    ..
+                }
+            }
+        ));
+        assert!(matches!(
+            death.events[9],
+            TimedEvent {
+                at: 715,
+                event: Event::TimeAdvanced {
+                    from: 477,
+                    to: 715,
+                    ..
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn gate_a_shared_living_and_medical_boundary_transitions_once() {
+        let mut world = World::new(205);
+        let patient = spawn(&mut world, SoldierSpec::default());
+        world.soldiers.living[patient.index()].fatigue = 897;
+        world.soldiers.living[patient.index()].activity = Activity::March;
+        world.casualty.insert(
+            patient,
+            CasualtyState {
+                blood: BLOOD_MAX / 3 + 1,
+                materialized_at: 0,
+                ..CasualtyState::default()
+            },
+        );
+        gate_wound(&mut world, patient, 1, 0);
+        world.medical_entity_candidates = 0;
+        let out = world.apply(Command::AdvanceTo { target: 1 });
+        assert_eq!(world.medical_entity_candidates, 1);
+        assert_eq!(
+            out.events
+                .iter()
+                .filter(|e| matches!(e.event, Event::ActivityChanged { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(world.casualty[&patient].blood, 1_666);
+    }
+
+    #[test]
+    fn gate_a_living_death_defeats_same_time_completion_and_materializes_casualty() {
+        let mut world = World::new(206);
+        let medic = spawn(
+            &mut world,
+            SoldierSpec {
+                role: Role::Medic,
+                inventory: Inventory {
+                    medical: 1,
+                    ..Inventory::default()
+                },
+                ..SoldierSpec::default()
+            },
+        );
+        let patient = spawn(&mut world, SoldierSpec::default());
+        let wound = gate_wound(&mut world, patient, 1, 0);
+        let tid = gate_start(&mut world, medic, patient, wound);
+        let l = &mut world.soldiers.living[patient.index()];
+        l.health = 10;
+        l.thirst = SEVERE_THIRST - 30;
+        l.activity = Activity::March;
+        world.soldiers.data[patient.index()].health = 10;
+        world.schedule_due(patient).unwrap();
+        let out = world.apply(Command::AdvanceTo { target: 10 });
+        assert!(matches!(
+            world.treatments[&tid].status,
+            TreatmentStatus::Interrupted {
+                reason: InterruptionReason::PatientDied,
+                ..
+            }
+        ));
+        assert_eq!(world.casualty[&patient].materialized_at, 10);
+        assert!(!world.active_by_entity.contains_key(&patient));
+        assert!(!world.active_by_entity.contains_key(&medic));
+        assert!(!world.due_by_treatment.contains_key(&tid));
+        assert_eq!(
+            out.events
+                .iter()
+                .filter(|e| matches!(e.event, Event::TreatmentInterrupted { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn gate_a_incapacitated_cold_casualty_leaps_to_real_boundary() {
+        let mut world = World::new(207);
+        let patient = spawn(&mut world, SoldierSpec::default());
+        gate_wound(&mut world, patient, 100, INCAPACITATED_SHOCK as u16);
+        world.medical_entity_candidates = 0;
+        world.apply(Command::AdvanceTo { target: 30 });
+        assert_eq!(world.medical_entity_candidates, 1);
+        assert_eq!(world.casualty[&patient].blood, 2_000);
+        assert_eq!(world.casualty[&patient].shock, 1_000);
+    }
+
+    #[test]
+    fn gate_a_hot_cold_churn_preserves_due_deadline_remainder_and_inventory() {
+        let mut world = World::new(208);
+        let medic = spawn(
+            &mut world,
+            SoldierSpec {
+                role: Role::Medic,
+                inventory: Inventory {
+                    medical: 2,
+                    ..Inventory::default()
+                },
+                ..SoldierSpec::default()
+            },
+        );
+        let patient = spawn(&mut world, SoldierSpec::default());
+        let wound = gate_wound(&mut world, patient, 7, 0);
+        let tid = gate_start(&mut world, medic, patient, wound);
+        for at in 1..=9 {
+            world.apply(Command::SetRegionHot {
+                cell: 0,
+                hot: at % 2 == 1,
+            });
+            world.apply(Command::AdvanceTo { target: at });
+        }
+        assert_eq!(world.treatments[&tid].completes_at, 10);
+        assert_eq!(world.soldiers.data[medic.index()].inventory.medical, 1);
+        assert_eq!(world.casualty[&patient].shock_remainder, 3);
+        assert_eq!(world.due_by_treatment.get(&tid), Some(&10));
+    }
+
+    #[test]
+    fn gate_a_generation_reuse_has_no_stale_medical_relationships() {
+        let mut world = World::new(209);
+        let medic = spawn(
+            &mut world,
+            SoldierSpec {
+                role: Role::Medic,
+                inventory: Inventory {
+                    medical: 1,
+                    ..Inventory::default()
+                },
+                ..SoldierSpec::default()
+            },
+        );
+        let patient = spawn(&mut world, SoldierSpec::default());
+        let wound = gate_wound(&mut world, patient, 1, 0);
+        let tid = gate_start(&mut world, medic, patient, wound);
+        world.apply(Command::DespawnSoldier { id: patient });
+        let replacement = spawn(&mut world, SoldierSpec::default());
+        assert_eq!(replacement.index(), patient.index());
+        assert_ne!(replacement, patient);
+        assert!(!world.casualty.contains_key(&replacement));
+        assert!(!world.active_by_entity.contains_key(&replacement));
+        assert!(!world.due_by_treatment.contains_key(&tid));
+    }
+
+    #[test]
+    fn gate_a_later_checked_failure_restores_future_interrupted_treatment() {
+        let mut world = World::new(210);
+        let medic = spawn(
+            &mut world,
+            SoldierSpec {
+                role: Role::Medic,
+                inventory: Inventory {
+                    medical: 1,
+                    ..Inventory::default()
+                },
+                ..SoldierSpec::default()
+            },
+        );
+        let patient = spawn(&mut world, SoldierSpec::default());
+        let wound = gate_wound(&mut world, patient, 500, 0);
+        let tid = gate_start(&mut world, medic, patient, wound);
+        world.cold_boundaries = u64::MAX;
+        let before = world.snapshot();
+        let digest = world.state_digest();
+        let out = world.apply(Command::AdvanceTo { target: 10 });
+        assert_eq!(out.error, Some(SimError::ArithmeticOverflow));
+        assert_eq!(world.snapshot(), before);
+        assert_eq!(world.state_digest(), digest);
+        assert_eq!(world.due_by_treatment.get(&tid), Some(&10));
+    }
+
+    #[test]
+    fn gate_a_snapshot_continuation_rebuilds_identical_due_indexes_and_events() {
+        let mut world = World::new(211);
+        let medic = spawn(
+            &mut world,
+            SoldierSpec {
+                role: Role::Medic,
+                inventory: Inventory {
+                    medical: 1,
+                    ..Inventory::default()
+                },
+                ..SoldierSpec::default()
+            },
+        );
+        let patient = spawn(&mut world, SoldierSpec::default());
+        let wound = gate_wound(&mut world, patient, 7, 0);
+        gate_start(&mut world, medic, patient, wound);
+        let mut restored = World::from_snapshot(&world.snapshot()).unwrap();
+        assert_eq!(world.living_due, restored.living_due);
+        assert_eq!(world.treatment_due, restored.treatment_due);
+        let a = world.apply(Command::AdvanceTo { target: 10 });
+        let b = restored.apply(Command::AdvanceTo { target: 10 });
+        assert_eq!(a.events, b.events);
+        assert_eq!(world.snapshot(), restored.snapshot());
+        assert_eq!(world.state_digest(), restored.state_digest());
+    }
+
+    #[test]
+    fn gate_a_low_blood_incapacity_survives_new_wound_and_shock_care() {
+        let mut world = World::new(212);
+        let medic = spawn(
+            &mut world,
+            SoldierSpec {
+                role: Role::Medic,
+                inventory: Inventory {
+                    medical: SHOCK_TREATMENT_COST,
+                    ..Inventory::default()
+                },
+                ..SoldierSpec::default()
+            },
+        );
+        let patient = spawn(&mut world, SoldierSpec::default());
+        world.casualty.insert(
+            patient,
+            CasualtyState {
+                blood: BLOOD_MAX / 3,
+                shock: 400,
+                shock_remainder: 0,
+                incapacitated: true,
+                recovering: false,
+                materialized_at: 0,
+            },
+        );
+        gate_wound(&mut world, patient, 0, 1);
+        assert!(world.casualty[&patient].incapacitated);
+        let tid = match world
+            .apply(Command::StartTreatment {
+                medic,
+                patient,
+                wound: None,
+                kind: TreatmentKind::Shock,
+            })
+            .events[0]
+            .event
+        {
+            Event::TreatmentStarted { id, .. } => id,
+            _ => unreachable!(),
+        };
+        world.apply(Command::AdvanceTo {
+            target: SHOCK_TREATMENT_DURATION,
+        });
+        assert!(matches!(
+            world.treatments[&tid].status,
+            TreatmentStatus::Completed { .. }
+        ));
+        assert!(world.casualty[&patient].incapacitated);
+    }
+
+    #[test]
+    fn gate_a_dead_completion_defensive_path_cleans_every_index() {
+        let mut world = World::new(213);
+        let medic = spawn(
+            &mut world,
+            SoldierSpec {
+                role: Role::Medic,
+                inventory: Inventory {
+                    medical: 1,
+                    ..Inventory::default()
+                },
+                ..SoldierSpec::default()
+            },
+        );
+        let patient = spawn(&mut world, SoldierSpec::default());
+        let wound = gate_wound(&mut world, patient, 1, 0);
+        let tid = gate_start(&mut world, medic, patient, wound);
+        world.soldiers.living[patient.index()].life = LifeState::Dead {
+            at: 10,
+            cause: DeathCause::Starvation,
+        };
+        world.clock = 10;
+        let mut events = Vec::new();
+        world.complete_treatments_at(10, &mut events).unwrap();
+        assert!(matches!(
+            world.treatments[&tid].status,
+            TreatmentStatus::Interrupted {
+                reason: InterruptionReason::PatientDied,
+                ..
+            }
+        ));
+        assert!(!world.active_by_entity.contains_key(&medic));
+        assert!(!world.active_by_entity.contains_key(&patient));
+        assert!(!world.due_by_treatment.contains_key(&tid));
     }
 }
