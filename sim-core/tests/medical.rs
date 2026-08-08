@@ -196,3 +196,206 @@ fn shock_treatment_rejects_an_unaffected_patient_without_consumption() {
     assert_eq!(world.snapshot(), before);
     assert_eq!(world.resource_totals().consumed_medical, 0);
 }
+
+fn wound_event_id(outcome: &ApplyOutcome) -> WoundId {
+    match outcome.events[0].event {
+        Event::WoundInflicted { id, .. } => id,
+        _ => panic!("expected wound event"),
+    }
+}
+
+#[test]
+fn bleeding_rate_seven_has_exact_hot_cold_remainder_and_death_fixture() {
+    fn fixture(hot: bool) -> (CasualtyState, LifeState, Vec<TimedEvent>) {
+        let mut world = World::new(71);
+        let patient = match world
+            .apply(Command::SpawnSoldier {
+                spec: SoldierSpec {
+                    inventory: Inventory {
+                        food: 100,
+                        water: 100,
+                        ..Inventory::default()
+                    },
+                    ..SoldierSpec::default()
+                },
+            })
+            .events[0]
+            .event
+        {
+            Event::SoldierSpawned { id, .. } => id,
+            _ => unreachable!(),
+        };
+        wound_event_id(&world.apply(Command::InflictWound {
+            patient,
+            wound: WoundSpec {
+                trauma: 0,
+                bleeding_per_second: 7,
+                shock: 0,
+            },
+        }));
+        if hot {
+            assert!(world
+                .apply(Command::SetRegionHot { cell: 0, hot: true })
+                .error
+                .is_none());
+        }
+        let first = world.apply(Command::AdvanceTo { target: 1 });
+        let c = world.casualty_state(patient).unwrap();
+        assert_eq!((c.blood, c.shock, c.shock_remainder), (4_993, 0, 7));
+        assert!(!c.incapacitated);
+        assert!(!first
+            .events
+            .iter()
+            .any(|e| matches!(e.event, Event::SoldierDied { .. })));
+        let outcome = world.apply(Command::AdvanceTo { target: 715 });
+        let deaths: Vec<_> = outcome
+            .events
+            .iter()
+            .filter(|e| matches!(e.event, Event::SoldierDied { .. }))
+            .cloned()
+            .collect();
+        assert_eq!(deaths.len(), 1);
+        assert_eq!(deaths[0].at, 715);
+        assert!(matches!(
+            deaths[0].event,
+            Event::SoldierDied {
+                cause: DeathCause::Hemorrhage,
+                ..
+            }
+        ));
+        (
+            world.casualty_state(patient).unwrap(),
+            world.soldier(patient).unwrap().living.life,
+            deaths,
+        )
+    }
+    let cold = fixture(false);
+    let hot = fixture(true);
+    assert_eq!(cold, hot);
+    assert_eq!(
+        (cold.0.blood, cold.0.shock, cold.0.shock_remainder),
+        (0, 500, 5)
+    );
+}
+
+#[test]
+fn wound_added_at_nonzero_clock_never_bleeds_retroactively() {
+    let mut world = World::new(72);
+    let patient = spawn(&mut world, Role::Rifle, 0);
+    wound_event_id(&world.apply(Command::InflictWound {
+        patient,
+        wound: WoundSpec {
+            trauma: 0,
+            bleeding_per_second: 7,
+            shock: 0,
+        },
+    }));
+    world.apply(Command::AdvanceTo { target: 5 });
+    wound_event_id(&world.apply(Command::InflictWound {
+        patient,
+        wound: WoundSpec {
+            trauma: 0,
+            bleeding_per_second: 11,
+            shock: 0,
+        },
+    }));
+    let at_five = world.casualty_state(patient).unwrap();
+    assert_eq!(
+        (at_five.blood, at_five.shock, at_five.shock_remainder),
+        (4_965, 3, 5)
+    );
+    world.apply(Command::AdvanceTo { target: 6 });
+    let at_six = world.casualty_state(patient).unwrap();
+    assert_eq!(
+        (at_six.blood, at_six.shock, at_six.shock_remainder),
+        (4_947, 5, 3)
+    );
+    assert_eq!(world.wounds_of(patient).len(), 2);
+}
+
+#[test]
+fn same_timestamp_hemorrhage_defeats_completion_and_cleans_relationship() {
+    let mut world = World::new(73);
+    let medic = spawn(&mut world, Role::Medic, HEMOSTATIC_COST);
+    let patient = spawn(&mut world, Role::Rifle, 0);
+    let wound = wound_event_id(&world.apply(Command::InflictWound {
+        patient,
+        wound: WoundSpec {
+            trauma: 0,
+            bleeding_per_second: 500,
+            shock: 0,
+        },
+    }));
+    let started = world.apply(Command::StartTreatment {
+        medic,
+        patient,
+        wound: Some(wound),
+        kind: TreatmentKind::Hemostatic,
+    });
+    let treatment = match started.events[0].event {
+        Event::TreatmentStarted { id, .. } => id,
+        _ => panic!(),
+    };
+    let outcome = world.apply(Command::AdvanceTo {
+        target: HEMOSTATIC_DURATION,
+    });
+    let relevant: Vec<_> = outcome
+        .events
+        .iter()
+        .filter(|e| {
+            matches!(
+                e.event,
+                Event::SoldierDied { .. }
+                    | Event::TreatmentInterrupted { .. }
+                    | Event::TreatmentCompleted { .. }
+            )
+        })
+        .map(|e| e.event)
+        .collect();
+    assert!(
+        matches!(relevant.as_slice(), [Event::SoldierDied { cause: DeathCause::Hemorrhage, .. }, Event::TreatmentInterrupted { id, reason: InterruptionReason::PatientDied }] if *id == treatment)
+    );
+    assert!(matches!(
+        world.treatment(treatment).unwrap().status,
+        TreatmentStatus::Interrupted {
+            at: HEMOSTATIC_DURATION,
+            reason: InterruptionReason::PatientDied
+        }
+    ));
+    assert!(!world.wound(wound).unwrap().controlled);
+    let restart = world.apply(Command::StartTreatment {
+        medic,
+        patient,
+        wound: Some(wound),
+        kind: TreatmentKind::Hemostatic,
+    });
+    assert_eq!(restart.error, Some(SimError::InvalidTreatment));
+}
+
+#[test]
+fn sparse_boundary_across_empty_hot_cell_keeps_snapshot_accounting_valid() {
+    let mut world = World::new(74);
+    assert!(world
+        .apply(Command::SetRegionHot {
+            cell: 99,
+            hot: true
+        })
+        .error
+        .is_none());
+    let patient = spawn(&mut world, Role::Rifle, 0);
+    wound_event_id(&world.apply(Command::InflictWound {
+        patient,
+        wound: WoundSpec {
+            trauma: 0,
+            bleeding_per_second: 100,
+            shock: 0,
+        },
+    }));
+    assert!(world
+        .apply(Command::AdvanceTo { target: 50 })
+        .error
+        .is_none());
+    assert_eq!(world.hot_cell(99).unwrap().fixed_steps, 50);
+    let bytes = world.snapshot();
+    assert_eq!(World::from_snapshot(&bytes).unwrap().snapshot(), bytes);
+}

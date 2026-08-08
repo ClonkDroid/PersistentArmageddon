@@ -40,6 +40,8 @@ pub struct Wound {
 pub struct CasualtyState {
     pub blood: u32,
     pub shock: u32,
+    /// Canonical tenths-of-a-shock-unit carried across materialization boundaries.
+    pub shock_remainder: u8,
     pub incapacitated: bool,
     pub recovering: bool,
     pub materialized_at: u64,
@@ -600,8 +602,10 @@ pub struct World {
 }
 
 #[derive(Clone)]
-struct LivingTransition {
+struct CompositeTransition {
     living: LivingState,
+    casualty: Option<CasualtyState>,
+    interruption: Option<(TreatmentId, InterruptionReason)>,
     inventory: Inventory,
     consumed_food: u128,
     consumed_water: u128,
@@ -673,17 +677,22 @@ impl World {
         if let Some(c) = self.casualty.get(&id) {
             let rate = self.bleeding_rate_by_patient.get(&id).copied().unwrap_or(0);
             if rate != 0 {
-                let ceil = |amount: u64| amount.saturating_add(rate - 1) / rate;
-                let blood = ceil(u64::from(c.blood)).max(1);
-                let shock =
-                    ceil(u64::from(1000_u32.saturating_sub(c.shock)).saturating_mul(10)).max(1);
-                let incap_blood = if c.blood > BLOOD_MAX / 3 {
-                    ceil(u64::from(c.blood - BLOOD_MAX / 3))
+                let ceil_loss = |amount: u64| amount.saturating_add(rate - 1) / rate;
+                let blood = ceil_loss(u64::from(c.blood)).max(1);
+                let shock_loss = u64::from(1000_u32.saturating_sub(c.shock))
+                    .saturating_mul(10)
+                    .saturating_sub(u64::from(c.shock_remainder));
+                let shock = ceil_loss(shock_loss).max(1);
+                let incap_blood = if !c.incapacitated && c.blood > BLOOD_MAX / 3 {
+                    ceil_loss(u64::from(c.blood - BLOOD_MAX / 3))
                 } else {
-                    1
+                    u64::MAX
                 };
-                let incap_shock = if c.shock < INCAPACITATED_SHOCK {
-                    ceil(u64::from(INCAPACITATED_SHOCK - c.shock).saturating_mul(10))
+                let incap_shock = if !c.incapacitated && c.shock < INCAPACITATED_SHOCK {
+                    let loss = u64::from(INCAPACITATED_SHOCK - c.shock)
+                        .saturating_mul(10)
+                        .saturating_sub(u64::from(c.shock_remainder));
+                    ceil_loss(loss)
                 } else {
                     u64::MAX
                 };
@@ -739,10 +748,15 @@ impl World {
         inventory: Inventory,
         id: EntityId,
         at: u64,
-    ) -> Result<LivingTransition, SimError> {
+        casualty: Option<CasualtyState>,
+        bleeding_rate: u64,
+        active_treatment: Option<(TreatmentId, bool)>,
+    ) -> Result<CompositeTransition, SimError> {
         if living.life != LifeState::Alive {
-            return Ok(LivingTransition {
+            return Ok(CompositeTransition {
                 living,
+                casualty,
+                interruption: None,
                 inventory,
                 consumed_food: 0,
                 consumed_water: 0,
@@ -837,8 +851,82 @@ impl World {
                 });
             }
         }
-        Ok(LivingTransition {
+        let mut casualty = casualty;
+        let mut interruption = None;
+        if l.life == LifeState::Alive {
+            if let Some(mut c) = casualty {
+                let elapsed = at
+                    .checked_sub(c.materialized_at)
+                    .ok_or(SimError::TimeReversal)?;
+                let loss = bleeding_rate
+                    .checked_mul(elapsed)
+                    .ok_or(SimError::ArithmeticOverflow)?;
+                c.blood = c.blood.saturating_sub(
+                    u32::try_from(loss.min(u64::from(u32::MAX)))
+                        .map_err(|_| SimError::ArithmeticOverflow)?,
+                );
+                let shock_numerator = u64::from(c.shock_remainder)
+                    .checked_add(loss)
+                    .ok_or(SimError::ArithmeticOverflow)?;
+                c.shock = c
+                    .shock
+                    .saturating_add(u32::try_from(shock_numerator / 10).unwrap_or(u32::MAX))
+                    .min(1000);
+                c.shock_remainder =
+                    u8::try_from(shock_numerator % 10).expect("remainder below ten");
+                let was_incapacitated = c.incapacitated;
+                c.incapacitated = c.shock >= INCAPACITATED_SHOCK || c.blood <= BLOOD_MAX / 3;
+                c.materialized_at = at;
+                if c.incapacitated && !was_incapacitated && l.activity != Activity::Idle {
+                    let before = l.activity;
+                    l.activity = Activity::Idle;
+                    events.push(TimedEvent {
+                        at,
+                        event: Event::ActivityChanged {
+                            id,
+                            before,
+                            after: Activity::Idle,
+                            forced: true,
+                        },
+                    });
+                }
+                if c.blood == 0 || c.shock >= 1000 {
+                    let cause = if c.blood == 0 {
+                        DeathCause::Hemorrhage
+                    } else {
+                        DeathCause::TraumaticShock
+                    };
+                    let health_before = l.health;
+                    l.health = 0;
+                    l.life = LifeState::Dead { at, cause };
+                    events.push(TimedEvent {
+                        at,
+                        event: Event::SoldierDied {
+                            id,
+                            cause,
+                            health_before,
+                        },
+                    });
+                }
+                casualty = Some(c);
+            }
+        }
+        if l.life != LifeState::Alive {
+            interruption = active_treatment.map(|(tid, is_medic)| {
+                (
+                    tid,
+                    if is_medic {
+                        InterruptionReason::MedicDied
+                    } else {
+                        InterruptionReason::PatientDied
+                    },
+                )
+            });
+        }
+        Ok(CompositeTransition {
             living: l,
+            casualty,
+            interruption,
             inventory: inv,
             consumed_food,
             consumed_water,
@@ -848,11 +936,14 @@ impl World {
     fn commit_transition(
         &mut self,
         id: EntityId,
-        transition: LivingTransition,
+        transition: CompositeTransition,
         out: &mut Vec<TimedEvent>,
     ) {
         let i = id.index();
         self.soldiers.living[i] = transition.living;
+        if let Some(casualty) = transition.casualty {
+            self.casualty.insert(id, casualty);
+        }
         self.soldiers.data[i].inventory = transition.inventory;
         self.soldiers.data[i].health = transition.living.health;
         self.consumed_food += transition.consumed_food;
@@ -971,10 +1062,12 @@ impl World {
             casualty.blood = casualty
                 .blood
                 .saturating_sub(u32::try_from(loss).unwrap_or(u32::MAX));
+            let numerator = u64::from(casualty.shock_remainder).checked_add(loss)?;
             casualty.shock = casualty
                 .shock
-                .saturating_add(u32::try_from(loss / 10).unwrap_or(u32::MAX))
+                .saturating_add(u32::try_from(numerator / 10).unwrap_or(u32::MAX))
                 .min(1000);
+            casualty.shock_remainder = u8::try_from(numerator % 10).ok()?;
             casualty.incapacitated =
                 casualty.shock >= INCAPACITATED_SHOCK || casualty.blood <= BLOOD_MAX / 3;
             casualty.materialized_at = self.clock;
@@ -1351,6 +1444,14 @@ impl World {
         let mut old = self.soldiers.living[patient.index()];
         Self::project(&mut old, self.clock)?;
         let health = old.health.saturating_sub(spec.trauma);
+        let old_rate = self
+            .bleeding_rate_by_patient
+            .get(&patient)
+            .copied()
+            .unwrap_or(0);
+        let rate = old_rate
+            .checked_add(u64::from(spec.bleeding_per_second))
+            .ok_or(SimError::ArithmeticOverflow)?;
         let mut casualty = self
             .casualty
             .get(&patient)
@@ -1360,6 +1461,27 @@ impl World {
                 materialized_at: self.clock,
                 ..CasualtyState::default()
             });
+        let elapsed = self
+            .clock
+            .checked_sub(casualty.materialized_at)
+            .ok_or(SimError::TimeReversal)?;
+        let prior_loss = old_rate
+            .checked_mul(elapsed)
+            .ok_or(SimError::ArithmeticOverflow)?;
+        casualty.blood = casualty.blood.saturating_sub(
+            u32::try_from(prior_loss.min(u64::from(u32::MAX)))
+                .map_err(|_| SimError::ArithmeticOverflow)?,
+        );
+        let shock_numerator = u64::from(casualty.shock_remainder)
+            .checked_add(prior_loss)
+            .ok_or(SimError::ArithmeticOverflow)?;
+        casualty.shock = casualty
+            .shock
+            .saturating_add(u32::try_from(shock_numerator / 10).unwrap_or(u32::MAX))
+            .min(1000);
+        casualty.shock_remainder = u8::try_from(shock_numerator % 10).expect("remainder below ten");
+        casualty.materialized_at = self.clock;
+        let was_incapacitated = casualty.incapacitated;
         casualty.shock = casualty
             .shock
             .checked_add(u32::from(spec.shock))
@@ -1379,8 +1501,10 @@ impl World {
         if casualty.incapacitated {
             replacement.activity = Activity::Idle;
         }
-        if let Some(tid) = self.active_by_entity.get(&patient).copied() {
-            self.interrupt_internal(tid, InterruptionReason::Ineligible)?;
+        if (!was_incapacitated && casualty.incapacitated) || health == 0 {
+            if let Some(tid) = self.active_by_entity.get(&patient).copied() {
+                self.interrupt_internal(tid, InterruptionReason::Ineligible)?;
+            }
         }
         self.next_wound_id = next;
         self.soldiers.living[patient.index()] = replacement;
@@ -1401,13 +1525,6 @@ impl World {
             .entry(patient)
             .or_default()
             .insert(id);
-        let rate = self
-            .bleeding_rate_by_patient
-            .get(&patient)
-            .copied()
-            .unwrap_or(0)
-            .checked_add(u64::from(spec.bleeding_per_second))
-            .ok_or(SimError::ArithmeticOverflow)?;
         if rate != 0 {
             self.bleeding_rate_by_patient.insert(patient, rate);
         }
@@ -1728,53 +1845,58 @@ impl World {
                     staged.push((id, false, None));
                     continue;
                 }
-                if let Some((tid, reason)) = self.advance_casualty_entity(id, at, out)? {
-                    interruptions.insert(tid, reason);
-                }
-                if self.soldiers.living[id.index()].life != LifeState::Alive {
-                    staged.push((id, false, None));
-                    continue;
-                }
                 let cell = self.soldiers.data[id.index()].position.cell;
                 let is_hot = self
                     .hot_cells
                     .get(&cell)
                     .is_some_and(|h| h.last_stepped_at < at);
+                let is_due = self.due_by_entity.get(&id) == Some(&at);
+                let is_treatment_endpoint = treatment_at == Some(at)
+                    && self
+                        .active_by_entity
+                        .get(&id)
+                        .is_some_and(|tid| self.due_by_treatment.get(tid) == Some(&at));
+                if !is_hot && !is_due && !is_treatment_endpoint {
+                    continue;
+                }
                 if is_hot {
                     hot_count = hot_count
                         .checked_add(1)
                         .ok_or(SimError::ArithmeticOverflow)?;
-                    let transition = Self::transition_second(
-                        self.soldiers.living[id.index()],
-                        self.soldiers.data[id.index()].inventory,
-                        id,
-                        at,
-                    )?;
-                    food_count = food_count
-                        .checked_add(transition.consumed_food)
-                        .ok_or(SimError::ArithmeticOverflow)?;
-                    water_count = water_count
-                        .checked_add(transition.consumed_water)
-                        .ok_or(SimError::ArithmeticOverflow)?;
-                    staged.push((id, true, Some(transition)));
-                } else if self.due_by_entity.get(&id) == Some(&at) {
+                } else if is_due {
                     cold_count = cold_count
                         .checked_add(1)
                         .ok_or(SimError::ArithmeticOverflow)?;
-                    let transition = Self::transition_second(
-                        self.soldiers.living[id.index()],
-                        self.soldiers.data[id.index()].inventory,
-                        id,
-                        at,
-                    )?;
-                    food_count = food_count
-                        .checked_add(transition.consumed_food)
-                        .ok_or(SimError::ArithmeticOverflow)?;
-                    water_count = water_count
-                        .checked_add(transition.consumed_water)
-                        .ok_or(SimError::ArithmeticOverflow)?;
-                    staged.push((id, false, Some(transition)));
                 }
+                let active = self.active_by_entity.get(&id).copied().map(|tid| {
+                    (
+                        tid,
+                        self.treatments.get(&tid).is_some_and(|t| t.medic == id),
+                    )
+                });
+                let transition = Self::transition_second(
+                    self.soldiers.living[id.index()],
+                    self.soldiers.data[id.index()].inventory,
+                    id,
+                    at,
+                    self.casualty.get(&id).copied(),
+                    self.bleeding_rate_by_patient.get(&id).copied().unwrap_or(0),
+                    active,
+                )?;
+                #[cfg(test)]
+                if transition.casualty.is_some() {
+                    self.medical_entity_candidates += 1;
+                }
+                if let Some((tid, reason)) = transition.interruption {
+                    interruptions.insert(tid, reason);
+                }
+                food_count = food_count
+                    .checked_add(transition.consumed_food)
+                    .ok_or(SimError::ArithmeticOverflow)?;
+                water_count = water_count
+                    .checked_add(transition.consumed_water)
+                    .ok_or(SimError::ArithmeticOverflow)?;
+                staged.push((id, is_hot, Some(transition)));
             }
             let next_hot = self
                 .hot_member_steps
@@ -1823,7 +1945,11 @@ impl World {
                 .values_mut()
                 .filter(|h| h.last_stepped_at < at)
             {
-                h.fixed_steps += 1;
+                let elapsed = at - h.last_stepped_at;
+                h.fixed_steps = h
+                    .fixed_steps
+                    .checked_add(elapsed)
+                    .ok_or(SimError::ArithmeticOverflow)?;
                 h.last_stepped_at = at;
             }
         }
@@ -1838,85 +1964,6 @@ impl World {
         } else {
             (cells, t - self.clock)
         })
-    }
-
-    fn advance_casualty_entity(
-        &mut self,
-        id: EntityId,
-        at: u64,
-        out: &mut Vec<TimedEvent>,
-    ) -> Result<Option<(TreatmentId, InterruptionReason)>, SimError> {
-        let Some(mut casualty) = self.casualty.get(&id).copied() else {
-            return Ok(None);
-        };
-        if casualty.materialized_at >= at
-            || self.soldiers.living[id.index()].life != LifeState::Alive
-        {
-            return Ok(None);
-        }
-        #[cfg(test)]
-        {
-            self.medical_entity_candidates += 1;
-        }
-        let elapsed = at - casualty.materialized_at;
-        let rate = self.bleeding_rate_by_patient.get(&id).copied().unwrap_or(0);
-        let loss = rate
-            .checked_mul(elapsed)
-            .ok_or(SimError::ArithmeticOverflow)?;
-        casualty.blood = casualty.blood.saturating_sub(
-            u32::try_from(loss.min(u64::from(u32::MAX)))
-                .map_err(|_| SimError::ArithmeticOverflow)?,
-        );
-        casualty.shock = casualty
-            .shock
-            .saturating_add(u32::try_from(loss / 10).unwrap_or(u32::MAX))
-            .min(1000);
-        casualty.incapacitated =
-            casualty.shock >= INCAPACITATED_SHOCK || casualty.blood <= BLOOD_MAX / 3;
-        casualty.materialized_at = at;
-        self.casualty.insert(id, casualty);
-        if casualty.incapacitated && self.soldiers.living[id.index()].activity != Activity::Idle {
-            let before = self.soldiers.living[id.index()].activity;
-            self.soldiers.living[id.index()].activity = Activity::Idle;
-            out.push(TimedEvent {
-                at,
-                event: Event::ActivityChanged {
-                    id,
-                    before,
-                    after: Activity::Idle,
-                    forced: true,
-                },
-            });
-        }
-        if casualty.blood != 0 && casualty.shock < 1000 {
-            return Ok(None);
-        }
-        let cause = if casualty.blood == 0 {
-            DeathCause::Hemorrhage
-        } else {
-            DeathCause::TraumaticShock
-        };
-        let health_before = self.soldiers.living[id.index()].health;
-        self.soldiers.living[id.index()].health = 0;
-        self.soldiers.living[id.index()].life = LifeState::Dead { at, cause };
-        self.soldiers.living[id.index()].materialized_at = at;
-        self.soldiers.data[id.index()].health = 0;
-        out.push(TimedEvent {
-            at,
-            event: Event::SoldierDied {
-                id,
-                cause,
-                health_before,
-            },
-        });
-        Ok(self.active_by_entity.get(&id).copied().map(|tid| {
-            let reason = if self.treatments[&tid].medic == id {
-                InterruptionReason::MedicDied
-            } else {
-                InterruptionReason::PatientDied
-            };
-            (tid, reason)
-        }))
     }
 
     fn complete_treatments_at(
@@ -2016,11 +2063,16 @@ impl World {
         for cell in self.hot_cells.keys() {
             touched.extend(self.cell_members.get(cell).into_iter().flatten().copied());
         }
-        let due_treatment_ids: BTreeSet<_> = self
+        let mut due_treatment_ids: BTreeSet<_> = self
             .treatment_due
             .range(..=t)
             .flat_map(|(_, ids)| ids.iter().copied())
             .collect();
+        due_treatment_ids.extend(
+            touched
+                .iter()
+                .filter_map(|id| self.active_by_entity.get(id).copied()),
+        );
         for tid in &due_treatment_ids {
             if let Some(treatment) = self.treatments.get(tid) {
                 touched.insert(treatment.medic);
@@ -2071,8 +2123,11 @@ impl World {
             .collect();
         let treatment_due_records: Vec<_> = self
             .treatment_due
-            .range(..=t)
-            .map(|(at, ids)| (*at, ids.clone()))
+            .iter()
+            .filter_map(|(at, ids)| {
+                let relevant: BTreeSet<_> = ids.intersection(&due_treatment_ids).copied().collect();
+                (!relevant.is_empty()).then_some((*at, relevant))
+            })
             .collect();
         let counters = (
             self.consumed_food,
@@ -2145,11 +2200,18 @@ impl World {
                         self.active_by_entity.insert(id, old);
                     }
                 }
-                for (at, _) in &treatment_due_records {
-                    self.treatment_due.remove(at);
+                for tid in &due_treatment_ids {
+                    if let Some(at) = self.due_by_treatment.get(tid).copied() {
+                        if let Some(bucket) = self.treatment_due.get_mut(&at) {
+                            bucket.remove(tid);
+                            if bucket.is_empty() {
+                                self.treatment_due.remove(&at);
+                            }
+                        }
+                    }
                 }
                 for (at, ids) in treatment_due_records {
-                    self.treatment_due.insert(at, ids);
+                    self.treatment_due.entry(at).or_default().extend(ids);
                 }
                 for tid in due_treatment_ids {
                     self.due_by_treatment.remove(&tid);
@@ -2377,6 +2439,7 @@ impl World {
             w.u64(id.raw());
             w.u32(c.blood);
             w.u32(c.shock);
+            w.u8(c.shock_remainder);
             w.bool(c.incapacitated);
             w.bool(c.recovering);
             w.u64(c.materialized_at);
@@ -2624,6 +2687,7 @@ impl World {
             let c = CasualtyState {
                 blood: r.u32()?,
                 shock: r.u32()?,
+                shock_remainder: r.u8()?,
                 incapacitated: r.bool()?,
                 recovering: r.bool()?,
                 materialized_at: r.u64()?,
@@ -2631,6 +2695,7 @@ impl World {
             if !soldiers.valid(id)
                 || c.blood > BLOOD_MAX
                 || c.shock > 1000
+                || c.shock_remainder >= 10
                 || c.materialized_at > clock
                 || casualty.insert(id, c).is_some()
             {
@@ -4134,7 +4199,9 @@ mod private_invariants {
         ];
         assert_eq!(cases.len(), 15);
         for case in cases {
-            let actual = World::transition_second(case.living, case.inventory, id, 1).unwrap();
+            let actual =
+                World::transition_second(case.living, case.inventory, id, 1, None, 0, None)
+                    .unwrap();
             assert_eq!(actual.living, case.expected, "{} living", case.name);
             assert_eq!(
                 actual.inventory, case.expected_inventory,
