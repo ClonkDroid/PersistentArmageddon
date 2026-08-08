@@ -12794,8 +12794,17 @@ mod private_invariants {
             ),
         ) {
             let layout = V7MedicalLayout::parse(bytes);
+            assert_eq!(
+                u32::from_le_bytes(
+                    bytes[layout.treatment_count..layout.treatment_count + 4]
+                        .try_into()
+                        .unwrap()
+                ),
+                1
+            );
             assert_eq!(layout.treatments.len(), 1);
             let record = &layout.treatments[0];
+            assert_eq!(record.range.start, layout.treatment_count + 4);
             let (id, medic, patient, wound, kind) = expected;
             assert_eq!(encoded_u64(bytes, record.id), id.0);
             assert_eq!(encoded_u64(bytes, record.medic), medic.raw());
@@ -12806,6 +12815,17 @@ mod private_invariants {
                 wound
             );
             assert_eq!(bytes[record.kind], kind as u8);
+            assert_eq!(
+                u32::from_le_bytes(
+                    bytes[record.consumed..record.consumed + 4]
+                        .try_into()
+                        .unwrap()
+                ),
+                match kind {
+                    TreatmentKind::Hemostatic => HEMOSTATIC_COST,
+                    TreatmentKind::Shock => SHOCK_TREATMENT_COST,
+                }
+            );
             assert_eq!(encoded_u64(bytes, record.started_at), 0);
             assert_eq!(
                 encoded_u64(bytes, record.completes_at),
@@ -12830,6 +12850,8 @@ mod private_invariants {
         ) {
             let (medic, patient, wound, treatment) = ids;
             let (expected_life, expected_incapacitated) = endpoint_state;
+            assert!(world.soldiers.valid(medic));
+            assert!(world.soldiers.valid(patient));
             let record = world.treatments[&treatment];
             assert_eq!(record.id, treatment);
             assert!(treatment.0 < world.next_treatment_id);
@@ -12888,22 +12910,18 @@ mod private_invariants {
             assert!(world.wounds[&wound].created_at <= record.started_at);
             assert!(wound.0 < world.next_wound_id);
             assert_eq!(
-                world.treatment_ids_by_entity.get(&medic),
-                Some(&BTreeSet::from([treatment]))
-            );
-            assert_eq!(
-                world.treatment_ids_by_entity.get(&patient),
-                Some(&BTreeSet::from([treatment]))
+                world.treatment_ids_by_entity,
+                BTreeMap::from([
+                    (medic, BTreeSet::from([treatment])),
+                    (patient, BTreeSet::from([treatment])),
+                ])
             );
             assert!(world.active_by_entity.is_empty());
             assert!(world.treatment_due.is_empty());
             assert!(world.due_by_treatment.is_empty());
             if endpoint == medic {
-                assert!(!world.availability_by_medic.contains_key(&medic));
-                assert!(world
-                    .available_medics
-                    .values()
-                    .all(|ids| !ids.contains(&medic)));
+                assert!(world.availability_by_medic.is_empty());
+                assert!(world.available_medics.is_empty());
             } else {
                 let medic_spec = world.soldiers.data[medic.index()];
                 let keys = BTreeSet::from([
@@ -12918,10 +12936,16 @@ mod private_invariants {
                         SHOCK_TREATMENT_COST,
                     ),
                 ]);
-                assert_eq!(world.availability_by_medic.get(&medic), Some(&keys));
-                for key in keys {
-                    assert!(world.available_medics[&key].contains(&medic));
-                }
+                assert_eq!(
+                    world.availability_by_medic,
+                    BTreeMap::from([(medic, keys.clone())])
+                );
+                assert_eq!(
+                    world.available_medics,
+                    keys.into_iter()
+                        .map(|key| (key, BTreeSet::from([medic])))
+                        .collect()
+                );
             }
             let totals = world.resource_totals();
             assert_eq!(totals.sourced_medical, 8);
@@ -13105,6 +13129,8 @@ mod private_invariants {
             Event::TreatmentStarted { id, .. } => id,
             _ => unreachable!(),
         };
+        assert!(incapacitated_patient.soldiers.valid(medic));
+        assert!(incapacitated_patient.soldiers.valid(patient));
         assert!(incapacitated_patient.is_incapacitated(patient));
         assert!(!incapacitated_patient.is_incapacitated(medic));
         assert_ne!(medic, patient);
@@ -13149,6 +13175,10 @@ mod private_invariants {
             incapacitated_patient.wounds[&target].created_at
                 <= incapacitated_patient.casualty[&patient].materialized_at
         );
+        assert!(
+            incapacitated_patient.wounds[&target].created_at
+                <= incapacitated_patient.treatments[&treatment].started_at
+        );
         assert_eq!(
             incapacitated_patient.treatments[&treatment].status,
             TreatmentStatus::Active
@@ -13166,30 +13196,24 @@ mod private_invariants {
             HEMOSTATIC_DURATION
         );
         assert!(positive.completes_at > incapacitated_patient.clock);
-        assert_eq!(incapacitated_patient.active_by_entity.len(), 2);
         assert_eq!(
-            incapacitated_patient.active_by_entity.get(&medic),
-            Some(&treatment)
+            incapacitated_patient.active_by_entity,
+            BTreeMap::from([(medic, treatment), (patient, treatment)])
         );
         assert_eq!(
-            incapacitated_patient.active_by_entity.get(&patient),
-            Some(&treatment)
+            incapacitated_patient.treatment_ids_by_entity,
+            BTreeMap::from([
+                (medic, BTreeSet::from([treatment])),
+                (patient, BTreeSet::from([treatment])),
+            ])
         );
         assert_eq!(
-            incapacitated_patient.treatment_ids_by_entity[&medic],
-            BTreeSet::from([treatment])
+            incapacitated_patient.due_by_treatment,
+            BTreeMap::from([(treatment, HEMOSTATIC_DURATION)])
         );
         assert_eq!(
-            incapacitated_patient.treatment_ids_by_entity[&patient],
-            BTreeSet::from([treatment])
-        );
-        assert_eq!(
-            incapacitated_patient.due_by_treatment[&treatment],
-            HEMOSTATIC_DURATION
-        );
-        assert_eq!(
-            incapacitated_patient.treatment_due[&HEMOSTATIC_DURATION],
-            BTreeSet::from([treatment])
+            incapacitated_patient.treatment_due,
+            BTreeMap::from([(HEMOSTATIC_DURATION, BTreeSet::from([treatment]))])
         );
         assert_eq!(incapacitated_patient.resource_totals().sourced_medical, 8);
         assert_eq!(incapacitated_patient.resource_totals().carried_medical, 7);
@@ -13201,19 +13225,16 @@ mod private_invariants {
                 + incapacitated_patient.resource_totals().consumed_medical
                 + incapacitated_patient.resource_totals().lost_medical
         );
-        assert!(!incapacitated_patient
-            .availability_by_medic
-            .contains_key(&medic));
-        assert!(incapacitated_patient
-            .available_medics
-            .values()
-            .all(|ids| !ids.contains(&medic)));
+        assert!(incapacitated_patient.availability_by_medic.is_empty());
+        assert!(incapacitated_patient.available_medics.is_empty());
         canonical_bytes(&incapacitated_patient);
 
         // Hemostasis requires a present, owned, uncontrolled and unhealed target.
         let (active, medic, patient, wound, treatment) = gate_c1_active_world();
         let assert_active_control =
             |world: &World, kind: TreatmentKind, target: Option<WoundId>| {
+                assert!(world.soldiers.valid(medic));
+                assert!(world.soldiers.valid(patient));
                 let record = world.treatments[&treatment];
                 assert_eq!(record.id, treatment);
                 assert!(treatment.0 < world.next_treatment_id);
@@ -13269,26 +13290,22 @@ mod private_invariants {
                     BTreeMap::from([(medic, treatment), (patient, treatment)])
                 );
                 assert_eq!(
-                    world.due_by_treatment.get(&treatment),
-                    Some(&record.completes_at)
+                    world.due_by_treatment,
+                    BTreeMap::from([(treatment, record.completes_at)])
                 );
                 assert_eq!(
-                    world.treatment_due.get(&record.completes_at),
-                    Some(&BTreeSet::from([treatment]))
+                    world.treatment_due,
+                    BTreeMap::from([(record.completes_at, BTreeSet::from([treatment]))])
                 );
                 assert_eq!(
-                    world.treatment_ids_by_entity.get(&medic),
-                    Some(&BTreeSet::from([treatment]))
+                    world.treatment_ids_by_entity,
+                    BTreeMap::from([
+                        (medic, BTreeSet::from([treatment])),
+                        (patient, BTreeSet::from([treatment])),
+                    ])
                 );
-                assert_eq!(
-                    world.treatment_ids_by_entity.get(&patient),
-                    Some(&BTreeSet::from([treatment]))
-                );
-                assert!(!world.availability_by_medic.contains_key(&medic));
-                assert!(world
-                    .available_medics
-                    .values()
-                    .all(|ids| !ids.contains(&medic)));
+                assert!(world.availability_by_medic.is_empty());
+                assert!(world.available_medics.is_empty());
                 let totals = world.resource_totals();
                 assert_eq!(totals.sourced_medical, 8);
                 assert_eq!(totals.carried_medical, u128::from(8 - record.consumed));
@@ -13390,15 +13407,15 @@ mod private_invariants {
             .apply(Command::AdvanceTo { target: 1 })
             .error
             .is_none());
-        assert_eq!(shock_world.treatments[&shock_treatment].wound, None);
-        assert_eq!(
-            shock_world.treatments[&shock_treatment].kind,
-            TreatmentKind::Shock
-        );
-        assert_eq!(
-            shock_world.treatments[&shock_treatment].status,
-            TreatmentStatus::Active
-        );
+        assert!(shock_world.soldiers.valid(shock_medic));
+        assert!(shock_world.soldiers.valid(shock_patient));
+        let shock_record = shock_world.treatments[&shock_treatment];
+        assert_eq!(shock_record.id, shock_treatment);
+        assert_eq!(shock_record.medic, shock_medic);
+        assert_eq!(shock_record.patient, shock_patient);
+        assert_eq!(shock_record.wound, None);
+        assert_eq!(shock_record.kind, TreatmentKind::Shock);
+        assert_eq!(shock_record.status, TreatmentStatus::Active);
         assert!(shock_treatment.0 < shock_world.next_treatment_id);
         assert_ne!(shock_medic, shock_patient);
         assert_eq!(
@@ -13469,26 +13486,22 @@ mod private_invariants {
             ])
         );
         assert_eq!(
-            shock_world.due_by_treatment[&shock_treatment],
-            SHOCK_TREATMENT_DURATION
+            shock_world.due_by_treatment,
+            BTreeMap::from([(shock_treatment, SHOCK_TREATMENT_DURATION)])
         );
         assert_eq!(
-            shock_world.treatment_due[&SHOCK_TREATMENT_DURATION],
-            BTreeSet::from([shock_treatment])
+            shock_world.treatment_due,
+            BTreeMap::from([(SHOCK_TREATMENT_DURATION, BTreeSet::from([shock_treatment]),)])
         );
         assert_eq!(
-            shock_world.treatment_ids_by_entity[&shock_medic],
-            BTreeSet::from([shock_treatment])
+            shock_world.treatment_ids_by_entity,
+            BTreeMap::from([
+                (shock_medic, BTreeSet::from([shock_treatment])),
+                (shock_patient, BTreeSet::from([shock_treatment])),
+            ])
         );
-        assert_eq!(
-            shock_world.treatment_ids_by_entity[&shock_patient],
-            BTreeSet::from([shock_treatment])
-        );
-        assert!(!shock_world.availability_by_medic.contains_key(&shock_medic));
-        assert!(shock_world
-            .available_medics
-            .values()
-            .all(|ids| !ids.contains(&shock_medic)));
+        assert!(shock_world.availability_by_medic.is_empty());
+        assert!(shock_world.available_medics.is_empty());
         assert_eq!(shock_world.resource_totals().sourced_medical, 8);
         assert_eq!(shock_world.resource_totals().carried_medical, 6);
         assert_eq!(shock_world.resource_totals().consumed_medical, 2);
@@ -13571,6 +13584,9 @@ mod private_invariants {
             .apply(Command::AdvanceTo { target: 1 })
             .error
             .is_none());
+        assert!(timed.soldiers.valid(timed_medic));
+        assert!(timed.soldiers.valid(timed_patient));
+        assert_eq!(timed.treatments[&timed_treatment].id, timed_treatment);
         assert_eq!(
             timed.wounds[&timed_wound].created_at,
             timed.treatments[&timed_treatment].started_at
@@ -13647,26 +13663,22 @@ mod private_invariants {
             ])
         );
         assert_eq!(
-            timed.due_by_treatment[&timed_treatment],
-            HEMOSTATIC_DURATION
+            timed.due_by_treatment,
+            BTreeMap::from([(timed_treatment, HEMOSTATIC_DURATION)])
         );
         assert_eq!(
-            timed.treatment_due[&HEMOSTATIC_DURATION],
-            BTreeSet::from([timed_treatment])
+            timed.treatment_due,
+            BTreeMap::from([(HEMOSTATIC_DURATION, BTreeSet::from([timed_treatment]),)])
         );
         assert_eq!(
-            timed.treatment_ids_by_entity[&timed_medic],
-            BTreeSet::from([timed_treatment])
+            timed.treatment_ids_by_entity,
+            BTreeMap::from([
+                (timed_medic, BTreeSet::from([timed_treatment])),
+                (timed_patient, BTreeSet::from([timed_treatment])),
+            ])
         );
-        assert_eq!(
-            timed.treatment_ids_by_entity[&timed_patient],
-            BTreeSet::from([timed_treatment])
-        );
-        assert!(!timed.availability_by_medic.contains_key(&timed_medic));
-        assert!(timed
-            .available_medics
-            .values()
-            .all(|ids| !ids.contains(&timed_medic)));
+        assert!(timed.availability_by_medic.is_empty());
+        assert!(timed.available_medics.is_empty());
         assert_eq!(timed.resource_totals().sourced_medical, 8);
         assert_eq!(timed.resource_totals().carried_medical, 7);
         assert_eq!(timed.resource_totals().consumed_medical, 1);
