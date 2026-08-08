@@ -10642,6 +10642,7 @@ mod private_invariants {
     /// fixture construction rather than silently moving an opaque byte offset.
     #[derive(Clone, Debug)]
     struct V7MedicalLayout {
+        clock: usize,
         sourced_food: usize,
         sourced_water: usize,
         sourced_medical: usize,
@@ -10662,6 +10663,7 @@ mod private_invariants {
         fn parse(bytes: &[u8]) -> Self {
             let mut r = R { b: bytes, p: 0 };
             assert_eq!(r.u32().unwrap(), SNAPSHOT_VERSION);
+            let clock = r.p;
             r.u64().unwrap(); // clock
             r.u64().unwrap(); // seed
             r.u64().unwrap(); // rng
@@ -10862,6 +10864,7 @@ mod private_invariants {
                 "v7 layout must consume the canonical image"
             );
             Self {
+                clock,
                 sourced_food,
                 sourced_water,
                 sourced_medical,
@@ -11749,7 +11752,8 @@ mod private_invariants {
             recovery_bytes
         );
 
-        let (active, _, _, _, _) = gate_c1_active_world();
+        let (active, active_medic, active_patient, active_wound, active_id) =
+            gate_c1_active_world();
         let active_bytes = active.snapshot();
         let active_layout = V7MedicalLayout::parse(&active_bytes);
         assert!(active_layout.treatments[0].wound.is_some());
@@ -11950,15 +11954,91 @@ mod private_invariants {
                 t.completes_at = t.started_at + HEMOSTATIC_DURATION;
             }
         );
-        state_error!(
-            active,
-            "active completion already due",
-            "active treatment",
-            |w: &mut World| {
-                let t = w.treatments.values_mut().next().unwrap();
-                t.started_at = 0;
-                t.completes_at = w.clock;
-            }
+        // The valid public control is one tick before its exact completion
+        // boundary.  Corrupt only the encoded world clock, leaving the active
+        // relationship and its canonical ten-second interval untouched.
+        let mut active_before_due = active.clone();
+        assert!(active_before_due
+            .apply(Command::AdvanceTo {
+                target: HEMOSTATIC_DURATION - 1,
+            })
+            .error
+            .is_none());
+        assert_eq!(active_before_due.clock, HEMOSTATIC_DURATION - 1);
+        let treatment = active_before_due.treatments.values().next().unwrap();
+        assert_eq!(treatment.status, TreatmentStatus::Active);
+        assert_eq!(treatment.kind, TreatmentKind::Hemostatic);
+        assert_eq!(treatment.id, active_id);
+        assert_eq!(treatment.medic, active_medic);
+        assert_eq!(treatment.patient, active_patient);
+        assert_eq!(treatment.wound, Some(active_wound));
+        assert_eq!(treatment.consumed, HEMOSTATIC_COST);
+        assert_eq!(
+            treatment.completes_at - treatment.started_at,
+            HEMOSTATIC_DURATION
+        );
+        let target = active_before_due
+            .wounds
+            .get(&treatment.wound.unwrap())
+            .unwrap();
+        assert_eq!(target.patient, treatment.patient);
+        assert!(!target.controlled);
+        assert!(!target.healed);
+        assert_ne!(treatment.medic, treatment.patient);
+        let medic = active_before_due.soldiers.data[treatment.medic.index()];
+        let patient = active_before_due.soldiers.data[treatment.patient.index()];
+        assert_eq!(medic.role, Role::Medic);
+        assert_eq!(patient.role, Role::Rifle);
+        assert_eq!(medic.faction, patient.faction);
+        assert_eq!(medic.position.cell, patient.position.cell);
+        assert_eq!(
+            active_before_due.soldiers.living[treatment.medic.index()].life,
+            LifeState::Alive
+        );
+        assert_eq!(
+            active_before_due.soldiers.living[treatment.patient.index()].life,
+            LifeState::Alive
+        );
+        assert_eq!(
+            active_before_due.active_by_entity.get(&treatment.medic),
+            Some(&treatment.id)
+        );
+        assert_eq!(
+            active_before_due.active_by_entity.get(&treatment.patient),
+            Some(&treatment.id)
+        );
+        assert_eq!(
+            active_before_due.due_by_treatment.get(&treatment.id),
+            Some(&treatment.completes_at)
+        );
+        assert_eq!(
+            active_before_due.treatment_due.get(&treatment.completes_at),
+            Some(&BTreeSet::from([treatment.id]))
+        );
+
+        let before_due_bytes = active_before_due.snapshot();
+        let restored_before_due = World::from_snapshot(&before_due_bytes).unwrap();
+        assert_eq!(restored_before_due.snapshot(), before_due_bytes);
+        assert_eq!(restored_before_due.treatments[&treatment.id], *treatment);
+        let before_due_layout = V7MedicalLayout::parse(&before_due_bytes);
+        let mut exact_due = before_due_bytes.clone();
+        put_u64(
+            &mut exact_due,
+            before_due_layout.clock,
+            treatment.completes_at,
+        );
+        assert_eq!(
+            before_due_bytes
+                .iter()
+                .zip(&exact_due)
+                .enumerate()
+                .filter_map(|(at, (before, after))| (before != after).then_some(at))
+                .collect::<Vec<_>>(),
+            vec![before_due_layout.clock]
+        );
+        assert_eq!(
+            World::from_snapshot(&exact_due).err(),
+            Some(SimError::Snapshot("active treatment"))
         );
 
         // Completed status is reachable only at the exact kind deadline.
