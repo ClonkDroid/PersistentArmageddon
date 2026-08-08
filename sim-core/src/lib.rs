@@ -12770,6 +12770,603 @@ mod private_invariants {
     }
 
     #[test]
+    fn gate_c1_2a_r3_active_endpoint_eligibility_and_treatment_targets() {
+        fn canonical_bytes(world: &World) -> Vec<u8> {
+            let bytes = world.snapshot();
+            let restored = World::from_snapshot(&bytes).unwrap();
+            assert_eq!(restored.snapshot(), bytes);
+            assert_eq!(restored.state_digest(), world.state_digest());
+            bytes
+        }
+
+        fn assert_retained_treatment(
+            world: &World,
+            ids: (EntityId, EntityId, WoundId, TreatmentId),
+            endpoint: EntityId,
+            endpoint_state: (LifeState, bool),
+            reason: InterruptionReason,
+        ) {
+            let (medic, patient, wound, treatment) = ids;
+            let (expected_life, expected_incapacitated) = endpoint_state;
+            let record = world.treatments[&treatment];
+            assert_eq!(record.id, treatment);
+            assert_eq!(record.medic, medic);
+            assert_eq!(record.patient, patient);
+            assert_eq!(record.wound, Some(wound));
+            assert_eq!(record.kind, TreatmentKind::Hemostatic);
+            assert_eq!(record.consumed, HEMOSTATIC_COST);
+            assert_eq!(record.started_at, 0);
+            assert_eq!(record.completes_at, HEMOSTATIC_DURATION);
+            assert_eq!(record.completes_at - record.started_at, HEMOSTATIC_DURATION);
+            assert!(record.completes_at > world.clock);
+            assert_eq!(
+                record.status,
+                TreatmentStatus::Interrupted {
+                    at: world.clock,
+                    reason,
+                }
+            );
+            assert_eq!(world.soldiers.living[endpoint.index()].life, expected_life);
+            assert_eq!(world.is_incapacitated(endpoint), expected_incapacitated);
+            assert_eq!(world.soldiers.data[medic.index()].role, Role::Medic);
+            assert!(world.medic_index[&(
+                world.soldiers.data[medic.index()].faction,
+                world.soldiers.data[medic.index()].position.cell
+            )]
+                .contains(&medic));
+            assert_ne!(medic, patient);
+            assert_eq!(
+                world.soldiers.data[medic.index()].faction,
+                world.soldiers.data[patient.index()].faction
+            );
+            assert_eq!(
+                world.soldiers.data[medic.index()].position.cell,
+                world.soldiers.data[patient.index()].position.cell
+            );
+            assert_eq!(world.wounds[&wound].patient, patient);
+            assert!(!world.wounds[&wound].controlled);
+            assert!(!world.wounds[&wound].healed);
+            assert!(world.wounds[&wound].created_at <= record.started_at);
+            assert!(wound.0 < world.next_wound_id);
+            assert_eq!(
+                world.treatment_ids_by_entity.get(&medic),
+                Some(&BTreeSet::from([treatment]))
+            );
+            assert_eq!(
+                world.treatment_ids_by_entity.get(&patient),
+                Some(&BTreeSet::from([treatment]))
+            );
+            assert!(world.active_by_entity.is_empty());
+            assert!(world.treatment_due.is_empty());
+            assert!(world.due_by_treatment.is_empty());
+            if endpoint == medic {
+                assert!(!world.availability_by_medic.contains_key(&medic));
+                assert!(world
+                    .available_medics
+                    .values()
+                    .all(|ids| !ids.contains(&medic)));
+            } else {
+                let medic_spec = world.soldiers.data[medic.index()];
+                let keys = BTreeSet::from([
+                    (
+                        medic_spec.faction,
+                        medic_spec.position.cell,
+                        HEMOSTATIC_COST,
+                    ),
+                    (
+                        medic_spec.faction,
+                        medic_spec.position.cell,
+                        SHOCK_TREATMENT_COST,
+                    ),
+                ]);
+                assert_eq!(world.availability_by_medic.get(&medic), Some(&keys));
+                for key in keys {
+                    assert!(world.available_medics[&key].contains(&medic));
+                }
+            }
+            let totals = world.resource_totals();
+            assert_eq!(totals.sourced_medical, 8);
+            assert_eq!(totals.carried_medical, u128::from(8 - HEMOSTATIC_COST));
+            assert_eq!(totals.consumed_medical, HEMOSTATIC_COST as u128);
+            assert_eq!(totals.lost_medical, 0);
+            assert_eq!(
+                totals.sourced_medical,
+                totals.carried_medical + totals.consumed_medical + totals.lost_medical
+            );
+        }
+
+        fn active_status(bytes: &[u8]) -> Vec<u8> {
+            let layout = V7MedicalLayout::parse(bytes);
+            assert_eq!(layout.treatments.len(), 1);
+            let treatment = &layout.treatments[0];
+            assert!(treatment.status_at.is_some());
+            assert!(treatment.reason.is_some());
+            let mut active =
+                Vec::with_capacity(bytes.len() - (treatment.range.end - treatment.status - 1));
+            active.extend_from_slice(&bytes[..treatment.status]);
+            active.push(0);
+            active.extend_from_slice(&bytes[treatment.range.end..]);
+            let active_layout = V7MedicalLayout::parse(&active);
+            assert_eq!(active_layout.treatments[0].status_at, None);
+            assert_eq!(active_layout.treatments[0].range.end, active_layout.end);
+            active
+        }
+
+        for (name, endpoint_is_medic, fatal) in [
+            ("dead medic", true, true),
+            ("dead patient", false, true),
+            ("incapacitated medic", true, false),
+        ] {
+            let (mut world, medic, patient, wound, treatment) = gate_c1_active_world();
+            let endpoint = if endpoint_is_medic { medic } else { patient };
+            let spec = if fatal {
+                WoundSpec {
+                    trauma: 1_000,
+                    bleeding_per_second: 0,
+                    shock: 0,
+                }
+            } else {
+                WoundSpec {
+                    trauma: 0,
+                    bleeding_per_second: 0,
+                    shock: INCAPACITATED_SHOCK as u16,
+                }
+            };
+            let outcome = world.apply(Command::InflictWound {
+                patient: endpoint,
+                wound: spec,
+            });
+            let interruption_reason = if fatal {
+                if endpoint_is_medic {
+                    InterruptionReason::MedicDied
+                } else {
+                    InterruptionReason::PatientDied
+                }
+            } else {
+                InterruptionReason::Ineligible
+            };
+            let new_wound = WoundId(1);
+            let mut expected = vec![TimedEvent {
+                at: 1,
+                event: Event::WoundInflicted {
+                    id: new_wound,
+                    patient: endpoint,
+                    wound: spec,
+                },
+            }];
+            if fatal {
+                expected.push(TimedEvent {
+                    at: 1,
+                    event: Event::SoldierDied {
+                        id: endpoint,
+                        cause: DeathCause::ImmediateTrauma,
+                        health_before: if endpoint_is_medic { 1_000 } else { 960 },
+                    },
+                });
+            }
+            expected.push(TimedEvent {
+                at: 1,
+                event: Event::TreatmentInterrupted {
+                    id: treatment,
+                    reason: interruption_reason,
+                },
+            });
+            assert_eq!(outcome.error, None, "{name}");
+            assert_eq!(outcome.events, expected, "{name}");
+            let life = if fatal {
+                LifeState::Dead {
+                    at: 1,
+                    cause: DeathCause::ImmediateTrauma,
+                }
+            } else {
+                LifeState::Alive
+            };
+            assert_retained_treatment(
+                &world,
+                (medic, patient, wound, treatment),
+                endpoint,
+                (life, !fatal),
+                interruption_reason,
+            );
+            assert_eq!(world.wounds[&new_wound].patient, endpoint);
+            assert!(!world.wounds[&new_wound].controlled);
+            assert!(!world.wounds[&new_wound].healed);
+            let bytes = canonical_bytes(&world);
+            let impossible = active_status(&bytes);
+            assert_eq!(
+                World::from_snapshot(&impossible).err(),
+                Some(SimError::Snapshot("active treatment eligibility")),
+                "{name}"
+            );
+        }
+
+        // Patient incapacity is intentionally valid when it predates treatment.
+        let mut incapacitated_patient = World::new(103);
+        let medic = spawn(
+            &mut incapacitated_patient,
+            SoldierSpec {
+                role: Role::Medic,
+                inventory: Inventory {
+                    medical: 8,
+                    ..Inventory::default()
+                },
+                ..SoldierSpec::default()
+            },
+        );
+        let patient = spawn(&mut incapacitated_patient, SoldierSpec::default());
+        assert_eq!(
+            incapacitated_patient
+                .apply(Command::InflictWound {
+                    patient,
+                    wound: WoundSpec {
+                        trauma: 0,
+                        bleeding_per_second: 0,
+                        shock: INCAPACITATED_SHOCK as u16,
+                    },
+                })
+                .events,
+            vec![TimedEvent {
+                at: 0,
+                event: Event::WoundInflicted {
+                    id: WoundId(0),
+                    patient,
+                    wound: WoundSpec {
+                        trauma: 0,
+                        bleeding_per_second: 0,
+                        shock: INCAPACITATED_SHOCK as u16,
+                    },
+                },
+            }]
+        );
+        let target = match incapacitated_patient
+            .apply(Command::InflictWound {
+                patient,
+                wound: WoundSpec {
+                    trauma: 1,
+                    bleeding_per_second: 2,
+                    shock: 0,
+                },
+            })
+            .events[0]
+            .event
+        {
+            Event::WoundInflicted { id, .. } => id,
+            _ => unreachable!(),
+        };
+        let treatment = match incapacitated_patient
+            .apply(Command::StartTreatment {
+                medic,
+                patient,
+                wound: Some(target),
+                kind: TreatmentKind::Hemostatic,
+            })
+            .events[0]
+            .event
+        {
+            Event::TreatmentStarted { id, .. } => id,
+            _ => unreachable!(),
+        };
+        assert!(incapacitated_patient.is_incapacitated(patient));
+        assert!(!incapacitated_patient.is_incapacitated(medic));
+        assert_eq!(
+            incapacitated_patient.treatments[&treatment].status,
+            TreatmentStatus::Active
+        );
+        assert_eq!(incapacitated_patient.active_by_entity.len(), 2);
+        assert_eq!(
+            incapacitated_patient.due_by_treatment[&treatment],
+            HEMOSTATIC_DURATION
+        );
+        assert_eq!(
+            incapacitated_patient.treatment_due[&HEMOSTATIC_DURATION],
+            BTreeSet::from([treatment])
+        );
+        assert_eq!(incapacitated_patient.resource_totals().sourced_medical, 8);
+        assert_eq!(incapacitated_patient.resource_totals().carried_medical, 7);
+        assert_eq!(incapacitated_patient.resource_totals().consumed_medical, 1);
+        canonical_bytes(&incapacitated_patient);
+
+        // Hemostasis requires a present, owned, uncontrolled and unhealed target.
+        let (active, medic, patient, wound, treatment) = gate_c1_active_world();
+        let assert_active_control =
+            |world: &World, kind: TreatmentKind, target: Option<WoundId>| {
+                let record = world.treatments[&treatment];
+                assert_eq!(record.id, treatment);
+                assert_eq!(record.medic, medic);
+                assert_eq!(record.patient, patient);
+                assert_eq!(record.kind, kind);
+                assert_eq!(record.wound, target);
+                assert_eq!(record.status, TreatmentStatus::Active);
+                assert_eq!(record.started_at, 0);
+                assert!(record.completes_at > world.clock);
+                assert_eq!(world.soldiers.data[medic.index()].role, Role::Medic);
+                assert_eq!(world.soldiers.living[medic.index()].life, LifeState::Alive);
+                assert_eq!(
+                    world.soldiers.living[patient.index()].life,
+                    LifeState::Alive
+                );
+                assert_eq!(
+                    world.soldiers.data[medic.index()].faction,
+                    world.soldiers.data[patient.index()].faction
+                );
+                assert_eq!(
+                    world.soldiers.data[medic.index()].position.cell,
+                    world.soldiers.data[patient.index()].position.cell
+                );
+                assert!(!world.is_incapacitated(medic));
+                assert!(!world.is_incapacitated(patient));
+                assert_eq!(
+                    world.active_by_entity,
+                    BTreeMap::from([(medic, treatment), (patient, treatment)])
+                );
+                assert_eq!(
+                    world.due_by_treatment.get(&treatment),
+                    Some(&record.completes_at)
+                );
+                assert_eq!(
+                    world.treatment_due.get(&record.completes_at),
+                    Some(&BTreeSet::from([treatment]))
+                );
+                assert_eq!(
+                    world.treatment_ids_by_entity.get(&medic),
+                    Some(&BTreeSet::from([treatment]))
+                );
+                assert_eq!(
+                    world.treatment_ids_by_entity.get(&patient),
+                    Some(&BTreeSet::from([treatment]))
+                );
+                let totals = world.resource_totals();
+                assert_eq!(totals.sourced_medical, 8);
+                assert_eq!(
+                    totals.sourced_medical,
+                    totals.carried_medical + totals.consumed_medical + totals.lost_medical
+                );
+            };
+        assert_active_control(&active, TreatmentKind::Hemostatic, Some(wound));
+        assert_eq!(active.wounds[&wound].patient, patient);
+        assert!(!active.wounds[&wound].controlled);
+        assert!(!active.wounds[&wound].healed);
+        assert!(wound.0 < active.next_wound_id);
+        let active_bytes = canonical_bytes(&active);
+        let active_layout = V7MedicalLayout::parse(&active_bytes);
+
+        let mut no_wound = active_bytes.clone();
+        let wound_payload = active_layout.treatments[0].wound.unwrap();
+        no_wound[active_layout.treatments[0].wound_option] = 0;
+        no_wound.drain(wound_payload..wound_payload + 8);
+        assert_snapshot_category(&no_wound, "treatment target");
+
+        let mut controlled = active_bytes.clone();
+        controlled[active_layout.wounds[0].controlled] = 1;
+        assert_snapshot_category(&controlled, "active treatment eligibility");
+
+        let (controlled_control, _, controlled_patient, controlled_wound, _) =
+            gate_c1_recovering_world();
+        assert!(controlled_control.wounds[&controlled_wound].controlled);
+        assert!(!controlled_control.wounds[&controlled_wound].healed);
+        assert_eq!(
+            controlled_control.wounds[&controlled_wound].patient,
+            controlled_patient
+        );
+        canonical_bytes(&controlled_control);
+
+        let mut healed_control = controlled_control;
+        let healed = healed_control.apply(Command::AdvanceTo { target: 20 });
+        assert!(healed.error.is_none());
+        assert!(healed_control.wounds[&controlled_wound].controlled);
+        assert!(healed_control.wounds[&controlled_wound].healed);
+        canonical_bytes(&healed_control);
+        let mut controlled_healed = active_bytes.clone();
+        controlled_healed[active_layout.wounds[0].controlled] = 1;
+        controlled_healed[active_layout.wounds[0].healed] = 1;
+        assert_snapshot_category(&controlled_healed, "active treatment eligibility");
+
+        // Shock care has no wound payload, even though its patient owns a valid wound.
+        let mut shock_world = World::new(104);
+        let shock_medic = spawn(
+            &mut shock_world,
+            SoldierSpec {
+                role: Role::Medic,
+                inventory: Inventory {
+                    medical: 8,
+                    ..Inventory::default()
+                },
+                ..SoldierSpec::default()
+            },
+        );
+        let shock_patient = spawn(&mut shock_world, SoldierSpec::default());
+        let shock_wound = match shock_world
+            .apply(Command::InflictWound {
+                patient: shock_patient,
+                wound: WoundSpec {
+                    trauma: 1,
+                    bleeding_per_second: 0,
+                    shock: 100,
+                },
+            })
+            .events[0]
+            .event
+        {
+            Event::WoundInflicted { id, .. } => id,
+            _ => unreachable!(),
+        };
+        let shock_treatment = match shock_world
+            .apply(Command::StartTreatment {
+                medic: shock_medic,
+                patient: shock_patient,
+                wound: None,
+                kind: TreatmentKind::Shock,
+            })
+            .events[0]
+            .event
+        {
+            Event::TreatmentStarted { id, .. } => id,
+            _ => unreachable!(),
+        };
+        assert!(shock_world
+            .apply(Command::AdvanceTo { target: 1 })
+            .error
+            .is_none());
+        assert_eq!(shock_world.treatments[&shock_treatment].wound, None);
+        assert_eq!(
+            shock_world.treatments[&shock_treatment].kind,
+            TreatmentKind::Shock
+        );
+        assert_eq!(
+            shock_world.treatments[&shock_treatment].status,
+            TreatmentStatus::Active
+        );
+        assert_eq!(
+            shock_world.treatments[&shock_treatment].consumed,
+            SHOCK_TREATMENT_COST
+        );
+        assert_eq!(
+            shock_world.treatments[&shock_treatment].completes_at,
+            SHOCK_TREATMENT_DURATION
+        );
+        assert!(shock_world.treatments[&shock_treatment].completes_at > shock_world.clock);
+        assert_eq!(shock_world.wounds[&shock_wound].patient, shock_patient);
+        assert!(shock_wound.0 < shock_world.next_wound_id);
+        assert_eq!(
+            shock_world.active_by_entity,
+            BTreeMap::from([
+                (shock_medic, shock_treatment),
+                (shock_patient, shock_treatment)
+            ])
+        );
+        assert_eq!(
+            shock_world.due_by_treatment[&shock_treatment],
+            SHOCK_TREATMENT_DURATION
+        );
+        assert_eq!(
+            shock_world.treatment_due[&SHOCK_TREATMENT_DURATION],
+            BTreeSet::from([shock_treatment])
+        );
+        assert_eq!(shock_world.resource_totals().sourced_medical, 8);
+        assert_eq!(shock_world.resource_totals().carried_medical, 6);
+        assert_eq!(shock_world.resource_totals().consumed_medical, 2);
+        let shock_bytes = canonical_bytes(&shock_world);
+        let shock_layout = V7MedicalLayout::parse(&shock_bytes);
+        let option = shock_layout.treatments[0].wound_option;
+        let mut shock_with_wound = Vec::with_capacity(shock_bytes.len() + 8);
+        shock_with_wound.extend_from_slice(&shock_bytes[..option]);
+        shock_with_wound.push(1);
+        shock_with_wound.extend_from_slice(&shock_wound.0.to_le_bytes());
+        shock_with_wound.extend_from_slice(&shock_bytes[option + 1..]);
+        assert_snapshot_category(&shock_with_wound, "treatment target");
+
+        // Equality is reachable; creation one second after treatment start is not.
+        // A hot public advance materializes casualty authority to second one while
+        // leaving the absolute treatment deadline in the future.
+        let mut timed = World::new(105);
+        let timed_medic = spawn(
+            &mut timed,
+            SoldierSpec {
+                role: Role::Medic,
+                inventory: Inventory {
+                    medical: 8,
+                    ..Inventory::default()
+                },
+                ..SoldierSpec::default()
+            },
+        );
+        let timed_patient = spawn(&mut timed, SoldierSpec::default());
+        assert!(timed
+            .apply(Command::SetRegionHot { cell: 0, hot: true })
+            .error
+            .is_none());
+        let timed_wound = match timed
+            .apply(Command::InflictWound {
+                patient: timed_patient,
+                wound: WoundSpec {
+                    trauma: 4,
+                    bleeding_per_second: 2,
+                    shock: 1,
+                },
+            })
+            .events[0]
+            .event
+        {
+            Event::WoundInflicted { id, .. } => id,
+            _ => unreachable!(),
+        };
+        let timed_treatment = match timed
+            .apply(Command::StartTreatment {
+                medic: timed_medic,
+                patient: timed_patient,
+                wound: Some(timed_wound),
+                kind: TreatmentKind::Hemostatic,
+            })
+            .events[0]
+            .event
+        {
+            Event::TreatmentStarted { id, .. } => id,
+            _ => unreachable!(),
+        };
+        assert!(timed
+            .apply(Command::AdvanceTo { target: 1 })
+            .error
+            .is_none());
+        assert_eq!(
+            timed.wounds[&timed_wound].created_at,
+            timed.treatments[&timed_treatment].started_at
+        );
+        assert_eq!(timed.wounds[&timed_wound].created_at, 0);
+        assert_eq!(timed.clock, 1);
+        assert_eq!(timed.casualty[&timed_patient].materialized_at, 1);
+        assert_eq!(
+            timed.soldiers.living[timed_patient.index()].materialized_at,
+            1
+        );
+        assert_eq!(timed.wounds[&timed_wound].patient, timed_patient);
+        assert!(timed_wound.0 < timed.next_wound_id);
+        assert!(!timed.wounds[&timed_wound].controlled);
+        assert!(!timed.wounds[&timed_wound].healed);
+        assert_eq!(
+            timed.treatments[&timed_treatment].kind,
+            TreatmentKind::Hemostatic
+        );
+        assert_eq!(timed.treatments[&timed_treatment].wound, Some(timed_wound));
+        assert_eq!(
+            timed.treatments[&timed_treatment].status,
+            TreatmentStatus::Active
+        );
+        assert_eq!(timed.treatments[&timed_treatment].consumed, HEMOSTATIC_COST);
+        assert_eq!(timed.treatments[&timed_treatment].started_at, 0);
+        assert_eq!(
+            timed.treatments[&timed_treatment].completes_at,
+            HEMOSTATIC_DURATION
+        );
+        assert!(timed.treatments[&timed_treatment].completes_at > timed.clock);
+        assert_eq!(
+            timed.active_by_entity,
+            BTreeMap::from([
+                (timed_medic, timed_treatment),
+                (timed_patient, timed_treatment)
+            ])
+        );
+        assert_eq!(
+            timed.due_by_treatment[&timed_treatment],
+            HEMOSTATIC_DURATION
+        );
+        assert_eq!(
+            timed.treatment_due[&HEMOSTATIC_DURATION],
+            BTreeSet::from([timed_treatment])
+        );
+        assert_eq!(timed.resource_totals().sourced_medical, 8);
+        assert_eq!(timed.resource_totals().carried_medical, 7);
+        assert_eq!(timed.resource_totals().consumed_medical, 1);
+        let timed_bytes = canonical_bytes(&timed);
+        let timed_layout = V7MedicalLayout::parse(&timed_bytes);
+        let mut after_start = timed_bytes.clone();
+        put_u64(&mut after_start, timed_layout.wounds[0].created_at, 1);
+        assert_eq!(1, timed.treatments[&timed_treatment].started_at + 1);
+        assert!(1 <= timed.clock);
+        assert!(1 <= timed.casualty[&timed_patient].materialized_at);
+        assert_snapshot_category(&after_start, "treatment target time");
+    }
+
+    #[test]
     fn gate_c1_all_six_death_causes_preserve_medical_history() {
         fn history_world(food: u32, water: u32) -> (World, EntityId, WoundId, TreatmentId) {
             let mut world = World::new(91);
