@@ -9069,24 +9069,188 @@ mod private_invariants {
             Some(&BTreeSet::from([medic, patient]))
         );
 
-        for (hot, fixed) in [(true, 0), (false, 0), (true, 0), (false, 0)] {
-            assert_eq!(
-                world.apply(Command::SetRegionHot { cell: 0, hot }).events,
-                vec![TimedEvent {
-                    at: 0,
-                    event: Event::RegionFidelityChanged {
-                        cell: 0,
-                        hot,
-                        fixed_steps: fixed
-                    }
-                }]
-            );
-            assert_eq!(world.treatments[&TreatmentId(0)].completes_at, 10);
-            assert_eq!(
-                world.due_by_treatment,
-                BTreeMap::from([(TreatmentId(0), 10)])
-            );
-        }
+        let assert_active =
+            |world: &World, hot: bool, activated_at: u64, fixed_steps: u64, hot_steps: u64| {
+                assert_eq!(world.treatments[&TreatmentId(0)].id, TreatmentId(0));
+                assert_eq!(world.treatments[&TreatmentId(0)].started_at, 0);
+                assert_eq!(world.treatments[&TreatmentId(0)].completes_at, 10);
+                assert_eq!(
+                    world.treatments[&TreatmentId(0)].status,
+                    TreatmentStatus::Active
+                );
+                assert_eq!(world.next_treatment_id, 1);
+                assert_eq!(world.consumed_medical, 1);
+                assert_eq!(world.soldiers.data[medic.index()].inventory.medical, 0);
+                assert_eq!(
+                    world.active_by_entity,
+                    BTreeMap::from([(medic, TreatmentId(0)), (patient, TreatmentId(0))])
+                );
+                assert_eq!(
+                    world.treatment_due,
+                    BTreeMap::from([(10, BTreeSet::from([TreatmentId(0)]))])
+                );
+                assert_eq!(
+                    world.due_by_treatment,
+                    BTreeMap::from([(TreatmentId(0), 10)])
+                );
+                assert_eq!(world.hot_member_steps, hot_steps);
+                if hot {
+                    assert_eq!(
+                        world.hot_cells,
+                        BTreeMap::from([(
+                            0,
+                            HotCellState {
+                                activated_at,
+                                last_stepped_at: world.clock,
+                                fixed_steps,
+                            },
+                        )])
+                    );
+                    assert!(!world.due_by_entity.contains_key(&medic));
+                    assert!(!world.due_by_entity.contains_key(&patient));
+                    assert!(world
+                        .living_due
+                        .values()
+                        .all(|ids| !ids.contains(&medic) && !ids.contains(&patient)));
+                } else {
+                    assert!(world.hot_cells.is_empty());
+                    assert_eq!(world.due_by_entity.get(&medic), Some(&400));
+                    assert_eq!(world.due_by_entity.get(&patient), Some(&400));
+                    assert_eq!(
+                        world.living_due.get(&400),
+                        Some(&BTreeSet::from([medic, patient]))
+                    );
+                }
+            };
+
+        assert_eq!(
+            world
+                .apply(Command::SetRegionHot { cell: 0, hot: true })
+                .events,
+            vec![TimedEvent {
+                at: 0,
+                event: Event::RegionFidelityChanged {
+                    cell: 0,
+                    hot: true,
+                    fixed_steps: 0
+                }
+            }]
+        );
+        assert_active(&world, true, 0, 0, 0);
+        assert_eq!(
+            world.apply(Command::AdvanceTo { target: 2 }).events,
+            vec![TimedEvent {
+                at: 2,
+                event: Event::TimeAdvanced {
+                    from: 0,
+                    to: 2,
+                    hot_cells_stepped: 1,
+                    fixed_steps_per_hot_cell: 2
+                }
+            }]
+        );
+        assert_active(&world, true, 0, 2, 4);
+        assert_eq!(
+            world
+                .apply(Command::SetRegionHot {
+                    cell: 0,
+                    hot: false
+                })
+                .events,
+            vec![TimedEvent {
+                at: 2,
+                event: Event::RegionFidelityChanged {
+                    cell: 0,
+                    hot: false,
+                    fixed_steps: 2
+                }
+            }]
+        );
+        assert_active(&world, false, 0, 0, 4);
+        assert_eq!(
+            world.apply(Command::AdvanceTo { target: 5 }).events,
+            vec![TimedEvent {
+                at: 5,
+                event: Event::TimeAdvanced {
+                    from: 2,
+                    to: 5,
+                    hot_cells_stepped: 0,
+                    fixed_steps_per_hot_cell: 0
+                }
+            }]
+        );
+        assert_active(&world, false, 0, 0, 4);
+        assert_eq!(
+            world
+                .apply(Command::SetRegionHot { cell: 0, hot: true })
+                .events,
+            vec![TimedEvent {
+                at: 5,
+                event: Event::RegionFidelityChanged {
+                    cell: 0,
+                    hot: true,
+                    fixed_steps: 0
+                }
+            }]
+        );
+        assert_active(&world, true, 5, 0, 4);
+        assert_eq!(
+            world.apply(Command::AdvanceTo { target: 8 }).events,
+            vec![TimedEvent {
+                at: 8,
+                event: Event::TimeAdvanced {
+                    from: 5,
+                    to: 8,
+                    hot_cells_stepped: 1,
+                    fixed_steps_per_hot_cell: 3
+                }
+            }]
+        );
+        assert_active(&world, true, 5, 3, 10);
+        assert_eq!(
+            world
+                .apply(Command::SetRegionHot {
+                    cell: 0,
+                    hot: false
+                })
+                .events,
+            vec![TimedEvent {
+                at: 8,
+                event: Event::RegionFidelityChanged {
+                    cell: 0,
+                    hot: false,
+                    fixed_steps: 3
+                }
+            }]
+        );
+        assert_active(&world, false, 0, 0, 10);
+        assert_eq!(
+            world.apply(Command::AdvanceTo { target: 9 }).events,
+            vec![TimedEvent {
+                at: 9,
+                event: Event::TimeAdvanced {
+                    from: 8,
+                    to: 9,
+                    hot_cells_stepped: 0,
+                    fixed_steps_per_hot_cell: 0
+                }
+            }]
+        );
+        assert_active(&world, false, 0, 0, 10);
+        assert_eq!(
+            world
+                .apply(Command::SetRegionHot { cell: 0, hot: true })
+                .events,
+            vec![TimedEvent {
+                at: 9,
+                event: Event::RegionFidelityChanged {
+                    cell: 0,
+                    hot: true,
+                    fixed_steps: 0
+                }
+            }]
+        );
+        assert_active(&world, true, 9, 0, 10);
         assert_eq!(
             world.apply(Command::AdvanceTo { target: 10 }).events,
             vec![
@@ -9111,14 +9275,22 @@ mod private_invariants {
                 TimedEvent {
                     at: 10,
                     event: Event::TimeAdvanced {
-                        from: 0,
+                        from: 9,
                         to: 10,
-                        hot_cells_stepped: 0,
-                        fixed_steps_per_hot_cell: 0
+                        hot_cells_stepped: 1,
+                        fixed_steps_per_hot_cell: 1
                     }
                 },
             ]
         );
+        assert_eq!(world.hot_member_steps, 12);
+        assert_eq!(world.hot_cells[&0].fixed_steps, 1);
+        assert_eq!(world.hot_cells[&0].last_stepped_at, 10);
+        assert!(world.active_by_entity.is_empty());
+        assert!(world.treatment_due.is_empty());
+        assert!(world.due_by_treatment.is_empty());
+        assert!(!world.due_by_entity.contains_key(&medic));
+        assert!(!world.due_by_entity.contains_key(&patient));
         assert_eq!(world.casualty[&patient].recovery_next_at, Some(15));
         assert_eq!(world.next_treatment_id, 1);
         assert_eq!(world.consumed_medical, 1);
@@ -9126,7 +9298,7 @@ mod private_invariants {
         assert_eq!(world.treatments[&TreatmentId(0)].completes_at, 10);
         assert_eq!(world.soldiers.data[medic.index()].inventory.medical, 0);
 
-        for hot in [true, false, true, false] {
+        for (hot, fixed_steps) in [(false, 1), (true, 0), (false, 0)] {
             let outcome = world.apply(Command::SetRegionHot { cell: 0, hot });
             assert_eq!(
                 outcome.events,
@@ -9135,15 +9307,32 @@ mod private_invariants {
                     event: Event::RegionFidelityChanged {
                         cell: 0,
                         hot,
-                        fixed_steps: 0
+                        fixed_steps
                     }
                 }]
             );
             assert_eq!(world.casualty[&patient].recovery_next_at, Some(15));
+            assert_eq!(world.hot_member_steps, 12);
+            assert_eq!(
+                world.treatments[&TreatmentId(0)].status,
+                TreatmentStatus::Completed { at: 10 }
+            );
+            assert!(world.active_by_entity.is_empty());
+            assert!(world.treatment_due.is_empty());
+            assert!(world.due_by_treatment.is_empty());
             if hot {
+                assert_eq!(world.hot_cells[&0].activated_at, 10);
+                assert_eq!(world.hot_cells[&0].last_stepped_at, 10);
+                assert_eq!(world.hot_cells[&0].fixed_steps, 0);
+                assert!(!world.due_by_entity.contains_key(&medic));
                 assert!(!world.due_by_entity.contains_key(&patient));
+                assert!(world.living_due.is_empty());
             } else {
+                assert!(world.hot_cells.is_empty());
+                assert_eq!(world.due_by_entity.get(&medic), Some(&400));
                 assert_eq!(world.due_by_entity.get(&patient), Some(&15));
+                assert_eq!(world.living_due.get(&15), Some(&BTreeSet::from([patient])));
+                assert_eq!(world.living_due.get(&400), Some(&BTreeSet::from([medic])));
             }
         }
         let at_15 = world.apply(Command::AdvanceTo { target: 15 });
@@ -9173,7 +9362,10 @@ mod private_invariants {
                 },
             ]
         );
+        assert_eq!(world.hot_member_steps, 12);
         assert_eq!(world.casualty[&patient].recovery_next_at, Some(20));
+        assert_eq!(world.due_by_entity.get(&patient), Some(&20));
+        assert_eq!(world.living_due.get(&20), Some(&BTreeSet::from([patient])));
         assert_eq!(
             world
                 .apply(Command::SetRegionHot { cell: 0, hot: true })
@@ -9187,6 +9379,9 @@ mod private_invariants {
                 }
             }]
         );
+        assert_eq!(world.hot_cells[&0].activated_at, 15);
+        assert_eq!(world.hot_cells[&0].fixed_steps, 0);
+        assert!(world.living_due.is_empty());
         assert_eq!(
             world.apply(Command::AdvanceTo { target: 20 }).events,
             vec![
@@ -9213,6 +9408,10 @@ mod private_invariants {
                 },
             ]
         );
+        assert_eq!(world.hot_member_steps, 22);
+        assert_eq!(world.hot_cells[&0].fixed_steps, 5);
+        assert_eq!(world.hot_cells[&0].last_stepped_at, 20);
+        assert_eq!(world.casualty[&patient].recovery_next_at, Some(25));
         assert_eq!(
             world
                 .apply(Command::SetRegionHot {
@@ -9229,6 +9428,10 @@ mod private_invariants {
                 }
             }]
         );
+        assert_eq!(world.hot_member_steps, 22);
+        assert_eq!(world.due_by_entity.get(&patient), Some(&25));
+        assert_eq!(world.living_due.get(&25), Some(&BTreeSet::from([patient])));
+        assert_eq!(world.due_by_entity.get(&medic), Some(&400));
         let healed = world.apply(Command::AdvanceTo { target: 40 });
         assert_eq!(
             healed.events,
@@ -9303,13 +9506,22 @@ mod private_invariants {
                 }
             }]
         );
-        let later = world.apply(Command::AdvanceTo { target: 45 });
-        assert!(!later.events.iter().any(|e| matches!(
-            e.event,
-            Event::TreatmentCompleted { .. }
-                | Event::RecoveryTicked { .. }
-                | Event::WoundHealed { .. }
-        )));
+        assert_eq!(
+            world.apply(Command::AdvanceTo { target: 45 }).events,
+            vec![TimedEvent {
+                at: 45,
+                event: Event::TimeAdvanced {
+                    from: 40,
+                    to: 45,
+                    hot_cells_stepped: 0,
+                    fixed_steps_per_hot_cell: 0
+                }
+            }]
+        );
+        assert_eq!(world.hot_member_steps, 22);
+        assert!(world.active_by_entity.is_empty());
+        assert!(world.treatment_due.is_empty());
+        assert!(world.due_by_treatment.is_empty());
     }
 
     #[test]
@@ -9486,8 +9698,8 @@ mod private_invariants {
         let control_out = control.apply(Command::AdvanceTo { target: base + 2 });
         assert_eq!(control_out.error, None);
         assert_eq!(
-            control_out.events[..3],
-            [
+            control_out.events,
+            vec![
                 TimedEvent {
                     at: base + 1,
                     event: Event::RecoveryTicked {
@@ -9516,17 +9728,73 @@ mod private_invariants {
                         next_at: None
                     }
                 },
+                TimedEvent {
+                    at: base + 2,
+                    event: Event::TreatmentInterrupted {
+                        id: treatment,
+                        reason: InterruptionReason::Ineligible
+                    }
+                },
+                TimedEvent {
+                    at: base + 2,
+                    event: Event::TimeAdvanced {
+                        from: base,
+                        to: base + 2,
+                        hot_cells_stepped: 0,
+                        fixed_steps_per_hot_cell: 0
+                    }
+                },
             ]
         );
-        assert!(control_out.events.contains(&TimedEvent {
-            at: base + 2,
-            event: Event::TreatmentInterrupted {
-                id: treatment,
+        assert!(control.wounds[&controlled].healed);
+        assert!(!control.casualty[&healing].recovering);
+        assert_eq!(control.casualty[&healing].recovery_next_at, None);
+        assert_eq!(
+            control.treatments[&treatment].status,
+            TreatmentStatus::Interrupted {
+                at: base + 2,
                 reason: InterruptionReason::Ineligible
             }
-        }));
+        );
+        assert!(!control.active_by_entity.contains_key(&busy));
+        assert!(!control.active_by_entity.contains_key(&patient));
+        assert!(!control.due_by_treatment.contains_key(&treatment));
+        assert!(control
+            .treatment_due
+            .values()
+            .all(|ids| !ids.contains(&treatment)));
+        assert_eq!(
+            control.treatment_ids_by_entity.get(&busy),
+            Some(&BTreeSet::from([treatment]))
+        );
+        assert_eq!(
+            control.treatment_ids_by_entity.get(&patient),
+            Some(&BTreeSet::from([treatment]))
+        );
         assert!(!control.availability_by_medic.contains_key(&leaving));
-        assert!(control.availability_by_medic.contains_key(&busy));
+        assert!(control
+            .available_medics
+            .values()
+            .all(|ids| !ids.contains(&leaving)));
+        let freed_keys = BTreeSet::from([(0, 0, 1)]);
+        assert_eq!(control.availability_by_medic.get(&busy), Some(&freed_keys));
+        assert_eq!(
+            control.available_medics.get(&(0, 0, 1)),
+            Some(&BTreeSet::from([busy]))
+        );
+        assert_eq!(
+            (
+                control.cold_boundaries,
+                control.hot_member_steps,
+                control.automatic_journal_visits,
+                control.automatic_execution_visits,
+                control.medical_entity_candidates,
+                control.wound_index_visits,
+                control.treatment_completion_candidates,
+                control.selection_candidates,
+            ),
+            (3, 0, 3, 3, 3, 0, 0, 0)
+        );
 
         let outcome = world.apply(Command::AdvanceTo { target: u64::MAX });
         assert_eq!(outcome.error, Some(SimError::ArithmeticOverflow));
