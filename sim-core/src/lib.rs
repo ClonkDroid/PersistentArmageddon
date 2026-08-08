@@ -524,8 +524,12 @@ impl World {
         } else {
             d = 1;
         }
-        if l.activity == Activity::March && l.fatigue < FORCED_IDLE_FATIGUE {
-            d = d.min(ceil(FORCED_IDLE_FATIGUE - l.fatigue, 3));
+        if l.activity == Activity::March {
+            d = d.min(if l.fatigue >= FORCED_IDLE_FATIGUE {
+                1
+            } else {
+                ceil(FORCED_IDLE_FATIGUE - l.fatigue, 3)
+            });
         }
         Ok(l.materialized_at.checked_add(d))
     }
@@ -1806,6 +1810,14 @@ impl World {
                 {
                     return Err(SimError::Snapshot("living timestamp"));
                 }
+                if living.life == LifeState::Alive
+                    && self
+                        .hot_cells
+                        .contains_key(&self.soldiers.data[i].position.cell)
+                    && living.materialized_at != self.clock
+                {
+                    return Err(SimError::Snapshot("hot living materialization"));
+                }
                 if let Some(q) = self.soldiers.data[i].squad {
                     let id = EntityId::from_parts(i as u32, self.soldiers.generation[i]);
                     if !self.squads.get(&q).is_some_and(|q| q.members.contains(&id)) {
@@ -2130,6 +2142,213 @@ mod private_invariants {
             Event::SoldierSpawned { id, .. } => id,
             _ => unreachable!(),
         }
+    }
+
+    #[test]
+    fn already_fatigued_marchers_force_idle_next_second_on_each_path() {
+        for fatigue in [FORCED_IDLE_FATIGUE, FORCED_IDLE_FATIGUE + 1] {
+            for hot in [false, true] {
+                let mut world = World::new(0);
+                let id = spawn(
+                    &mut world,
+                    SoldierSpec {
+                        inventory: Inventory {
+                            food: 100,
+                            water: 100,
+                            medical: 7,
+                        },
+                        ammunition: 11,
+                        ..SoldierSpec::default()
+                    },
+                );
+                assert!(world
+                    .apply(Command::AdvanceTo { target: 900 })
+                    .error
+                    .is_none());
+                world.soldiers.living[id.index()].fatigue = fatigue;
+                world.schedule_due(id).unwrap();
+                if hot {
+                    assert!(world
+                        .apply(Command::SetRegionHot { cell: 0, hot: true })
+                        .error
+                        .is_none());
+                }
+                let changed = world.apply(Command::SetActivity {
+                    id,
+                    activity: Activity::March,
+                });
+                assert_eq!(
+                    changed.events,
+                    vec![TimedEvent {
+                        at: 900,
+                        event: Event::ActivityChanged {
+                            id,
+                            before: Activity::Idle,
+                            after: Activity::March,
+                            forced: false,
+                        },
+                    }]
+                );
+                if hot {
+                    assert!(!world.due_by_entity.contains_key(&id));
+                } else {
+                    assert_eq!(world.due_by_entity.get(&id), Some(&901));
+                }
+
+                let checkpoint = world.snapshot();
+                let mut restored = World::from_snapshot(&checkpoint).unwrap();
+                let expected_events = vec![
+                    TimedEvent {
+                        at: 901,
+                        event: Event::ActivityChanged {
+                            id,
+                            before: Activity::March,
+                            after: Activity::Idle,
+                            forced: true,
+                        },
+                    },
+                    TimedEvent {
+                        at: 901,
+                        event: Event::TimeAdvanced {
+                            from: 900,
+                            to: 901,
+                            hot_cells_stepped: u64::from(hot),
+                            fixed_steps_per_hot_cell: u64::from(hot),
+                        },
+                    },
+                ];
+                for candidate in [&mut world, &mut restored] {
+                    let outcome = candidate.apply(Command::AdvanceTo { target: 901 });
+                    assert_eq!(outcome.error, None);
+                    assert_eq!(outcome.events, expected_events);
+                    assert_eq!(
+                        candidate.soldier(id),
+                        Some(Soldier {
+                            id,
+                            faction: 0,
+                            position: Position::default(),
+                            squad: None,
+                            role: Role::Rifle,
+                            rank: 0,
+                            health: 1000,
+                            needs: Needs {
+                                fatigue: fatigue + 3,
+                                hunger: 2,
+                                thirst: 3,
+                                sleep_debt: 902,
+                            },
+                            ammunition: 11,
+                            inventory: Inventory {
+                                food: 91,
+                                water: 82,
+                                medical: 7,
+                            },
+                            living: LivingState {
+                                hunger: 2,
+                                thirst: 3,
+                                fatigue: fatigue + 3,
+                                sleep_debt: 902,
+                                morale: 1000,
+                                health: 1000,
+                                activity: Activity::Idle,
+                                life: LifeState::Alive,
+                                materialized_at: 901,
+                            },
+                        })
+                    );
+                    assert_eq!(
+                        candidate.resource_totals(),
+                        ResourceTotals {
+                            ammunition: 11,
+                            stockpile_supplies: 0,
+                            carried_food: 91,
+                            carried_water: 82,
+                            carried_medical: 7,
+                            sourced_food: 100,
+                            sourced_water: 100,
+                            consumed_food: 9,
+                            consumed_water: 18,
+                            lost_food: 0,
+                            lost_water: 0,
+                        }
+                    );
+                    assert_eq!(
+                        candidate.living_work_counters(),
+                        if hot { (18, 1) } else { (19, 0) }
+                    );
+                }
+                assert_eq!(world.snapshot(), restored.snapshot());
+            }
+        }
+    }
+
+    #[test]
+    fn v6_hot_living_materialization_must_equal_clock() {
+        const MATERIALIZED_AT: usize = 214;
+        let mut hot = World::new(0);
+        assert!(hot
+            .apply(Command::SetRegionHot { cell: 0, hot: true })
+            .error
+            .is_none());
+        let _id = spawn(&mut hot, SoldierSpec::default());
+        assert!(hot.apply(Command::AdvanceTo { target: 10 }).error.is_none());
+        let canonical = hot.snapshot();
+        let mut resumed = World::from_snapshot(&canonical).unwrap();
+        let uninterrupted = hot.apply(Command::AdvanceTo { target: 11 });
+        let resumed_outcome = resumed.apply(Command::AdvanceTo { target: 11 });
+        assert_eq!(uninterrupted, resumed_outcome);
+        assert_eq!(hot.snapshot(), resumed.snapshot());
+
+        let mut stale = canonical.clone();
+        overwrite(&mut stale, MATERIALIZED_AT, 9_u64.to_le_bytes());
+        assert_eq!(
+            World::from_snapshot(&stale).err(),
+            Some(SimError::Snapshot("hot living materialization"))
+        );
+
+        let mut cold = World::new(0);
+        let cold_id = spawn(&mut cold, SoldierSpec::default());
+        assert!(cold
+            .apply(Command::AdvanceTo { target: 10 })
+            .error
+            .is_none());
+        assert_eq!(cold.soldiers.living[cold_id.index()].materialized_at, 0);
+        assert!(World::from_snapshot(&cold.snapshot()).is_ok());
+
+        let mut dead_hot = World::new(0);
+        assert!(dead_hot
+            .apply(Command::SetRegionHot { cell: 0, hot: true })
+            .error
+            .is_none());
+        let dead = spawn(
+            &mut dead_hot,
+            SoldierSpec {
+                health: 10,
+                ..SoldierSpec::default()
+            },
+        );
+        dead_hot.soldiers.living[dead.index()].thirst = SEVERE_THIRST;
+        assert!(dead_hot
+            .apply(Command::AdvanceTo { target: 10 })
+            .error
+            .is_none());
+        assert_eq!(dead_hot.soldiers.living[dead.index()].materialized_at, 1);
+        let steps = dead_hot.living_work_counters();
+        let mut dead_restored = World::from_snapshot(&dead_hot.snapshot()).unwrap();
+        let outcome = dead_restored.apply(Command::AdvanceTo { target: 11 });
+        assert_eq!(outcome.error, None);
+        assert_eq!(dead_restored.living_work_counters(), steps);
+        assert_eq!(
+            dead_restored.soldiers.living[dead.index()].materialized_at,
+            1
+        );
+        assert!(outcome.events.iter().all(|event| !matches!(
+            event.event,
+            Event::RationConsumed { .. }
+                | Event::ActivityChanged { forced: true, .. }
+                | Event::LivingDeteriorated { .. }
+                | Event::SoldierDied { .. }
+        )));
     }
 
     #[test]
@@ -3075,6 +3294,7 @@ mod private_invariants {
                 "hot_activated_after_last" | "hot_last_not_clock" | "hot_fixed_step_mismatch" => {
                     "hot cell"
                 }
+                "hot_alive_stale_materialization" => "hot living materialization",
                 "invalid_death_cause" => "death cause",
                 "death_time_mismatch" | "dead_materialization_mismatch" | "dead_nonzero_health" => {
                     "death state"
@@ -3181,6 +3401,22 @@ mod private_invariants {
             "hot_entity_due_entry",
             hot_due,
             expected("hot_entity_due_entry"),
+        ));
+        let mut hot_at_ten = hot;
+        assert!(hot_at_ten
+            .apply(Command::AdvanceTo { target: 10 })
+            .error
+            .is_none());
+        let mut stale_hot_living = hot_at_ten.snapshot();
+        overwrite(
+            &mut stale_hot_living,
+            MATERIALIZED_ALIVE,
+            9_u64.to_le_bytes(),
+        );
+        cases.push((
+            "hot_alive_stale_materialization",
+            stale_hot_living,
+            expected("hot_alive_stale_materialization"),
         ));
 
         let mut dead = World::new(7);
