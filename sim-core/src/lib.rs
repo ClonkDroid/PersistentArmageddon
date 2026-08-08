@@ -12779,6 +12779,48 @@ mod private_invariants {
             bytes
         }
 
+        fn encoded_u64(bytes: &[u8], at: usize) -> u64 {
+            u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap())
+        }
+
+        fn assert_recomposed_active_record(
+            bytes: &[u8],
+            expected: (
+                TreatmentId,
+                EntityId,
+                EntityId,
+                Option<WoundId>,
+                TreatmentKind,
+            ),
+        ) {
+            let layout = V7MedicalLayout::parse(bytes);
+            assert_eq!(layout.treatments.len(), 1);
+            let record = &layout.treatments[0];
+            let (id, medic, patient, wound, kind) = expected;
+            assert_eq!(encoded_u64(bytes, record.id), id.0);
+            assert_eq!(encoded_u64(bytes, record.medic), medic.raw());
+            assert_eq!(encoded_u64(bytes, record.patient), patient.raw());
+            assert_eq!(bytes[record.wound_option], u8::from(wound.is_some()));
+            assert_eq!(
+                record.wound.map(|at| WoundId(encoded_u64(bytes, at))),
+                wound
+            );
+            assert_eq!(bytes[record.kind], kind as u8);
+            assert_eq!(encoded_u64(bytes, record.started_at), 0);
+            assert_eq!(
+                encoded_u64(bytes, record.completes_at),
+                match kind {
+                    TreatmentKind::Hemostatic => HEMOSTATIC_DURATION,
+                    TreatmentKind::Shock => SHOCK_TREATMENT_DURATION,
+                }
+            );
+            assert_eq!(bytes[record.status], 0);
+            assert_eq!(record.status_at, None);
+            assert_eq!(record.reason, None);
+            assert_eq!(record.range.end, layout.end);
+            assert_eq!(layout.end, bytes.len());
+        }
+
         fn assert_retained_treatment(
             world: &World,
             ids: (EntityId, EntityId, WoundId, TreatmentId),
@@ -12790,6 +12832,7 @@ mod private_invariants {
             let (expected_life, expected_incapacitated) = endpoint_state;
             let record = world.treatments[&treatment];
             assert_eq!(record.id, treatment);
+            assert!(treatment.0 < world.next_treatment_id);
             assert_eq!(record.medic, medic);
             assert_eq!(record.patient, patient);
             assert_eq!(record.wound, Some(wound));
@@ -12809,6 +12852,20 @@ mod private_invariants {
             assert_eq!(world.soldiers.living[endpoint.index()].life, expected_life);
             assert_eq!(world.is_incapacitated(endpoint), expected_incapacitated);
             assert_eq!(world.soldiers.data[medic.index()].role, Role::Medic);
+            assert_eq!(
+                world.soldiers.living[medic.index()].activity,
+                Activity::Idle
+            );
+            assert_eq!(
+                world.soldiers.living[patient.index()].activity,
+                Activity::Idle
+            );
+            let unaffected = if endpoint == medic { patient } else { medic };
+            assert_eq!(
+                world.soldiers.living[unaffected.index()].life,
+                LifeState::Alive
+            );
+            assert!(!world.is_incapacitated(unaffected));
             assert!(world.medic_index[&(
                 world.soldiers.data[medic.index()].faction,
                 world.soldiers.data[medic.index()].position.cell
@@ -12824,6 +12881,8 @@ mod private_invariants {
                 world.soldiers.data[patient.index()].position.cell
             );
             assert_eq!(world.wounds[&wound].patient, patient);
+            assert!(world.casualty.contains_key(&patient));
+            assert!(world.wounds[&wound].created_at <= world.casualty[&patient].materialized_at);
             assert!(!world.wounds[&wound].controlled);
             assert!(!world.wounds[&wound].healed);
             assert!(world.wounds[&wound].created_at <= record.started_at);
@@ -13048,11 +13107,82 @@ mod private_invariants {
         };
         assert!(incapacitated_patient.is_incapacitated(patient));
         assert!(!incapacitated_patient.is_incapacitated(medic));
+        assert_ne!(medic, patient);
+        assert_eq!(
+            incapacitated_patient.soldiers.data[medic.index()].role,
+            Role::Medic
+        );
+        assert_eq!(
+            incapacitated_patient.soldiers.living[medic.index()].life,
+            LifeState::Alive
+        );
+        assert_eq!(
+            incapacitated_patient.soldiers.living[patient.index()].life,
+            LifeState::Alive
+        );
+        assert_eq!(
+            incapacitated_patient.soldiers.living[medic.index()].activity,
+            Activity::Idle
+        );
+        assert_eq!(
+            incapacitated_patient.soldiers.living[patient.index()].activity,
+            Activity::Idle
+        );
+        assert_eq!(
+            incapacitated_patient.soldiers.data[medic.index()].faction,
+            incapacitated_patient.soldiers.data[patient.index()].faction
+        );
+        assert_eq!(
+            incapacitated_patient.soldiers.data[medic.index()]
+                .position
+                .cell,
+            incapacitated_patient.soldiers.data[patient.index()]
+                .position
+                .cell
+        );
+        assert!(incapacitated_patient.casualty.contains_key(&patient));
+        assert_eq!(incapacitated_patient.wounds[&target].patient, patient);
+        assert!(target.0 < incapacitated_patient.next_wound_id);
+        assert!(!incapacitated_patient.wounds[&target].controlled);
+        assert!(!incapacitated_patient.wounds[&target].healed);
+        assert!(
+            incapacitated_patient.wounds[&target].created_at
+                <= incapacitated_patient.casualty[&patient].materialized_at
+        );
         assert_eq!(
             incapacitated_patient.treatments[&treatment].status,
             TreatmentStatus::Active
         );
+        let positive = incapacitated_patient.treatments[&treatment];
+        assert_eq!(positive.id, treatment);
+        assert!(treatment.0 < incapacitated_patient.next_treatment_id);
+        assert_eq!(positive.medic, medic);
+        assert_eq!(positive.patient, patient);
+        assert_eq!(positive.kind, TreatmentKind::Hemostatic);
+        assert_eq!(positive.wound, Some(target));
+        assert_eq!(positive.consumed, HEMOSTATIC_COST);
+        assert_eq!(
+            positive.completes_at - positive.started_at,
+            HEMOSTATIC_DURATION
+        );
+        assert!(positive.completes_at > incapacitated_patient.clock);
         assert_eq!(incapacitated_patient.active_by_entity.len(), 2);
+        assert_eq!(
+            incapacitated_patient.active_by_entity.get(&medic),
+            Some(&treatment)
+        );
+        assert_eq!(
+            incapacitated_patient.active_by_entity.get(&patient),
+            Some(&treatment)
+        );
+        assert_eq!(
+            incapacitated_patient.treatment_ids_by_entity[&medic],
+            BTreeSet::from([treatment])
+        );
+        assert_eq!(
+            incapacitated_patient.treatment_ids_by_entity[&patient],
+            BTreeSet::from([treatment])
+        );
         assert_eq!(
             incapacitated_patient.due_by_treatment[&treatment],
             HEMOSTATIC_DURATION
@@ -13064,6 +13194,20 @@ mod private_invariants {
         assert_eq!(incapacitated_patient.resource_totals().sourced_medical, 8);
         assert_eq!(incapacitated_patient.resource_totals().carried_medical, 7);
         assert_eq!(incapacitated_patient.resource_totals().consumed_medical, 1);
+        assert_eq!(incapacitated_patient.resource_totals().lost_medical, 0);
+        assert_eq!(
+            incapacitated_patient.resource_totals().sourced_medical,
+            incapacitated_patient.resource_totals().carried_medical
+                + incapacitated_patient.resource_totals().consumed_medical
+                + incapacitated_patient.resource_totals().lost_medical
+        );
+        assert!(!incapacitated_patient
+            .availability_by_medic
+            .contains_key(&medic));
+        assert!(incapacitated_patient
+            .available_medics
+            .values()
+            .all(|ids| !ids.contains(&medic)));
         canonical_bytes(&incapacitated_patient);
 
         // Hemostasis requires a present, owned, uncontrolled and unhealed target.
@@ -13072,18 +13216,42 @@ mod private_invariants {
             |world: &World, kind: TreatmentKind, target: Option<WoundId>| {
                 let record = world.treatments[&treatment];
                 assert_eq!(record.id, treatment);
+                assert!(treatment.0 < world.next_treatment_id);
                 assert_eq!(record.medic, medic);
                 assert_eq!(record.patient, patient);
                 assert_eq!(record.kind, kind);
                 assert_eq!(record.wound, target);
                 assert_eq!(record.status, TreatmentStatus::Active);
                 assert_eq!(record.started_at, 0);
+                assert_eq!(
+                    record.consumed,
+                    match kind {
+                        TreatmentKind::Hemostatic => HEMOSTATIC_COST,
+                        TreatmentKind::Shock => SHOCK_TREATMENT_COST,
+                    }
+                );
+                assert_eq!(
+                    record.completes_at - record.started_at,
+                    match kind {
+                        TreatmentKind::Hemostatic => HEMOSTATIC_DURATION,
+                        TreatmentKind::Shock => SHOCK_TREATMENT_DURATION,
+                    }
+                );
                 assert!(record.completes_at > world.clock);
+                assert_ne!(medic, patient);
                 assert_eq!(world.soldiers.data[medic.index()].role, Role::Medic);
                 assert_eq!(world.soldiers.living[medic.index()].life, LifeState::Alive);
                 assert_eq!(
                     world.soldiers.living[patient.index()].life,
                     LifeState::Alive
+                );
+                assert_eq!(
+                    world.soldiers.living[medic.index()].activity,
+                    Activity::Idle
+                );
+                assert_eq!(
+                    world.soldiers.living[patient.index()].activity,
+                    Activity::Idle
                 );
                 assert_eq!(
                     world.soldiers.data[medic.index()].faction,
@@ -13095,6 +13263,7 @@ mod private_invariants {
                 );
                 assert!(!world.is_incapacitated(medic));
                 assert!(!world.is_incapacitated(patient));
+                assert!(world.casualty.contains_key(&patient));
                 assert_eq!(
                     world.active_by_entity,
                     BTreeMap::from([(medic, treatment), (patient, treatment)])
@@ -13115,8 +13284,16 @@ mod private_invariants {
                     world.treatment_ids_by_entity.get(&patient),
                     Some(&BTreeSet::from([treatment]))
                 );
+                assert!(!world.availability_by_medic.contains_key(&medic));
+                assert!(world
+                    .available_medics
+                    .values()
+                    .all(|ids| !ids.contains(&medic)));
                 let totals = world.resource_totals();
                 assert_eq!(totals.sourced_medical, 8);
+                assert_eq!(totals.carried_medical, u128::from(8 - record.consumed));
+                assert_eq!(totals.consumed_medical, u128::from(record.consumed));
+                assert_eq!(totals.lost_medical, 0);
                 assert_eq!(
                     totals.sourced_medical,
                     totals.carried_medical + totals.consumed_medical + totals.lost_medical
@@ -13124,6 +13301,8 @@ mod private_invariants {
             };
         assert_active_control(&active, TreatmentKind::Hemostatic, Some(wound));
         assert_eq!(active.wounds[&wound].patient, patient);
+        assert!(active.wounds[&wound].created_at <= active.casualty[&patient].materialized_at);
+        assert!(active.wounds[&wound].created_at <= active.treatments[&treatment].started_at);
         assert!(!active.wounds[&wound].controlled);
         assert!(!active.wounds[&wound].healed);
         assert!(wound.0 < active.next_wound_id);
@@ -13134,6 +13313,10 @@ mod private_invariants {
         let wound_payload = active_layout.treatments[0].wound.unwrap();
         no_wound[active_layout.treatments[0].wound_option] = 0;
         no_wound.drain(wound_payload..wound_payload + 8);
+        assert_recomposed_active_record(
+            &no_wound,
+            (treatment, medic, patient, None, TreatmentKind::Hemostatic),
+        );
         assert_snapshot_category(&no_wound, "treatment target");
 
         let mut controlled = active_bytes.clone();
@@ -13216,6 +13399,40 @@ mod private_invariants {
             shock_world.treatments[&shock_treatment].status,
             TreatmentStatus::Active
         );
+        assert!(shock_treatment.0 < shock_world.next_treatment_id);
+        assert_ne!(shock_medic, shock_patient);
+        assert_eq!(
+            shock_world.soldiers.data[shock_medic.index()].role,
+            Role::Medic
+        );
+        assert_eq!(
+            shock_world.soldiers.living[shock_medic.index()].life,
+            LifeState::Alive
+        );
+        assert_eq!(
+            shock_world.soldiers.living[shock_patient.index()].life,
+            LifeState::Alive
+        );
+        assert_eq!(
+            shock_world.soldiers.living[shock_medic.index()].activity,
+            Activity::Idle
+        );
+        assert_eq!(
+            shock_world.soldiers.living[shock_patient.index()].activity,
+            Activity::Idle
+        );
+        assert!(!shock_world.is_incapacitated(shock_medic));
+        assert!(!shock_world.is_incapacitated(shock_patient));
+        assert_eq!(
+            shock_world.soldiers.data[shock_medic.index()].faction,
+            shock_world.soldiers.data[shock_patient.index()].faction
+        );
+        assert_eq!(
+            shock_world.soldiers.data[shock_medic.index()].position.cell,
+            shock_world.soldiers.data[shock_patient.index()]
+                .position
+                .cell
+        );
         assert_eq!(
             shock_world.treatments[&shock_treatment].consumed,
             SHOCK_TREATMENT_COST
@@ -13224,9 +13441,26 @@ mod private_invariants {
             shock_world.treatments[&shock_treatment].completes_at,
             SHOCK_TREATMENT_DURATION
         );
+        assert_eq!(shock_world.treatments[&shock_treatment].started_at, 0);
+        assert_eq!(
+            shock_world.treatments[&shock_treatment].completes_at
+                - shock_world.treatments[&shock_treatment].started_at,
+            SHOCK_TREATMENT_DURATION
+        );
         assert!(shock_world.treatments[&shock_treatment].completes_at > shock_world.clock);
         assert_eq!(shock_world.wounds[&shock_wound].patient, shock_patient);
         assert!(shock_wound.0 < shock_world.next_wound_id);
+        assert!(shock_world.casualty.contains_key(&shock_patient));
+        assert!(!shock_world.wounds[&shock_wound].controlled);
+        assert!(!shock_world.wounds[&shock_wound].healed);
+        assert!(
+            shock_world.wounds[&shock_wound].created_at
+                <= shock_world.casualty[&shock_patient].materialized_at
+        );
+        assert!(
+            shock_world.wounds[&shock_wound].created_at
+                <= shock_world.treatments[&shock_treatment].started_at
+        );
         assert_eq!(
             shock_world.active_by_entity,
             BTreeMap::from([
@@ -13242,9 +13476,29 @@ mod private_invariants {
             shock_world.treatment_due[&SHOCK_TREATMENT_DURATION],
             BTreeSet::from([shock_treatment])
         );
+        assert_eq!(
+            shock_world.treatment_ids_by_entity[&shock_medic],
+            BTreeSet::from([shock_treatment])
+        );
+        assert_eq!(
+            shock_world.treatment_ids_by_entity[&shock_patient],
+            BTreeSet::from([shock_treatment])
+        );
+        assert!(!shock_world.availability_by_medic.contains_key(&shock_medic));
+        assert!(shock_world
+            .available_medics
+            .values()
+            .all(|ids| !ids.contains(&shock_medic)));
         assert_eq!(shock_world.resource_totals().sourced_medical, 8);
         assert_eq!(shock_world.resource_totals().carried_medical, 6);
         assert_eq!(shock_world.resource_totals().consumed_medical, 2);
+        assert_eq!(shock_world.resource_totals().lost_medical, 0);
+        assert_eq!(
+            shock_world.resource_totals().sourced_medical,
+            shock_world.resource_totals().carried_medical
+                + shock_world.resource_totals().consumed_medical
+                + shock_world.resource_totals().lost_medical
+        );
         let shock_bytes = canonical_bytes(&shock_world);
         let shock_layout = V7MedicalLayout::parse(&shock_bytes);
         let option = shock_layout.treatments[0].wound_option;
@@ -13253,6 +13507,16 @@ mod private_invariants {
         shock_with_wound.push(1);
         shock_with_wound.extend_from_slice(&shock_wound.0.to_le_bytes());
         shock_with_wound.extend_from_slice(&shock_bytes[option + 1..]);
+        assert_recomposed_active_record(
+            &shock_with_wound,
+            (
+                shock_treatment,
+                shock_medic,
+                shock_patient,
+                Some(shock_wound),
+                TreatmentKind::Shock,
+            ),
+        );
         assert_snapshot_category(&shock_with_wound, "treatment target");
 
         // Equality is reachable; creation one second after treatment start is not.
@@ -13320,6 +13584,7 @@ mod private_invariants {
         );
         assert_eq!(timed.wounds[&timed_wound].patient, timed_patient);
         assert!(timed_wound.0 < timed.next_wound_id);
+        assert!(timed.casualty.contains_key(&timed_patient));
         assert!(!timed.wounds[&timed_wound].controlled);
         assert!(!timed.wounds[&timed_wound].healed);
         assert_eq!(
@@ -13331,10 +13596,46 @@ mod private_invariants {
             timed.treatments[&timed_treatment].status,
             TreatmentStatus::Active
         );
+        assert!(timed_treatment.0 < timed.next_treatment_id);
+        assert_ne!(timed_medic, timed_patient);
+        assert_eq!(timed.treatments[&timed_treatment].medic, timed_medic);
+        assert_eq!(timed.treatments[&timed_treatment].patient, timed_patient);
+        assert_eq!(timed.soldiers.data[timed_medic.index()].role, Role::Medic);
+        assert_eq!(
+            timed.soldiers.living[timed_medic.index()].life,
+            LifeState::Alive
+        );
+        assert_eq!(
+            timed.soldiers.living[timed_patient.index()].life,
+            LifeState::Alive
+        );
+        assert_eq!(
+            timed.soldiers.living[timed_medic.index()].activity,
+            Activity::Idle
+        );
+        assert_eq!(
+            timed.soldiers.living[timed_patient.index()].activity,
+            Activity::Idle
+        );
+        assert!(!timed.is_incapacitated(timed_medic));
+        assert!(!timed.is_incapacitated(timed_patient));
+        assert_eq!(
+            timed.soldiers.data[timed_medic.index()].faction,
+            timed.soldiers.data[timed_patient.index()].faction
+        );
+        assert_eq!(
+            timed.soldiers.data[timed_medic.index()].position.cell,
+            timed.soldiers.data[timed_patient.index()].position.cell
+        );
         assert_eq!(timed.treatments[&timed_treatment].consumed, HEMOSTATIC_COST);
         assert_eq!(timed.treatments[&timed_treatment].started_at, 0);
         assert_eq!(
             timed.treatments[&timed_treatment].completes_at,
+            HEMOSTATIC_DURATION
+        );
+        assert_eq!(
+            timed.treatments[&timed_treatment].completes_at
+                - timed.treatments[&timed_treatment].started_at,
             HEMOSTATIC_DURATION
         );
         assert!(timed.treatments[&timed_treatment].completes_at > timed.clock);
@@ -13353,9 +13654,29 @@ mod private_invariants {
             timed.treatment_due[&HEMOSTATIC_DURATION],
             BTreeSet::from([timed_treatment])
         );
+        assert_eq!(
+            timed.treatment_ids_by_entity[&timed_medic],
+            BTreeSet::from([timed_treatment])
+        );
+        assert_eq!(
+            timed.treatment_ids_by_entity[&timed_patient],
+            BTreeSet::from([timed_treatment])
+        );
+        assert!(!timed.availability_by_medic.contains_key(&timed_medic));
+        assert!(timed
+            .available_medics
+            .values()
+            .all(|ids| !ids.contains(&timed_medic)));
         assert_eq!(timed.resource_totals().sourced_medical, 8);
         assert_eq!(timed.resource_totals().carried_medical, 7);
         assert_eq!(timed.resource_totals().consumed_medical, 1);
+        assert_eq!(timed.resource_totals().lost_medical, 0);
+        assert_eq!(
+            timed.resource_totals().sourced_medical,
+            timed.resource_totals().carried_medical
+                + timed.resource_totals().consumed_medical
+                + timed.resource_totals().lost_medical
+        );
         let timed_bytes = canonical_bytes(&timed);
         let timed_layout = V7MedicalLayout::parse(&timed_bytes);
         let mut after_start = timed_bytes.clone();
