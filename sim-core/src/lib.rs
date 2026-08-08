@@ -11,6 +11,12 @@ pub const SEVERE_HUNGER: u32 = 800;
 pub const SEVERE_THIRST: u32 = 800;
 pub const FORCED_IDLE_FATIGUE: u32 = 900;
 pub const BLOOD_MAX: u32 = 5_000;
+// A v7 snapshot contains at most `u32::MAX` wound records and each encoded
+// bleeding rate is at most 1_000.  Consequently even the largest encodable
+// aggregate is 4_294_967_295_000, well below `u64::MAX`.  Keep the checked
+// runtime addition as defence in depth, but do not manufacture an unreachable
+// "bleeding overflow" snapshot in corruption tests.
+const _: () = assert!((u32::MAX as u64) * 1_000 < u64::MAX);
 pub const INCAPACITATED_SHOCK: u32 = 700;
 pub const HEMOSTATIC_DURATION: u64 = 10;
 pub const SHOCK_TREATMENT_DURATION: u64 = 15;
@@ -10586,6 +10592,292 @@ mod private_invariants {
         }
     }
 
+    #[derive(Clone, Debug)]
+    struct V7CasualtyLayout {
+        range: std::ops::Range<usize>,
+        owner: usize,
+        blood: usize,
+        shock: usize,
+        shock_remainder: usize,
+        incapacitated: usize,
+        recovering: usize,
+        recovery_option: usize,
+        recovery_deadline: Option<usize>,
+        materialized_at: usize,
+    }
+
+    #[derive(Clone, Debug)]
+    struct V7WoundLayout {
+        range: std::ops::Range<usize>,
+        id: usize,
+        patient: usize,
+        created_at: usize,
+        trauma: usize,
+        bleeding: usize,
+        shock: usize,
+        controlled: usize,
+        healed: usize,
+    }
+
+    #[derive(Clone, Debug)]
+    struct V7TreatmentLayout {
+        range: std::ops::Range<usize>,
+        id: usize,
+        medic: usize,
+        patient: usize,
+        wound_option: usize,
+        wound: Option<usize>,
+        kind: usize,
+        started_at: usize,
+        completes_at: usize,
+        consumed: usize,
+        status: usize,
+        status_at: Option<usize>,
+        reason: Option<usize>,
+    }
+
+    /// Test-only schema walk for canonical v7.  Every raw corruption below is
+    /// addressed by a named field or record range.  Parsing the canonical image
+    /// (including all variable-length prefixes) makes an encoding change fail at
+    /// fixture construction rather than silently moving an opaque byte offset.
+    #[derive(Clone, Debug)]
+    struct V7MedicalLayout {
+        next_wound_id: usize,
+        next_treatment_id: usize,
+        casualty_count: usize,
+        wound_count: usize,
+        treatment_count: usize,
+        casualties: Vec<V7CasualtyLayout>,
+        wounds: Vec<V7WoundLayout>,
+        treatments: Vec<V7TreatmentLayout>,
+        end: usize,
+    }
+
+    impl V7MedicalLayout {
+        fn parse(bytes: &[u8]) -> Self {
+            let mut r = R { b: bytes, p: 0 };
+            assert_eq!(r.u32().unwrap(), SNAPSHOT_VERSION);
+            r.u64().unwrap(); // clock
+            r.u64().unwrap(); // seed
+            r.u64().unwrap(); // rng
+            r.u64().unwrap(); // next schedule
+            for _ in 0..9 {
+                r.u128().unwrap();
+            }
+            let next_wound_id = r.p;
+            r.u64().unwrap();
+            let next_treatment_id = r.p;
+            r.u64().unwrap();
+            r.u64().unwrap();
+            r.u64().unwrap();
+            for _ in 0..r.u32().unwrap() {
+                r.u32().unwrap();
+                if r.bool().unwrap() {
+                    r.spec().unwrap();
+                    r.living().unwrap();
+                }
+            }
+            for _ in 0..r.u32().unwrap() {
+                r.u32().unwrap();
+            }
+            for _ in 0..r.u32().unwrap() {
+                r.u32().unwrap();
+                r.opt_id().unwrap();
+                for _ in 0..r.u32().unwrap() {
+                    r.u64().unwrap();
+                }
+            }
+            for _ in 0..r.u32().unwrap() {
+                r.u32().unwrap();
+                r.stock().unwrap();
+            }
+            for _ in 0..r.u32().unwrap() {
+                r.u32().unwrap();
+                r.u64().unwrap();
+                r.u64().unwrap();
+                r.u64().unwrap();
+            }
+            for _ in 0..r.u32().unwrap() {
+                r.u64().unwrap();
+                for _ in 0..r.u32().unwrap() {
+                    r.u64().unwrap();
+                    r.sc().unwrap();
+                }
+            }
+            for _ in 0..r.u32().unwrap() {
+                r.u64().unwrap();
+                for _ in 0..r.u32().unwrap() {
+                    r.u64().unwrap();
+                }
+            }
+            let casualty_count = r.p;
+            let mut casualties = Vec::new();
+            for _ in 0..r.u32().unwrap() {
+                let start = r.p;
+                let owner = r.p;
+                r.u64().unwrap();
+                let blood = r.p;
+                r.u32().unwrap();
+                let shock = r.p;
+                r.u32().unwrap();
+                let shock_remainder = r.p;
+                r.u8().unwrap();
+                let incapacitated = r.p;
+                r.bool().unwrap();
+                let recovering = r.p;
+                r.bool().unwrap();
+                let recovery_option = r.p;
+                let recovery_deadline = if r.bool().unwrap() {
+                    let p = r.p;
+                    r.u64().unwrap();
+                    Some(p)
+                } else {
+                    None
+                };
+                let materialized_at = r.p;
+                r.u64().unwrap();
+                casualties.push(V7CasualtyLayout {
+                    range: start..r.p,
+                    owner,
+                    blood,
+                    shock,
+                    shock_remainder,
+                    incapacitated,
+                    recovering,
+                    recovery_option,
+                    recovery_deadline,
+                    materialized_at,
+                });
+            }
+            let wound_count = r.p;
+            let mut wounds = Vec::new();
+            for _ in 0..r.u32().unwrap() {
+                let start = r.p;
+                let id = r.p;
+                r.u64().unwrap();
+                let patient = r.p;
+                r.u64().unwrap();
+                let created_at = r.p;
+                r.u64().unwrap();
+                let trauma = r.p;
+                r.u16().unwrap();
+                let bleeding = r.p;
+                r.u16().unwrap();
+                let shock = r.p;
+                r.u16().unwrap();
+                let controlled = r.p;
+                r.bool().unwrap();
+                let healed = r.p;
+                r.bool().unwrap();
+                wounds.push(V7WoundLayout {
+                    range: start..r.p,
+                    id,
+                    patient,
+                    created_at,
+                    trauma,
+                    bleeding,
+                    shock,
+                    controlled,
+                    healed,
+                });
+            }
+            let treatment_count = r.p;
+            let mut treatments = Vec::new();
+            for _ in 0..r.u32().unwrap() {
+                let start = r.p;
+                let id = r.p;
+                r.u64().unwrap();
+                let medic = r.p;
+                r.u64().unwrap();
+                let patient = r.p;
+                r.u64().unwrap();
+                let wound_option = r.p;
+                let wound = if r.bool().unwrap() {
+                    let p = r.p;
+                    r.u64().unwrap();
+                    Some(p)
+                } else {
+                    None
+                };
+                let kind = r.p;
+                r.u8().unwrap();
+                let started_at = r.p;
+                r.u64().unwrap();
+                let completes_at = r.p;
+                r.u64().unwrap();
+                let consumed = r.p;
+                r.u32().unwrap();
+                let status = r.p;
+                let tag = r.u8().unwrap();
+                let (status_at, reason) = match tag {
+                    0 => (None, None),
+                    1 => {
+                        let p = r.p;
+                        r.u64().unwrap();
+                        (Some(p), None)
+                    }
+                    2 => {
+                        let p = r.p;
+                        r.u64().unwrap();
+                        let q = r.p;
+                        r.u8().unwrap();
+                        (Some(p), Some(q))
+                    }
+                    _ => panic!("canonical status tag"),
+                };
+                treatments.push(V7TreatmentLayout {
+                    range: start..r.p,
+                    id,
+                    medic,
+                    patient,
+                    wound_option,
+                    wound,
+                    kind,
+                    started_at,
+                    completes_at,
+                    consumed,
+                    status,
+                    status_at,
+                    reason,
+                });
+            }
+            assert_eq!(
+                r.p,
+                bytes.len(),
+                "v7 layout must consume the canonical image"
+            );
+            Self {
+                next_wound_id,
+                next_treatment_id,
+                casualty_count,
+                wound_count,
+                treatment_count,
+                casualties,
+                wounds,
+                treatments,
+                end: r.p,
+            }
+        }
+    }
+
+    fn put_u16(bytes: &mut [u8], at: usize, value: u16) {
+        bytes[at..at + 2].copy_from_slice(&value.to_le_bytes());
+    }
+    fn put_u32(bytes: &mut [u8], at: usize, value: u32) {
+        bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    fn put_u64(bytes: &mut [u8], at: usize, value: u64) {
+        bytes[at..at + 8].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn assert_snapshot_category(bytes: &[u8], category: &'static str) {
+        assert_eq!(
+            World::from_snapshot(bytes).err(),
+            Some(SimError::Snapshot(category)),
+            "expected named v7 corruption {category}"
+        );
+    }
+
     fn gate_c1_active_world() -> (World, EntityId, EntityId, WoundId, TreatmentId) {
         let mut world = World::new(71);
         let medic = spawn(
@@ -10842,53 +11134,440 @@ mod private_invariants {
     }
 
     #[test]
-    fn gate_c1_all_six_death_causes_preserve_medical_history() {
-        for cause in [
-            DeathCause::Dehydration,
-            DeathCause::Starvation,
-            DeathCause::Exhaustion,
-            DeathCause::ImmediateTrauma,
-            DeathCause::Hemorrhage,
-            DeathCause::TraumaticShock,
-        ] {
-            let (mut world, _, patient, wound, treatment) = gate_c1_active_world();
-            assert!(world
-                .apply(Command::InterruptTreatment { id: treatment })
-                .error
-                .is_none());
-            {
-                let living = &mut world.soldiers.living[patient.index()];
-                living.life = LifeState::Dead { at: 1, cause };
-                living.health = 0;
-                living.materialized_at = 1;
-            }
-            world.soldiers.data[patient.index()].health = 0;
-            let casualty = world.casualty.get_mut(&patient).unwrap();
-            casualty.materialized_at = 1;
-            casualty.recovering = false;
-            casualty.recovery_next_at = None;
-            match cause {
-                DeathCause::Hemorrhage => casualty.blood = 0,
-                DeathCause::TraumaticShock => casualty.shock = 1000,
-                _ => {}
-            }
-            casualty.incapacitated =
-                casualty.shock >= INCAPACITATED_SHOCK || casualty.blood <= BLOOD_MAX / 3;
-            world.unschedule_due(patient);
-            world.refresh_medic_availability(patient);
+    fn gate_c1_schema_aware_raw_v7_medical_corruption_boundaries() {
+        let (mut world, _medic, patient, _wound, first_treatment) = gate_c1_active_world();
+        world.apply(Command::InterruptTreatment {
+            id: first_treatment,
+        });
+        let second_patient = spawn(&mut world, SoldierSpec::default());
+        let second_wound = match world
+            .apply(Command::InflictWound {
+                patient: second_patient,
+                wound: WoundSpec {
+                    trauma: 20,
+                    bleeding_per_second: 4,
+                    shock: 10,
+                },
+            })
+            .events[0]
+            .event
+        {
+            Event::WoundInflicted { id, .. } => id,
+            _ => unreachable!(),
+        };
+        let second_medic = spawn(
+            &mut world,
+            SoldierSpec {
+                role: Role::Medic,
+                inventory: Inventory {
+                    medical: 4,
+                    ..Inventory::default()
+                },
+                ..SoldierSpec::default()
+            },
+        );
+        let second_treatment = match world
+            .apply(Command::StartTreatment {
+                medic: second_medic,
+                patient: second_patient,
+                wound: Some(second_wound),
+                kind: TreatmentKind::Hemostatic,
+            })
+            .events[0]
+            .event
+        {
+            Event::TreatmentStarted { id, .. } => id,
+            _ => unreachable!(),
+        };
+        assert_eq!(second_treatment, TreatmentId(1));
+        let canonical = world.snapshot();
+        assert_eq!(
+            World::from_snapshot(&canonical).unwrap().snapshot(),
+            canonical
+        );
+        let layout = V7MedicalLayout::parse(&canonical);
+        assert_eq!(
+            (
+                layout.casualties.len(),
+                layout.wounds.len(),
+                layout.treatments.len()
+            ),
+            (2, 2, 2)
+        );
+        assert_eq!(layout.end, canonical.len());
+        assert_eq!(
+            u32::from_le_bytes(
+                canonical[layout.casualty_count..layout.casualty_count + 4]
+                    .try_into()
+                    .unwrap()
+            ),
+            2
+        );
+        assert_eq!(
+            u32::from_le_bytes(
+                canonical[layout.wound_count..layout.wound_count + 4]
+                    .try_into()
+                    .unwrap()
+            ),
+            2
+        );
+        assert_eq!(
+            u32::from_le_bytes(
+                canonical[layout.treatment_count..layout.treatment_count + 4]
+                    .try_into()
+                    .unwrap()
+            ),
+            2
+        );
 
-            let canonical = world.snapshot();
-            let once = World::from_snapshot(&canonical).unwrap();
-            let twice = World::from_snapshot(&once.snapshot()).unwrap();
-            assert_eq!(once.snapshot(), canonical, "{cause:?}");
-            assert_eq!(twice.snapshot(), canonical, "{cause:?}");
-            assert_eq!(twice.state_digest(), world.state_digest(), "{cause:?}");
-            assert_eq!(twice.wounds[&wound], world.wounds[&wound]);
-            assert_eq!(twice.treatments[&treatment], world.treatments[&treatment]);
+        let mutate =
+            |name: &str, category: &'static str, f: &dyn Fn(&mut Vec<u8>, &V7MedicalLayout)| {
+                let mut bytes = canonical.clone();
+                let named = V7MedicalLayout::parse(&bytes);
+                f(&mut bytes, &named);
+                assert_eq!(
+                    World::from_snapshot(&bytes).err(),
+                    Some(SimError::Snapshot(category)),
+                    "named corruption {name}"
+                );
+            };
+        mutate(
+            "duplicate casualty owner",
+            "noncanonical casualty order",
+            &|b, l| {
+                let value = u64::from_le_bytes(
+                    b[l.casualties[0].owner..l.casualties[0].owner + 8]
+                        .try_into()
+                        .unwrap(),
+                );
+                put_u64(b, l.casualties[1].owner, value)
+            },
+        );
+        mutate(
+            "noncanonical casualty owners",
+            "noncanonical casualty order",
+            &|b, l| {
+                let a = b[l.casualties[0].range.clone()].to_vec();
+                let z = b[l.casualties[1].range.clone()].to_vec();
+                b[l.casualties[0].range.clone()].copy_from_slice(&z);
+                b[l.casualties[1].range.clone()].copy_from_slice(&a);
+            },
+        );
+        mutate("duplicate wound id", "noncanonical wound order", &|b, l| {
+            let value =
+                u64::from_le_bytes(b[l.wounds[0].id..l.wounds[0].id + 8].try_into().unwrap());
+            put_u64(b, l.wounds[1].id, value)
+        });
+        mutate(
+            "noncanonical wound records",
+            "noncanonical wound order",
+            &|b, l| {
+                let a = b[l.wounds[0].range.clone()].to_vec();
+                let z = b[l.wounds[1].range.clone()].to_vec();
+                b[l.wounds[0].range.clone()].copy_from_slice(&z);
+                b[l.wounds[1].range.clone()].copy_from_slice(&a);
+            },
+        );
+        mutate(
+            "duplicate treatment id",
+            "noncanonical treatment order",
+            &|b, l| {
+                let value = u64::from_le_bytes(
+                    b[l.treatments[0].id..l.treatments[0].id + 8]
+                        .try_into()
+                        .unwrap(),
+                );
+                put_u64(b, l.treatments[1].id, value)
+            },
+        );
+        mutate("invalid casualty Boolean", "boolean", &|b, l| {
+            b[l.casualties[0].incapacitated] = 2
+        });
+        mutate("invalid recovery Boolean", "boolean", &|b, l| {
+            b[l.casualties[0].recovering] = 2
+        });
+        mutate("invalid recovery option Boolean", "boolean", &|b, l| {
+            b[l.casualties[0].recovery_option] = 2
+        });
+        mutate("invalid wound controlled Boolean", "boolean", &|b, l| {
+            b[l.wounds[0].controlled] = 2
+        });
+        mutate("invalid wound healed Boolean", "boolean", &|b, l| {
+            b[l.wounds[0].healed] = 2
+        });
+        mutate(
+            "invalid treatment wound-option Boolean",
+            "boolean",
+            &|b, l| b[l.treatments[0].wound_option] = 2,
+        );
+        mutate("invalid treatment kind tag", "treatment kind", &|b, l| {
+            b[l.treatments[0].kind] = 2
+        });
+        mutate(
+            "invalid treatment status tag",
+            "treatment status",
+            &|b, l| b[l.treatments[1].status] = 3,
+        );
+        mutate(
+            "invalid interruption reason tag",
+            "interruption reason",
+            &|b, l| b[l.treatments[0].reason.unwrap()] = 6,
+        );
+        mutate("retained wound equals next id", "wound", &|b, l| {
+            put_u64(b, l.next_wound_id, second_wound.0)
+        });
+        mutate("retained treatment equals next id", "treatment", &|b, l| {
+            put_u64(b, l.next_treatment_id, second_treatment.0)
+        });
+        mutate("casualty blood above range", "casualty", &|b, l| {
+            put_u32(b, l.casualties[0].blood, BLOOD_MAX + 1)
+        });
+        mutate("casualty shock above range", "casualty", &|b, l| {
+            put_u32(b, l.casualties[0].shock, 1001)
+        });
+        mutate(
+            "casualty shock remainder above range",
+            "casualty",
+            &|b, l| b[l.casualties[0].shock_remainder] = 10,
+        );
+        mutate("future casualty materialization", "casualty", &|b, l| {
+            put_u64(b, l.casualties[0].materialized_at, world.clock + 1)
+        });
+        mutate("stale wound patient generation", "wound", &|b, l| {
+            put_u64(
+                b,
+                l.wounds[0].patient,
+                patient.raw().wrapping_add(1u64 << 32),
+            )
+        });
+        mutate("zero-effect wound", "wound specification", &|b, l| {
+            put_u16(b, l.wounds[0].trauma, 0);
+            put_u16(b, l.wounds[0].bleeding, 0);
+            put_u16(b, l.wounds[0].shock, 0)
+        });
+        mutate("trauma above range", "wound specification", &|b, l| {
+            put_u16(b, l.wounds[0].trauma, 1001)
+        });
+        mutate("bleeding above range", "wound specification", &|b, l| {
+            put_u16(b, l.wounds[0].bleeding, 1001)
+        });
+        mutate("shock above range", "wound specification", &|b, l| {
+            put_u16(b, l.wounds[0].shock, 1001)
+        });
+        mutate("future wound creation", "wound", &|b, l| {
+            put_u64(b, l.wounds[0].created_at, world.clock + 1)
+        });
+        mutate("self treatment", "treatment endpoints", &|b, l| {
+            let x = u64::from_le_bytes(
+                b[l.treatments[0].medic..l.treatments[0].medic + 8]
+                    .try_into()
+                    .unwrap(),
+            );
+            put_u64(b, l.treatments[0].patient, x)
+        });
+        mutate("future treatment start", "treatment duration", &|b, l| {
+            put_u64(b, l.treatments[1].started_at, world.clock + 1)
+        });
+        mutate("wrong treatment cost", "treatment cost", &|b, l| {
+            put_u32(b, l.treatments[1].consumed, 9)
+        });
+        mutate("wrong treatment duration", "treatment duration", &|b, l| {
+            put_u64(b, l.treatments[1].completes_at, 12)
+        });
+        mutate("active already due", "active treatment", &|b, l| {
+            put_u64(b, l.treatments[1].completes_at, world.clock)
+        });
+
+        for (name, cut) in [
+            ("casualty field", layout.casualties[0].shock),
+            ("wound record", layout.wounds[0].created_at),
+            ("treatment record", layout.treatments[0].started_at),
+        ] {
             assert_eq!(
-                twice.soldiers.living[patient.index()].life,
-                LifeState::Dead { at: 1, cause }
+                World::from_snapshot(&canonical[..cut]).err(),
+                Some(SimError::Snapshot("truncated")),
+                "named truncation {name}"
             );
         }
+        let mut trailing = canonical.clone();
+        trailing.push(0);
+        assert_snapshot_category(&trailing, "trailing bytes");
+        assert!(layout
+            .casualties
+            .iter()
+            .all(|x| x.recovery_deadline.is_none()));
+        assert!(layout.treatments.iter().all(|x| !x.range.is_empty()));
+        assert!(layout
+            .treatments
+            .iter()
+            .any(|x| x.wound.is_some() && x.status_at.is_some()));
+    }
+
+    #[test]
+    fn gate_c1_all_six_death_causes_preserve_medical_history() {
+        fn history_world(food: u32, water: u32) -> (World, EntityId, WoundId, TreatmentId) {
+            let mut world = World::new(91);
+            let medic = spawn(
+                &mut world,
+                SoldierSpec {
+                    role: Role::Medic,
+                    inventory: Inventory {
+                        medical: 8,
+                        ..Inventory::default()
+                    },
+                    ..SoldierSpec::default()
+                },
+            );
+            let patient = spawn(
+                &mut world,
+                SoldierSpec {
+                    inventory: Inventory {
+                        food,
+                        water,
+                        ..Inventory::default()
+                    },
+                    ..SoldierSpec::default()
+                },
+            );
+            let wound = match world
+                .apply(Command::InflictWound {
+                    patient,
+                    wound: WoundSpec {
+                        trauma: 0,
+                        bleeding_per_second: 1,
+                        shock: 0,
+                    },
+                })
+                .events[0]
+                .event
+            {
+                Event::WoundInflicted { id, .. } => id,
+                _ => unreachable!(),
+            };
+            let treatment = match world
+                .apply(Command::StartTreatment {
+                    medic,
+                    patient,
+                    wound: Some(wound),
+                    kind: TreatmentKind::Hemostatic,
+                })
+                .events[0]
+                .event
+            {
+                Event::TreatmentStarted { id, .. } => id,
+                _ => unreachable!(),
+            };
+            (world, patient, wound, treatment)
+        }
+        let cases = [
+            (DeathCause::Dehydration, 20, 0, 499),
+            (DeathCause::Starvation, 0, 20, 1049),
+        ];
+        for (cause, food, water, expected_at) in cases {
+            let (mut world, patient, wound, treatment) = history_world(food, water);
+            let completion = world.apply(Command::AdvanceTo { target: 10 });
+            assert!(completion
+                .events
+                .iter()
+                .any(|e| matches!(e.event,Event::TreatmentCompleted{id,..} if id==treatment)));
+            let death = world.apply(Command::AdvanceTo { target: 2_000 });
+            assert!(death.events.iter().any(|e| e.at == expected_at
+                && matches!(e.event,Event::SoldierDied{id, cause:c, ..} if id==patient && c==cause)));
+            assert_eq!(
+                world.soldiers.living[patient.index()].life,
+                LifeState::Dead {
+                    at: expected_at,
+                    cause
+                }
+            );
+            assert_eq!(
+                world.treatments[&treatment].status,
+                TreatmentStatus::Completed { at: 10 }
+            );
+            assert!(world.wounds.contains_key(&wound));
+            assert_death_round_trip(&world, patient, wound, treatment, cause, expected_at);
+        }
+
+        for cause in [DeathCause::ImmediateTrauma, DeathCause::TraumaticShock] {
+            let (mut world, patient, wound, treatment) = history_world(0, 0);
+            let spec = if cause == DeathCause::ImmediateTrauma {
+                WoundSpec {
+                    trauma: 1000,
+                    bleeding_per_second: 0,
+                    shock: 0,
+                }
+            } else {
+                WoundSpec {
+                    trauma: 0,
+                    bleeding_per_second: 0,
+                    shock: 1000,
+                }
+            };
+            let outcome = world.apply(Command::InflictWound {
+                patient,
+                wound: spec,
+            });
+            assert!(outcome.events.iter().any(|e| e.at == 0
+                && matches!(e.event,Event::SoldierDied{id,cause:c, ..} if id==patient && c==cause)));
+            assert!(outcome
+                .events
+                .iter()
+                .any(|e| matches!(e.event,Event::TreatmentInterrupted{id,..} if id==treatment)));
+            assert_death_round_trip(&world, patient, wound, treatment, cause, 0);
+        }
+
+        let (mut world, patient, wound, treatment) = history_world(0, 0);
+        let outcome = world.apply(Command::InflictWound {
+            patient,
+            wound: WoundSpec {
+                trauma: 0,
+                bleeding_per_second: 1000,
+                shock: 0,
+            },
+        });
+        assert!(outcome.error.is_none());
+        let death = world.apply(Command::AdvanceTo { target: 10 });
+        assert!(death.events.iter().any(|e| e.at==5 && matches!(e.event,Event::SoldierDied{id,cause:DeathCause::Hemorrhage, ..} if id==patient)));
+        assert_death_round_trip(&world, patient, wound, treatment, DeathCause::Hemorrhage, 5);
+
+        // M1.2 has no public transition that produces Exhaustion.  This one
+        // schema-level control is therefore deliberately narrower than the five
+        // public reachability cases above.
+        let (mut world, patient, wound, treatment) = history_world(0, 0);
+        world.apply(Command::InterruptTreatment { id: treatment });
+        world.soldiers.living[patient.index()].life = LifeState::Dead {
+            at: 0,
+            cause: DeathCause::Exhaustion,
+        };
+        world.soldiers.living[patient.index()].health = 0;
+        world.soldiers.data[patient.index()].health = 0;
+        world.casualty.get_mut(&patient).unwrap().incapacitated = false;
+        world.unschedule_due(patient);
+        assert_death_round_trip(&world, patient, wound, treatment, DeathCause::Exhaustion, 0);
+    }
+
+    fn assert_death_round_trip(
+        world: &World,
+        patient: EntityId,
+        wound: WoundId,
+        treatment: TreatmentId,
+        cause: DeathCause,
+        at: u64,
+    ) {
+        let bytes = world.snapshot();
+        let once = World::from_snapshot(&bytes).unwrap();
+        let twice = World::from_snapshot(&once.snapshot()).unwrap();
+        assert_eq!(once.snapshot(), bytes);
+        assert_eq!(twice.snapshot(), bytes);
+        assert_eq!(twice.state_digest(), world.state_digest());
+        assert_eq!(
+            twice.soldiers.living[patient.index()].life,
+            LifeState::Dead { at, cause }
+        );
+        assert_eq!(twice.wounds[&wound], world.wounds[&wound]);
+        assert_eq!(twice.treatments[&treatment], world.treatments[&treatment]);
+        assert_eq!(twice.treatment_ids_by_entity, world.treatment_ids_by_entity);
+        assert_eq!(twice.wound_ids_by_patient, world.wound_ids_by_patient);
+        assert_eq!(twice.resource_totals(), world.resource_totals());
     }
 }
