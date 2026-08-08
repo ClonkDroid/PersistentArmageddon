@@ -8207,4 +8207,340 @@ mod private_invariants {
             );
         }
     }
+
+    #[test]
+    fn gate_b_acceptance_09_real_medic_churn_visits_only_eligible_candidates() {
+        let mut world = World::new(409);
+        let medic_spec = |medical| SoldierSpec {
+            role: Role::Medic,
+            inventory: Inventory {
+                medical,
+                ..Inventory::default()
+            },
+            ..SoldierSpec::default()
+        };
+        let patient = spawn(&mut world, medic_spec(4));
+        let marching = spawn(&mut world, medic_spec(4));
+        let busy = spawn(&mut world, medic_spec(4));
+        let poor = spawn(&mut world, medic_spec(0));
+        let recovering = spawn(&mut world, medic_spec(4));
+        let dead = spawn(&mut world, medic_spec(4));
+        let eligible = spawn(&mut world, medic_spec(4));
+        let helper = spawn(&mut world, medic_spec(20));
+
+        assert_eq!(
+            world
+                .apply(Command::SetActivity {
+                    id: marching,
+                    activity: Activity::March,
+                })
+                .error,
+            None
+        );
+        let busy_patient = spawn(&mut world, SoldierSpec::default());
+        let busy_wound = gate_wound(&mut world, busy_patient, 1, 0);
+        let _busy_treatment = gate_start(&mut world, busy, busy_patient, busy_wound);
+        let recovery_wound = gate_wound(&mut world, recovering, 1, 700);
+        let dead_wound = world.apply(Command::InflictWound {
+            patient: dead,
+            wound: WoundSpec {
+                trauma: 1000,
+                bleeding_per_second: 0,
+                shock: 0,
+            },
+        });
+        assert_eq!(dead_wound.error, None);
+        assert!(matches!(
+            world.soldiers.living[dead.index()].life,
+            LifeState::Dead {
+                cause: DeathCause::ImmediateTrauma,
+                ..
+            }
+        ));
+        for i in 0..2_000 {
+            spawn(
+                &mut world,
+                SoldierSpec {
+                    faction: if i % 2 == 0 { 1 } else { 0 },
+                    position: Position {
+                        cell: if i % 2 == 0 { 0 } else { 99 },
+                        ..Position::default()
+                    },
+                    role: Role::Medic,
+                    inventory: Inventory {
+                        medical: 10,
+                        ..Inventory::default()
+                    },
+                    ..SoldierSpec::default()
+                },
+            );
+        }
+
+        let patient_wound = gate_wound(&mut world, patient, 1, 0);
+        let before = world.selection_candidates;
+        let selected = world.apply(Command::RequestTreatment {
+            patient,
+            wound: Some(patient_wound),
+            kind: TreatmentKind::Hemostatic,
+        });
+        assert_eq!(selected.error, None);
+        assert!(matches!(
+            selected.events.as_slice(),
+            [TimedEvent {
+                at: 0,
+                event: Event::TreatmentStarted {
+                    id: TreatmentId(1),
+                    medic,
+                    patient: selected_patient,
+                    consumed: HEMOSTATIC_COST,
+                    ..
+                },
+            }] if *medic == eligible && *selected_patient == patient
+        ));
+        assert_eq!(world.selection_candidates - before, 2); // self, then the sole eligible medic
+        assert_eq!(world.consumed_medical, 2);
+        assert_eq!(world.soldiers.data[eligible.index()].inventory.medical, 3);
+
+        assert_eq!(
+            world
+                .apply(Command::InterruptTreatment { id: TreatmentId(1) })
+                .error,
+            None
+        );
+        assert_eq!(
+            world
+                .apply(Command::StartTreatment {
+                    medic: helper,
+                    patient: recovering,
+                    wound: Some(recovery_wound),
+                    kind: TreatmentKind::Hemostatic,
+                })
+                .error,
+            None
+        );
+        assert_eq!(world.apply(Command::AdvanceTo { target: 15 }).error, None);
+        assert!(!world.casualty[&recovering].incapacitated);
+        assert!(world.availability_by_medic.contains_key(&recovering));
+        assert_eq!(
+            world
+                .apply(Command::SetActivity {
+                    id: busy,
+                    activity: Activity::March,
+                })
+                .error,
+            None
+        );
+
+        let second_wound = gate_wound(&mut world, patient, 1, 0);
+        let before = world.selection_candidates;
+        let recovered_selected = world.apply(Command::RequestTreatment {
+            patient,
+            wound: Some(second_wound),
+            kind: TreatmentKind::Hemostatic,
+        });
+        assert!(matches!(
+            recovered_selected.events[0].event,
+            Event::TreatmentStarted { medic, .. } if medic == recovering
+        ));
+        assert_eq!(world.selection_candidates - before, 2);
+        let active = world.active_by_entity[&patient];
+        assert_eq!(
+            world
+                .apply(Command::InterruptTreatment { id: active })
+                .error,
+            None
+        );
+
+        let removed = world.apply(Command::DespawnSoldier { id: recovering });
+        assert_eq!(removed.error, None);
+        assert!(!world.availability_by_medic.contains_key(&recovering));
+        assert!(world
+            .available_medics
+            .values()
+            .all(|ids| !ids.contains(&recovering)));
+        let replacement = spawn(&mut world, medic_spec(4));
+        assert_eq!(replacement.index(), recovering.index());
+        assert_eq!(replacement.generation(), recovering.generation() + 1);
+        let third_wound = gate_wound(&mut world, patient, 1, 0);
+        let before = world.selection_candidates;
+        let reused_selected = world.apply(Command::RequestTreatment {
+            patient,
+            wound: Some(third_wound),
+            kind: TreatmentKind::Hemostatic,
+        });
+        assert!(matches!(
+            reused_selected.events[0].event,
+            Event::TreatmentStarted { medic, .. } if medic == eligible
+        ));
+        assert_eq!(world.selection_candidates - before, 2);
+        assert!(world
+            .available_medics
+            .values()
+            .all(|ids| !ids.contains(&recovering)));
+        assert!(!world.treatment_ids_by_entity.contains_key(&recovering));
+        assert_eq!(poor.index(), 3);
+    }
+
+    #[test]
+    fn gate_b_acceptance_10_materialized_removal_cleans_both_endpoint_roles() {
+        for remove_medic in [true, false] {
+            let mut world = World::new(if remove_medic { 410 } else { 411 });
+            let medic = spawn(
+                &mut world,
+                SoldierSpec {
+                    role: Role::Medic,
+                    inventory: Inventory {
+                        food: 7,
+                        water: 8,
+                        medical: 5,
+                    },
+                    ..SoldierSpec::default()
+                },
+            );
+            let patient = spawn(
+                &mut world,
+                SoldierSpec {
+                    inventory: Inventory {
+                        food: 11,
+                        water: 12,
+                        medical: 2,
+                    },
+                    ..SoldierSpec::default()
+                },
+            );
+            let medic_wound = gate_wound(&mut world, medic, 1, 0);
+            let patient_wound = gate_wound(&mut world, patient, 2, 0);
+            let treatment = gate_start(&mut world, medic, patient, patient_wound);
+            assert_eq!(world.apply(Command::AdvanceTo { target: 3 }).error, None);
+            assert_eq!(world.clock, 3);
+            assert_eq!(world.casualty[&medic].materialized_at, 0);
+            assert_eq!(world.casualty[&patient].materialized_at, 0);
+
+            let removed = if remove_medic { medic } else { patient };
+            let survivor = if remove_medic { patient } else { medic };
+            let reason = if remove_medic {
+                InterruptionReason::MedicRemoved
+            } else {
+                InterruptionReason::PatientRemoved
+            };
+            let expected_loadout = if remove_medic {
+                Loadout {
+                    ammunition: 0,
+                    food: 7,
+                    water: 8,
+                    medical: 4,
+                }
+            } else {
+                Loadout {
+                    ammunition: 0,
+                    food: 11,
+                    water: 12,
+                    medical: 2,
+                }
+            };
+            let outcome = world.apply(Command::DespawnSoldier { id: removed });
+            assert_eq!(outcome.error, None);
+            assert_eq!(
+                outcome.events,
+                vec![
+                    TimedEvent {
+                        at: 3,
+                        event: Event::TreatmentInterrupted {
+                            id: treatment,
+                            reason,
+                        },
+                    },
+                    TimedEvent {
+                        at: 3,
+                        event: Event::SoldierRemoved {
+                            id: removed,
+                            loadout: expected_loadout,
+                        },
+                    },
+                ]
+            );
+            assert!(!world.soldiers.valid(removed));
+            assert!(world.soldiers.valid(survivor));
+            assert!(!world.casualty.contains_key(&removed));
+            assert!(!world.wound_ids_by_patient.contains_key(&removed));
+            assert!(!world.bleeding_rate_by_patient.contains_key(&removed));
+            assert!(!world.due_by_entity.contains_key(&removed));
+            assert!(!world.active_by_entity.contains_key(&removed));
+            assert!(!world.active_by_entity.contains_key(&survivor));
+            assert!(!world.treatments.contains_key(&treatment));
+            assert!(!world.due_by_treatment.contains_key(&treatment));
+            assert!(world
+                .treatment_due
+                .values()
+                .all(|ids| !ids.contains(&treatment)));
+            assert!(!world.treatment_ids_by_entity.contains_key(&removed));
+            assert!(!world.treatment_ids_by_entity.contains_key(&survivor));
+            assert!(!world.availability_by_medic.contains_key(&removed));
+            assert!(world
+                .available_medics
+                .values()
+                .all(|ids| !ids.contains(&removed)));
+            assert!(world
+                .cell_members
+                .values()
+                .all(|ids| !ids.contains(&removed)));
+            assert!(!world.wounds.contains_key(&if remove_medic {
+                medic_wound
+            } else {
+                patient_wound
+            }));
+            assert_eq!(world.sourced_medical, 7);
+            assert_eq!(world.consumed_medical, 1);
+            assert_eq!(world.lost_medical, u128::from(expected_loadout.medical));
+            let carried_medical: u128 = world
+                .soldiers
+                .data
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| world.soldiers.alive[*index])
+                .map(|(_, spec)| u128::from(spec.inventory.medical))
+                .sum();
+            assert_eq!(
+                world.sourced_medical,
+                carried_medical + world.consumed_medical + world.lost_medical
+            );
+            assert_eq!(world.lost_food, u128::from(expected_loadout.food));
+            assert_eq!(world.lost_water, u128::from(expected_loadout.water));
+            let (carried_food, carried_water) = world
+                .soldiers
+                .data
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| world.soldiers.alive[*index])
+                .fold((0_u128, 0_u128), |(food, water), (_, spec)| {
+                    (
+                        food + u128::from(spec.inventory.food),
+                        water + u128::from(spec.inventory.water),
+                    )
+                });
+            assert_eq!(world.sourced_food, 18);
+            assert_eq!(world.sourced_water, 20);
+            assert_eq!(
+                world.sourced_food,
+                carried_food + world.consumed_food + world.lost_food
+            );
+            assert_eq!(
+                world.sourced_water,
+                carried_water + world.consumed_water + world.lost_water
+            );
+
+            let replacement = spawn(&mut world, SoldierSpec::default());
+            assert_eq!(replacement.index(), removed.index());
+            assert_eq!(replacement.generation(), removed.generation() + 1);
+            assert!(!world.casualty.contains_key(&replacement));
+            assert!(!world.wound_ids_by_patient.contains_key(&replacement));
+            assert!(!world.active_by_entity.contains_key(&replacement));
+            assert!(!world.treatment_ids_by_entity.contains_key(&replacement));
+            let before = world.snapshot();
+            let stale = world.apply(Command::DespawnSoldier { id: removed });
+            assert_eq!(stale.error, Some(SimError::InvalidEntity));
+            assert!(stale.events.is_empty());
+            assert_eq!(world.snapshot(), before);
+        }
+    }
 }
