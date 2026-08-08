@@ -125,6 +125,199 @@ fn interruption_releases_endpoints_without_refund() {
 }
 
 #[test]
+fn recovery_has_an_exact_material_boundary_and_heals_history() {
+    let mut w = World::new(21);
+    let medic = spawn(&mut w, Role::Medic, 1);
+    let patient = spawn(&mut w, Role::Rifle, 0);
+    let wound = match w
+        .apply(Command::InflictWound {
+            patient,
+            wound: WoundSpec {
+                trauma: 1,
+                bleeding_per_second: 2,
+                shock: 1,
+            },
+        })
+        .events[0]
+        .event
+    {
+        Event::WoundInflicted { id, .. } => id,
+        _ => panic!(),
+    };
+    w.apply(Command::StartTreatment {
+        medic,
+        patient,
+        wound: Some(wound),
+        kind: TreatmentKind::Hemostatic,
+    });
+    let completed = w.apply(Command::AdvanceTo { target: 10 });
+    assert!(completed.events.iter().any(|e| matches!(e.event, Event::RecoveryChanged { id, before: false, after: true, next_at: Some(15) } if id == patient)));
+    assert_eq!(
+        w.casualty_state(patient).unwrap().recovery_next_at,
+        Some(15)
+    );
+    w.apply(Command::AdvanceTo { target: 14 });
+    assert_eq!(w.casualty_state(patient).unwrap().blood, 4_980);
+    assert_eq!(w.soldier(patient).unwrap().living.health, 999);
+    let mut restored = World::from_snapshot(&w.snapshot()).unwrap();
+    let boundary = w.apply(Command::AdvanceTo { target: 15 });
+    let restored_boundary = restored.apply(Command::AdvanceTo { target: 15 });
+    assert_eq!(restored_boundary.events, boundary.events);
+    assert_eq!(restored.snapshot(), w.snapshot());
+    assert_eq!(
+        boundary
+            .events
+            .iter()
+            .map(|x| x.event)
+            .filter(|e| matches!(
+                e,
+                Event::RecoveryTicked { .. }
+                    | Event::WoundHealed { .. }
+                    | Event::RecoveryChanged { .. }
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            Event::RecoveryTicked {
+                id: patient,
+                blood_before: 4_980,
+                blood_after: 5_000,
+                shock_before: 3,
+                shock_after: 0,
+                health_before: 999,
+                health_after: 1_000
+            },
+            Event::WoundHealed { id: wound, patient },
+            Event::RecoveryChanged {
+                id: patient,
+                before: true,
+                after: false,
+                next_at: None
+            },
+        ]
+    );
+    assert!(w.wound(wound).unwrap().healed);
+    assert_eq!(w.casualty_state(patient).unwrap().recovery_next_at, None);
+}
+
+#[test]
+fn immediate_wounds_emit_complete_causal_arrays() {
+    let mut w = World::new(22);
+    let patient = spawn(&mut w, Role::Rifle, 0);
+    w.apply(Command::SetActivity {
+        id: patient,
+        activity: Activity::March,
+    });
+    let nonfatal = w.apply(Command::InflictWound {
+        patient,
+        wound: WoundSpec {
+            trauma: 0,
+            bleeding_per_second: 0,
+            shock: 700,
+        },
+    });
+    assert_eq!(
+        nonfatal.events.iter().map(|x| x.event).collect::<Vec<_>>(),
+        vec![
+            Event::WoundInflicted {
+                id: WoundId(0),
+                patient,
+                wound: WoundSpec {
+                    trauma: 0,
+                    bleeding_per_second: 0,
+                    shock: 700
+                }
+            },
+            Event::ActivityChanged {
+                id: patient,
+                before: Activity::March,
+                after: Activity::Idle,
+                forced: true
+            },
+        ]
+    );
+    let fatal = w.apply(Command::InflictWound {
+        patient,
+        wound: WoundSpec {
+            trauma: 0,
+            bleeding_per_second: 0,
+            shock: 300,
+        },
+    });
+    assert_eq!(
+        fatal.events.iter().map(|x| x.event).collect::<Vec<_>>(),
+        vec![
+            Event::WoundInflicted {
+                id: WoundId(1),
+                patient,
+                wound: WoundSpec {
+                    trauma: 0,
+                    bleeding_per_second: 0,
+                    shock: 300
+                }
+            },
+            Event::SoldierDied {
+                id: patient,
+                cause: DeathCause::TraumaticShock,
+                health_before: 1_000
+            },
+        ]
+    );
+    assert_eq!(
+        w.soldier(patient).unwrap().living.life,
+        LifeState::Dead {
+            at: 0,
+            cause: DeathCause::TraumaticShock
+        }
+    );
+}
+
+#[test]
+fn active_removal_emits_interruption_then_removal_and_reuse_is_clean() {
+    let mut w = World::new(23);
+    let medic = spawn(&mut w, Role::Medic, 1);
+    let patient = spawn(&mut w, Role::Rifle, 0);
+    let wound = match w
+        .apply(Command::InflictWound {
+            patient,
+            wound: WoundSpec {
+                trauma: 1,
+                bleeding_per_second: 1,
+                shock: 1,
+            },
+        })
+        .events[0]
+        .event
+    {
+        Event::WoundInflicted { id, .. } => id,
+        _ => panic!(),
+    };
+    let tid = match w
+        .apply(Command::StartTreatment {
+            medic,
+            patient,
+            wound: Some(wound),
+            kind: TreatmentKind::Hemostatic,
+        })
+        .events[0]
+        .event
+    {
+        Event::TreatmentStarted { id, .. } => id,
+        _ => panic!(),
+    };
+    let removed = w.apply(Command::DespawnSoldier { id: patient });
+    assert!(
+        matches!(removed.events[0].event, Event::TreatmentInterrupted { id, reason: InterruptionReason::PatientRemoved } if id == tid)
+    );
+    assert!(matches!(removed.events[1].event, Event::SoldierRemoved { id, .. } if id == patient));
+    assert!(w.wound(wound).is_none());
+    assert!(w.treatment(tid).is_none());
+    let replacement = spawn(&mut w, Role::Rifle, 0);
+    assert_eq!(replacement.index(), patient.index());
+    assert!(w.casualty_state(replacement).is_none());
+    assert!(w.wounds_of(replacement).is_empty());
+}
+
+#[test]
 fn direct_advance_stamps_hemorrhage_at_the_causal_second() {
     let mut world = World::new(11);
     let patient = spawn(&mut world, Role::Rifle, 0);
@@ -352,14 +545,24 @@ fn same_timestamp_hemorrhage_defeats_completion_and_cleans_relationship() {
         })
         .map(|e| e.event)
         .collect();
-    assert!(
-        matches!(relevant.as_slice(), [Event::SoldierDied { cause: DeathCause::Hemorrhage, .. }, Event::TreatmentInterrupted { id, reason: InterruptionReason::PatientDied }] if *id == treatment)
-    );
+    assert!(matches!(
+        relevant.as_slice(),
+        [
+            Event::TreatmentInterrupted {
+                id,
+                reason: InterruptionReason::Ineligible
+            },
+            Event::SoldierDied {
+                cause: DeathCause::Hemorrhage,
+                ..
+            }
+        ] if *id == treatment
+    ));
     assert!(matches!(
         world.treatment(treatment).unwrap().status,
         TreatmentStatus::Interrupted {
-            at: HEMOSTATIC_DURATION,
-            reason: InterruptionReason::PatientDied
+            at: 7,
+            reason: InterruptionReason::Ineligible
         }
     ));
     assert!(!world.wound(wound).unwrap().controlled);

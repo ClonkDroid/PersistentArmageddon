@@ -607,6 +607,28 @@ fn event_json(x: &TimedEvent) -> Value {
         Event::TreatmentInterrupted { id, reason } => {
             json!({"type":"treatment_interrupted","id":id.0,"reason":format!("{reason:?}").to_lowercase()})
         }
+        Event::RecoveryChanged {
+            id,
+            before,
+            after,
+            next_at,
+        } => {
+            json!({"type":"recovery_changed","id":id.raw(),"before":before,"after":after,"next_at":next_at})
+        }
+        Event::RecoveryTicked {
+            id,
+            blood_before,
+            blood_after,
+            shock_before,
+            shock_after,
+            health_before,
+            health_after,
+        } => {
+            json!({"type":"recovery_ticked","id":id.raw(),"blood_before":blood_before,"blood_after":blood_after,"shock_before":shock_before,"shock_after":shock_after,"health_before":health_before,"health_after":health_after})
+        }
+        Event::WoundHealed { id, patient } => {
+            json!({"type":"wound_healed","id":id.0,"patient":patient.raw()})
+        }
     };
     json!({"at":x.at,"event":payload})
 }

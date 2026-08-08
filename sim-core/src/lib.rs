@@ -16,6 +16,11 @@ pub const HEMOSTATIC_DURATION: u64 = 10;
 pub const SHOCK_TREATMENT_DURATION: u64 = 15;
 pub const HEMOSTATIC_COST: u32 = 1;
 pub const SHOCK_TREATMENT_COST: u32 = 2;
+/// Recovery is evaluated on exact five-second boundaries.
+pub const RECOVERY_INTERVAL: u64 = 5;
+pub const RECOVERY_BLOOD_PER_TICK: u32 = 100;
+pub const RECOVERY_SHOCK_PER_TICK: u32 = 50;
+pub const RECOVERY_HEALTH_PER_TICK: u16 = 25;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Hash)]
 pub struct WoundId(pub u64);
@@ -44,6 +49,8 @@ pub struct CasualtyState {
     pub shock_remainder: u8,
     pub incapacitated: bool,
     pub recovering: bool,
+    /// The one canonical recovery boundary. `None` unless `recovering`.
+    pub recovery_next_at: Option<u64>,
     pub materialized_at: u64,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -425,6 +432,25 @@ pub enum Event {
         id: TreatmentId,
         reason: InterruptionReason,
     },
+    RecoveryChanged {
+        id: EntityId,
+        before: bool,
+        after: bool,
+        next_at: Option<u64>,
+    },
+    RecoveryTicked {
+        id: EntityId,
+        blood_before: u32,
+        blood_after: u32,
+        shock_before: u32,
+        shock_after: u32,
+        health_before: u16,
+        health_after: u16,
+    },
+    WoundHealed {
+        id: WoundId,
+        patient: EntityId,
+    },
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TimedEvent {
@@ -582,7 +608,9 @@ pub struct World {
     treatment_due: BTreeMap<u64, BTreeSet<TreatmentId>>,
     due_by_treatment: BTreeMap<TreatmentId, u64>,
     active_by_entity: BTreeMap<EntityId, TreatmentId>,
+    treatment_ids_by_entity: BTreeMap<EntityId, BTreeSet<TreatmentId>>,
     medic_index: BTreeMap<(u16, u32), BTreeSet<EntityId>>,
+    available_medics: BTreeMap<(u16, u32, u32), BTreeSet<EntityId>>,
     sourced_medical: u128,
     consumed_medical: u128,
     lost_medical: u128,
@@ -610,6 +638,7 @@ struct CompositeTransition {
     consumed_food: u128,
     consumed_water: u128,
     events: Vec<TimedEvent>,
+    recovery_completed: bool,
 }
 impl World {
     fn rates(a: Activity) -> (i32, u32, u32, i32) {
@@ -703,6 +732,13 @@ impl World {
                     d = d.min(at.saturating_sub(l.materialized_at).max(1));
                 }
             }
+            if c.recovering {
+                let recovery_at = c.recovery_next_at.ok_or(SimError::InvalidTreatment)?;
+                if recovery_at <= l.materialized_at {
+                    return Err(SimError::InvalidTreatment);
+                }
+                d = d.min(recovery_at - l.materialized_at);
+            }
         }
         Ok(l.materialized_at.checked_add(d))
     }
@@ -761,6 +797,7 @@ impl World {
                 consumed_food: 0,
                 consumed_water: 0,
                 events: Vec::new(),
+                recovery_completed: false,
             });
         }
         let mut l = living;
@@ -853,6 +890,7 @@ impl World {
         }
         let mut casualty = casualty;
         let mut interruption = None;
+        let mut recovery_completed = false;
         // Living needs and casualty physiology share this materialization
         // boundary.  In particular, a needs death at `at` must not leave the
         // casualty half of the authoritative record at an older timestamp.
@@ -881,6 +919,37 @@ impl World {
             let was_incapacitated = c.incapacitated;
             c.incapacitated = c.shock >= INCAPACITATED_SHOCK || c.blood <= BLOOD_MAX / 3;
             c.materialized_at = at;
+            if c.recovering && c.recovery_next_at == Some(at) && bleeding_rate == 0 {
+                let blood_before = c.blood;
+                let shock_before = c.shock;
+                let health_before = l.health;
+                c.blood = c
+                    .blood
+                    .saturating_add(RECOVERY_BLOOD_PER_TICK)
+                    .min(BLOOD_MAX);
+                c.shock = c.shock.saturating_sub(RECOVERY_SHOCK_PER_TICK);
+                l.health = l.health.saturating_add(RECOVERY_HEALTH_PER_TICK).min(1000);
+                c.incapacitated = c.shock >= INCAPACITATED_SHOCK || c.blood <= BLOOD_MAX / 3;
+                events.push(TimedEvent {
+                    at,
+                    event: Event::RecoveryTicked {
+                        id,
+                        blood_before,
+                        blood_after: c.blood,
+                        shock_before,
+                        shock_after: c.shock,
+                        health_before,
+                        health_after: l.health,
+                    },
+                });
+                if c.blood == BLOOD_MAX && c.shock == 0 && l.health == 1000 {
+                    c.recovering = false;
+                    c.recovery_next_at = None;
+                    recovery_completed = true;
+                } else {
+                    c.recovery_next_at = at.checked_add(RECOVERY_INTERVAL);
+                }
+            }
             if l.life == LifeState::Alive
                 && c.incapacitated
                 && !was_incapacitated
@@ -897,6 +966,10 @@ impl World {
                         forced: true,
                     },
                 });
+            }
+            if l.life == LifeState::Alive && c.incapacitated && !was_incapacitated {
+                interruption =
+                    active_treatment.map(|(tid, _)| (tid, InterruptionReason::Ineligible));
             }
             if l.life == LifeState::Alive && (c.blood == 0 || c.shock >= 1000) {
                 let cause = if c.blood == 0 {
@@ -938,6 +1011,7 @@ impl World {
             consumed_food,
             consumed_water,
             events,
+            recovery_completed,
         })
     }
     fn commit_transition(
@@ -953,9 +1027,36 @@ impl World {
         }
         self.soldiers.data[i].inventory = transition.inventory;
         self.soldiers.data[i].health = transition.living.health;
+        self.refresh_medic_availability(id);
         self.consumed_food += transition.consumed_food;
         self.consumed_water += transition.consumed_water;
         out.extend(transition.events);
+        if transition.recovery_completed {
+            if let Some(ids) = self.wound_ids_by_patient.get(&id) {
+                for wound_id in ids {
+                    let wound = self.wounds.get_mut(wound_id).expect("indexed wound");
+                    if wound.controlled && !wound.healed {
+                        wound.healed = true;
+                        out.push(TimedEvent {
+                            at: transition.living.materialized_at,
+                            event: Event::WoundHealed {
+                                id: *wound_id,
+                                patient: id,
+                            },
+                        });
+                    }
+                }
+            }
+            out.push(TimedEvent {
+                at: transition.living.materialized_at,
+                event: Event::RecoveryChanged {
+                    id,
+                    before: true,
+                    after: false,
+                    next_at: None,
+                },
+            });
+        }
     }
     pub fn new(seed: u64) -> Self {
         Self {
@@ -991,7 +1092,9 @@ impl World {
             treatment_due: BTreeMap::new(),
             due_by_treatment: BTreeMap::new(),
             active_by_entity: BTreeMap::new(),
+            treatment_ids_by_entity: BTreeMap::new(),
             medic_index: BTreeMap::new(),
+            available_medics: BTreeMap::new(),
             sourced_medical: 0,
             consumed_medical: 0,
             lost_medical: 0,
@@ -1097,6 +1200,36 @@ impl World {
         let mut blocked = None;
         let error = match c {
             Command::AdvanceTo { target } => self.advance(target, &mut events, &mut blocked),
+            Command::InflictWound { patient, wound } => {
+                self.inflict_wound(patient, wound).map(|es| {
+                    events.extend(es.into_iter().map(|event| TimedEvent {
+                        at: self.clock,
+                        event,
+                    }));
+                })
+            }
+            Command::DespawnSoldier { id } => {
+                let interruption = self.active_by_entity.get(&id).copied().map(|tid| {
+                    let reason = if self.treatments[&tid].medic == id {
+                        InterruptionReason::MedicRemoved
+                    } else {
+                        InterruptionReason::PatientRemoved
+                    };
+                    (tid, reason)
+                });
+                self.apply_one(Command::DespawnSoldier { id }).map(|event| {
+                    if let Some((id, reason)) = interruption {
+                        events.push(TimedEvent {
+                            at: self.clock,
+                            event: Event::TreatmentInterrupted { id, reason },
+                        });
+                    }
+                    events.push(TimedEvent {
+                        at: self.clock,
+                        event,
+                    });
+                })
+            }
             _ => self.apply_one(c).map(|e| {
                 events.push(TimedEvent {
                     at: self.clock,
@@ -1160,6 +1293,7 @@ impl World {
                         .or_default()
                         .insert(id);
                 }
+                self.refresh_medic_availability(id);
                 Ok(Event::SoldierSpawned {
                     id,
                     loadout: spec.into(),
@@ -1217,7 +1351,35 @@ impl World {
                     }
                 }
                 self.bleeding_rate_by_patient.remove(&id);
+                if let Some(history) = self.treatment_ids_by_entity.remove(&id) {
+                    for tid in history {
+                        if let Some(treatment) = self.treatments.remove(&tid) {
+                            if let Some(at) = self.due_by_treatment.remove(&tid) {
+                                if let Some(bucket) = self.treatment_due.get_mut(&at) {
+                                    bucket.remove(&tid);
+                                    if bucket.is_empty() {
+                                        self.treatment_due.remove(&at);
+                                    }
+                                }
+                            }
+                            let other = if treatment.medic == id {
+                                treatment.patient
+                            } else {
+                                treatment.medic
+                            };
+                            if let Some(other_history) =
+                                self.treatment_ids_by_entity.get_mut(&other)
+                            {
+                                other_history.remove(&tid);
+                                if other_history.is_empty() {
+                                    self.treatment_ids_by_entity.remove(&other);
+                                }
+                            }
+                        }
+                    }
+                }
                 self.soldiers.remove(id);
+                self.refresh_medic_availability(id);
                 Ok(Event::SoldierRemoved {
                     id,
                     loadout: spec.into(),
@@ -1353,6 +1515,7 @@ impl World {
                 };
                 self.unschedule_due(id);
                 self.soldiers.living[id.index()] = replacement;
+                self.refresh_medic_availability(id);
                 if !hot {
                     if let Some(at) = due {
                         self.living_due.entry(at).or_default().insert(id);
@@ -1366,7 +1529,7 @@ impl World {
                     forced: false,
                 })
             }
-            Command::InflictWound { patient, wound } => self.inflict_wound(patient, wound),
+            Command::InflictWound { .. } => unreachable!("multi-event command handled by apply"),
             Command::StartTreatment {
                 medic,
                 patient,
@@ -1382,14 +1545,14 @@ impl World {
                     return Err(SimError::InvalidEntity);
                 }
                 let spec = self.soldiers.data[patient.index()];
+                let cost = match kind {
+                    TreatmentKind::Hemostatic => HEMOSTATIC_COST,
+                    TreatmentKind::Shock => SHOCK_TREATMENT_COST,
+                };
                 let medic = self
-                    .medic_index
-                    .get(&(spec.faction, spec.position.cell))
-                    .and_then(|ids| {
-                        ids.iter()
-                            .copied()
-                            .find(|id| self.eligible_medic(*id, patient, kind))
-                    })
+                    .available_medics
+                    .get(&(spec.faction, spec.position.cell, cost))
+                    .and_then(|ids| ids.iter().copied().next())
                     .ok_or(SimError::NoEligibleMedic)?;
                 self.start_treatment(medic, patient, wound, kind)
             }
@@ -1405,6 +1568,78 @@ impl World {
     }
     fn is_incapacitated(&self, id: EntityId) -> bool {
         self.casualty.get(&id).is_some_and(|c| c.incapacitated)
+    }
+    fn refresh_medic_availability(&mut self, id: EntityId) {
+        for ids in self.available_medics.values_mut() {
+            ids.remove(&id);
+        }
+        self.available_medics.retain(|_, ids| !ids.is_empty());
+        if !self.soldiers.valid(id) {
+            return;
+        }
+        let s = self.soldiers.data[id.index()];
+        let available = s.role == Role::Medic
+            && self.soldiers.living[id.index()].life == LifeState::Alive
+            && self.soldiers.living[id.index()].activity != Activity::March
+            && !self.is_incapacitated(id)
+            && !self.active_by_entity.contains_key(&id);
+        if available {
+            for cost in [HEMOSTATIC_COST, SHOCK_TREATMENT_COST] {
+                if s.inventory.medical >= cost {
+                    self.available_medics
+                        .entry((s.faction, s.position.cell, cost))
+                        .or_default()
+                        .insert(id);
+                }
+            }
+        }
+    }
+    fn recovery_eligible(&self, id: EntityId) -> bool {
+        self.soldiers.valid(id)
+            && self.soldiers.living[id.index()].life == LifeState::Alive
+            && self
+                .casualty
+                .get(&id)
+                .is_some_and(|c| c.blood != 0 && c.shock < 1000)
+            && self.bleeding_rate_by_patient.get(&id).copied().unwrap_or(0) == 0
+            && self.wound_ids_by_patient.get(&id).is_some_and(|ids| {
+                !ids.is_empty()
+                    && ids.iter().all(|wid| {
+                        self.wounds
+                            .get(wid)
+                            .is_some_and(|w| w.controlled || w.healed)
+                    })
+            })
+    }
+    fn reevaluate_recovery(&mut self, id: EntityId, at: u64) -> Result<Option<Event>, SimError> {
+        let eligible = self.recovery_eligible(id);
+        let Some(c) = self.casualty.get_mut(&id) else {
+            return Ok(None);
+        };
+        if eligible && !c.recovering {
+            let next = at
+                .checked_add(RECOVERY_INTERVAL)
+                .ok_or(SimError::ArithmeticOverflow)?;
+            c.recovering = true;
+            c.recovery_next_at = Some(next);
+            Ok(Some(Event::RecoveryChanged {
+                id,
+                before: false,
+                after: true,
+                next_at: Some(next),
+            }))
+        } else if !eligible && c.recovering {
+            c.recovering = false;
+            c.recovery_next_at = None;
+            Ok(Some(Event::RecoveryChanged {
+                id,
+                before: true,
+                after: false,
+                next_at: None,
+            }))
+        } else {
+            Ok(None)
+        }
     }
     fn eligible_medic(&self, medic: EntityId, patient: EntityId, kind: TreatmentKind) -> bool {
         if medic == patient || !self.soldiers.valid(medic) || !self.soldiers.valid(patient) {
@@ -1423,11 +1658,16 @@ impl World {
             && self.soldiers.living[medic.index()].life == LifeState::Alive
             && self.soldiers.living[patient.index()].life == LifeState::Alive
             && self.soldiers.living[medic.index()].activity != Activity::March
+            && self.soldiers.living[patient.index()].activity != Activity::March
             && !self.is_incapacitated(medic)
             && !self.active_by_entity.contains_key(&medic)
             && !self.active_by_entity.contains_key(&patient)
     }
-    fn inflict_wound(&mut self, patient: EntityId, spec: WoundSpec) -> Result<Event, SimError> {
+    fn inflict_wound(
+        &mut self,
+        patient: EntityId,
+        spec: WoundSpec,
+    ) -> Result<Vec<Event>, SimError> {
         if !self.soldiers.valid(patient) {
             return Err(SimError::InvalidEntity);
         }
@@ -1496,27 +1736,57 @@ impl World {
             .min(1000);
         casualty.incapacitated =
             casualty.shock >= INCAPACITATED_SHOCK || casualty.blood <= BLOOD_MAX / 3;
+        let recovery_was_active = casualty.recovering;
         casualty.recovering = false;
+        casualty.recovery_next_at = None;
         let mut replacement = old;
         replacement.health = health;
         replacement.materialized_at = self.clock;
-        if health == 0 {
+        let death_cause = if health == 0 {
+            Some(DeathCause::ImmediateTrauma)
+        } else if casualty.shock >= 1000 {
+            Some(DeathCause::TraumaticShock)
+        } else {
+            None
+        };
+        if let Some(cause) = death_cause {
             replacement.life = LifeState::Dead {
                 at: self.clock,
-                cause: DeathCause::ImmediateTrauma,
+                cause,
             };
+            replacement.health = 0;
         }
-        if casualty.incapacitated {
+        let forced_idle = death_cause.is_none()
+            && casualty.incapacitated
+            && replacement.activity != Activity::Idle;
+        let activity_before = replacement.activity;
+        if forced_idle {
             replacement.activity = Activity::Idle;
         }
-        if (!was_incapacitated && casualty.incapacitated) || health == 0 {
-            if let Some(tid) = self.active_by_entity.get(&patient).copied() {
-                self.interrupt_internal(tid, InterruptionReason::Ineligible)?;
-            }
-        }
+        let interruption = self
+            .active_by_entity
+            .get(&patient)
+            .copied()
+            .and_then(|tid| {
+                if death_cause.is_some() {
+                    let t = self.treatments[&tid];
+                    Some((
+                        tid,
+                        if t.medic == patient {
+                            InterruptionReason::MedicDied
+                        } else {
+                            InterruptionReason::PatientDied
+                        },
+                    ))
+                } else if !was_incapacitated && casualty.incapacitated {
+                    Some((tid, InterruptionReason::Ineligible))
+                } else {
+                    None
+                }
+            });
         self.next_wound_id = next;
         self.soldiers.living[patient.index()] = replacement;
-        self.soldiers.data[patient.index()].health = health;
+        self.soldiers.data[patient.index()].health = replacement.health;
         self.casualty.insert(patient, casualty);
         self.wounds.insert(
             id,
@@ -1537,11 +1807,40 @@ impl World {
             self.bleeding_rate_by_patient.insert(patient, rate);
         }
         self.schedule_due(patient)?;
-        Ok(Event::WoundInflicted {
+        self.refresh_medic_availability(patient);
+        let mut events = vec![Event::WoundInflicted {
             id,
             patient,
             wound: spec,
-        })
+        }];
+        if forced_idle {
+            events.push(Event::ActivityChanged {
+                id: patient,
+                before: activity_before,
+                after: Activity::Idle,
+                forced: true,
+            });
+        }
+        if let Some(cause) = death_cause {
+            events.push(Event::SoldierDied {
+                id: patient,
+                cause,
+                health_before: old.health,
+            });
+        }
+        if recovery_was_active {
+            events.push(Event::RecoveryChanged {
+                id: patient,
+                before: true,
+                after: false,
+                next_at: None,
+            });
+        }
+        if let Some((tid, reason)) = interruption {
+            self.interrupt_internal(tid, reason)?;
+            events.push(Event::TreatmentInterrupted { id: tid, reason });
+        }
+        Ok(events)
     }
     fn start_treatment(
         &mut self,
@@ -1614,6 +1913,16 @@ impl World {
         self.due_by_treatment.insert(id, completes_at);
         self.active_by_entity.insert(medic, id);
         self.active_by_entity.insert(patient, id);
+        self.treatment_ids_by_entity
+            .entry(medic)
+            .or_default()
+            .insert(id);
+        self.treatment_ids_by_entity
+            .entry(patient)
+            .or_default()
+            .insert(id);
+        self.refresh_medic_availability(medic);
+        self.refresh_medic_availability(patient);
         Ok(Event::TreatmentStarted {
             id,
             medic,
@@ -1650,6 +1959,10 @@ impl World {
         }
         self.active_by_entity.remove(&t.medic);
         self.active_by_entity.remove(&t.patient);
+        let medic = t.medic;
+        let patient = t.patient;
+        self.refresh_medic_availability(medic);
+        self.refresh_medic_availability(patient);
         Ok(())
     }
     fn validate_schedule(&self, c: ScheduledCommand) -> Result<(), SimError> {
@@ -2048,13 +2361,15 @@ impl World {
                         .ok_or(SimError::InvalidTreatment)?;
                     c.shock = c.shock.saturating_sub(300);
                     c.incapacitated = c.shock >= INCAPACITATED_SHOCK || c.blood <= BLOOD_MAX / 3;
-                    c.recovering = true;
                 }
             }
+            let recovery_event = self.reevaluate_recovery(t.patient, at)?;
             self.treatments.get_mut(&tid).unwrap().status = TreatmentStatus::Completed { at };
             self.due_by_treatment.remove(&tid);
             self.active_by_entity.remove(&t.medic);
             self.active_by_entity.remove(&t.patient);
+            self.refresh_medic_availability(t.medic);
+            self.refresh_medic_availability(t.patient);
             self.schedule_due(t.patient)?;
             out.push(TimedEvent {
                 at,
@@ -2065,6 +2380,9 @@ impl World {
                     kind: t.kind,
                 },
             });
+            if let Some(event) = recovery_event {
+                out.push(TimedEvent { at, event });
+            }
         }
         Ok(())
     }
@@ -2245,6 +2563,9 @@ impl World {
                             self.due_by_treatment.insert(tid, treatment.completes_at);
                         }
                     }
+                }
+                for id in &touched {
+                    self.refresh_medic_availability(*id);
                 }
                 self.consumed_food = counters.0;
                 self.consumed_water = counters.1;
@@ -2469,6 +2790,10 @@ impl World {
             w.u8(c.shock_remainder);
             w.bool(c.incapacitated);
             w.bool(c.recovering);
+            w.bool(c.recovery_next_at.is_some());
+            if let Some(at) = c.recovery_next_at {
+                w.u64(at);
+            }
             w.u64(c.materialized_at);
         }
         w.u32(self.wounds.len() as u32);
@@ -2717,6 +3042,7 @@ impl World {
                 shock_remainder: r.u8()?,
                 incapacitated: r.bool()?,
                 recovering: r.bool()?,
+                recovery_next_at: if r.bool()? { Some(r.u64()?) } else { None },
                 materialized_at: r.u64()?,
             };
             if !soldiers.valid(id)
@@ -2724,6 +3050,8 @@ impl World {
                 || c.shock > 1000
                 || c.shock_remainder >= 10
                 || c.materialized_at > clock
+                || c.recovering != c.recovery_next_at.is_some()
+                || c.recovery_next_at.is_some_and(|at| at <= clock)
                 || casualty.insert(id, c).is_some()
             {
                 return Err(SimError::Snapshot("casualty"));
@@ -2849,7 +3177,9 @@ impl World {
             treatment_due: BTreeMap::new(),
             due_by_treatment: BTreeMap::new(),
             active_by_entity,
+            treatment_ids_by_entity: BTreeMap::new(),
             medic_index: BTreeMap::new(),
+            available_medics: BTreeMap::new(),
             sourced_medical,
             consumed_medical,
             lost_medical,
@@ -2877,7 +3207,31 @@ impl World {
                     .ok_or(SimError::Snapshot("bleeding aggregate"))?;
             }
         }
+        for (id, casualty) in &w.casualty {
+            if casualty.recovering
+                && (w.soldiers.living[id.index()].life != LifeState::Alive
+                    || casualty.blood == 0
+                    || casualty.shock >= 1000
+                    || w.bleeding_rate_by_patient.get(id).copied().unwrap_or(0) != 0
+                    || !w.wound_ids_by_patient.get(id).is_some_and(|ids| {
+                        !ids.is_empty()
+                            && ids.iter().all(|wid| {
+                                w.wounds.get(wid).is_some_and(|x| x.controlled || x.healed)
+                            })
+                    }))
+            {
+                return Err(SimError::Snapshot("recovery state"));
+            }
+        }
         for (id, treatment) in &w.treatments {
+            w.treatment_ids_by_entity
+                .entry(treatment.medic)
+                .or_default()
+                .insert(*id);
+            w.treatment_ids_by_entity
+                .entry(treatment.patient)
+                .or_default()
+                .insert(*id);
             if treatment.status == TreatmentStatus::Active {
                 w.treatment_due
                     .entry(treatment.completes_at)
@@ -2900,6 +3254,7 @@ impl World {
                         .or_default()
                         .insert(id);
                 }
+                w.refresh_medic_availability(id);
             }
         }
         w.validate()?;
@@ -6223,6 +6578,7 @@ mod private_invariants {
                 shock_remainder: 9,
                 incapacitated: true,
                 recovering: false,
+                recovery_next_at: None,
                 materialized_at: 477
             }
         );
@@ -6273,6 +6629,7 @@ mod private_invariants {
                 shock_remainder: 5,
                 incapacitated: true,
                 recovering: false,
+                recovery_next_at: None,
                 materialized_at: 715
             }
         );
@@ -6640,8 +6997,8 @@ mod private_invariants {
         assert_eq!(
             control.treatments[&tid].status,
             TreatmentStatus::Interrupted {
-                at: 5,
-                reason: InterruptionReason::PatientDied
+                at: 4,
+                reason: InterruptionReason::Ineligible
             }
         );
         assert_eq!(control_out.events.iter().filter(|event| matches!(event.event, Event::TreatmentInterrupted { id, .. } if id == tid)).count(), 1);
@@ -6744,6 +7101,7 @@ mod private_invariants {
                 shock_remainder: 0,
                 incapacitated: true,
                 recovering: false,
+                recovery_next_at: None,
                 materialized_at: 0,
             },
         );
