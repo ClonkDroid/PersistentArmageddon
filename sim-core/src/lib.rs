@@ -8211,6 +8211,8 @@ mod private_invariants {
     #[test]
     fn gate_b_acceptance_09_real_medic_churn_visits_only_eligible_candidates() {
         let mut world = World::new(409);
+        let availability_keys =
+            BTreeSet::from([(0, 0, HEMOSTATIC_COST), (0, 0, SHOCK_TREATMENT_COST)]);
         let medic_spec = |medical| SoldierSpec {
             role: Role::Medic,
             inventory: Inventory {
@@ -8257,8 +8259,10 @@ mod private_invariants {
                 ..
             }
         ));
+        let mut other_faction = BTreeSet::new();
+        let mut other_cell = BTreeSet::new();
         for i in 0..2_000 {
-            spawn(
+            let id = spawn(
                 &mut world,
                 SoldierSpec {
                     faction: if i % 2 == 0 { 1 } else { 0 },
@@ -8274,9 +8278,46 @@ mod private_invariants {
                     ..SoldierSpec::default()
                 },
             );
+            if i % 2 == 0 {
+                other_faction.insert(id);
+            } else {
+                other_cell.insert(id);
+            }
         }
 
+        let requested_cohort = BTreeSet::from([
+            patient, marching, busy, poor, recovering, dead, eligible, helper,
+        ]);
+        assert_eq!(world.medic_index[&(0, 0)], requested_cohort);
+        assert_eq!(world.medic_index[&(1, 0)], other_faction);
+        assert_eq!(world.medic_index[&(0, 99)], other_cell);
+        assert_eq!(world.medic_index.len(), 3);
+        assert_eq!(world.medic_index[&(1, 0)].len(), 1_000);
+        assert_eq!(world.medic_index[&(0, 99)].len(), 1_000);
+        for cost in [HEMOSTATIC_COST, SHOCK_TREATMENT_COST] {
+            assert_eq!(world.available_medics[&(1, 0, cost)], other_faction);
+            assert_eq!(world.available_medics[&(0, 99, cost)], other_cell);
+        }
+        for id in [marching, busy, poor, recovering, dead] {
+            assert!(!world.availability_by_medic.contains_key(&id));
+        }
+        for id in [patient, eligible, helper] {
+            assert_eq!(world.availability_by_medic[&id], availability_keys);
+        }
+        assert_eq!(
+            world.available_medics[&(0, 0, HEMOSTATIC_COST)],
+            BTreeSet::from([patient, eligible, helper])
+        );
+        assert_eq!(
+            world.available_medics[&(0, 0, SHOCK_TREATMENT_COST)],
+            BTreeSet::from([patient, eligible, helper])
+        );
+
         let patient_wound = gate_wound(&mut world, patient, 1, 0);
+        assert_eq!(
+            world.available_medics[&(0, 0, HEMOSTATIC_COST)],
+            BTreeSet::from([patient, eligible, helper])
+        );
         let before = world.selection_candidates;
         let selected = world.apply(Command::RequestTreatment {
             patient,
@@ -8284,22 +8325,33 @@ mod private_invariants {
             kind: TreatmentKind::Hemostatic,
         });
         assert_eq!(selected.error, None);
-        assert!(matches!(
-            selected.events.as_slice(),
-            [TimedEvent {
+        assert_eq!(
+            selected.events,
+            vec![TimedEvent {
                 at: 0,
                 event: Event::TreatmentStarted {
                     id: TreatmentId(1),
-                    medic,
-                    patient: selected_patient,
+                    medic: eligible,
+                    patient,
+                    wound: Some(patient_wound),
+                    kind: TreatmentKind::Hemostatic,
+                    completes_at: 10,
                     consumed: HEMOSTATIC_COST,
-                    ..
                 },
-            }] if *medic == eligible && *selected_patient == patient
-        ));
+            }]
+        );
         assert_eq!(world.selection_candidates - before, 2); // self, then the sole eligible medic
         assert_eq!(world.consumed_medical, 2);
         assert_eq!(world.soldiers.data[eligible.index()].inventory.medical, 3);
+        assert_eq!(
+            world.resource_totals(),
+            ResourceTotals {
+                carried_medical: 20_042,
+                sourced_medical: 20_044,
+                consumed_medical: 2,
+                ..ResourceTotals::default()
+            }
+        );
 
         assert_eq!(
             world
@@ -8318,9 +8370,103 @@ mod private_invariants {
                 .error,
             None
         );
-        assert_eq!(world.apply(Command::AdvanceTo { target: 15 }).error, None);
+        let recovery = world.apply(Command::AdvanceTo { target: 15 });
+        assert_eq!(recovery.error, None);
+        assert_eq!(
+            recovery.events,
+            vec![
+                TimedEvent {
+                    at: 10,
+                    event: Event::TreatmentCompleted {
+                        id: TreatmentId(0),
+                        medic: busy,
+                        patient: busy_patient,
+                        kind: TreatmentKind::Hemostatic
+                    }
+                },
+                TimedEvent {
+                    at: 10,
+                    event: Event::RecoveryChanged {
+                        id: busy_patient,
+                        before: false,
+                        after: true,
+                        next_at: Some(15)
+                    }
+                },
+                TimedEvent {
+                    at: 10,
+                    event: Event::TreatmentCompleted {
+                        id: TreatmentId(2),
+                        medic: helper,
+                        patient: recovering,
+                        kind: TreatmentKind::Hemostatic
+                    }
+                },
+                TimedEvent {
+                    at: 10,
+                    event: Event::RecoveryChanged {
+                        id: recovering,
+                        before: false,
+                        after: true,
+                        next_at: Some(15)
+                    }
+                },
+                TimedEvent {
+                    at: 15,
+                    event: Event::RecoveryTicked {
+                        id: recovering,
+                        blood_before: 4_990,
+                        blood_after: 5_000,
+                        shock_before: 701,
+                        shock_after: 651,
+                        health_before: 1_000,
+                        health_after: 1_000
+                    }
+                },
+                TimedEvent {
+                    at: 15,
+                    event: Event::RecoveryTicked {
+                        id: busy_patient,
+                        blood_before: 4_990,
+                        blood_after: 5_000,
+                        shock_before: 1,
+                        shock_after: 0,
+                        health_before: 1_000,
+                        health_after: 1_000
+                    }
+                },
+                TimedEvent {
+                    at: 15,
+                    event: Event::WoundHealed {
+                        id: busy_wound,
+                        patient: busy_patient
+                    }
+                },
+                TimedEvent {
+                    at: 15,
+                    event: Event::RecoveryChanged {
+                        id: busy_patient,
+                        before: true,
+                        after: false,
+                        next_at: None
+                    }
+                },
+                TimedEvent {
+                    at: 15,
+                    event: Event::TimeAdvanced {
+                        from: 0,
+                        to: 15,
+                        hot_cells_stepped: 0,
+                        fixed_steps_per_hot_cell: 0
+                    }
+                },
+            ]
+        );
         assert!(!world.casualty[&recovering].incapacitated);
-        assert!(world.availability_by_medic.contains_key(&recovering));
+        assert_eq!(world.casualty[&recovering].blood, 5_000);
+        assert_eq!(world.casualty[&recovering].shock, 651);
+        assert!(world.casualty[&recovering].recovering);
+        assert_eq!(world.casualty[&recovering].recovery_next_at, Some(20));
         assert_eq!(
             world
                 .apply(Command::SetActivity {
@@ -8330,19 +8476,62 @@ mod private_invariants {
                 .error,
             None
         );
+        assert_eq!(world.medic_index[&(0, 0)], requested_cohort);
+        assert_eq!(world.medic_index[&(1, 0)], other_faction);
+        assert_eq!(world.medic_index[&(0, 99)], other_cell);
+        for cost in [HEMOSTATIC_COST, SHOCK_TREATMENT_COST] {
+            assert_eq!(world.available_medics[&(1, 0, cost)], other_faction);
+            assert_eq!(world.available_medics[&(0, 99, cost)], other_cell);
+        }
+        for id in [marching, busy, poor, dead] {
+            assert!(!world.availability_by_medic.contains_key(&id));
+        }
+        for id in [patient, recovering, eligible, helper] {
+            assert_eq!(world.availability_by_medic[&id], availability_keys);
+        }
+        assert_eq!(
+            world.available_medics[&(0, 0, HEMOSTATIC_COST)],
+            BTreeSet::from([patient, recovering, eligible, helper])
+        );
 
         let second_wound = gate_wound(&mut world, patient, 1, 0);
+        assert_eq!(
+            world.available_medics[&(0, 0, HEMOSTATIC_COST)],
+            BTreeSet::from([patient, recovering, eligible, helper])
+        );
         let before = world.selection_candidates;
         let recovered_selected = world.apply(Command::RequestTreatment {
             patient,
             wound: Some(second_wound),
             kind: TreatmentKind::Hemostatic,
         });
-        assert!(matches!(
-            recovered_selected.events[0].event,
-            Event::TreatmentStarted { medic, .. } if medic == recovering
-        ));
+        assert_eq!(recovered_selected.error, None);
+        assert_eq!(
+            recovered_selected.events,
+            vec![TimedEvent {
+                at: 15,
+                event: Event::TreatmentStarted {
+                    id: TreatmentId(3),
+                    medic: recovering,
+                    patient,
+                    wound: Some(second_wound),
+                    kind: TreatmentKind::Hemostatic,
+                    completes_at: 25,
+                    consumed: HEMOSTATIC_COST
+                }
+            }]
+        );
         assert_eq!(world.selection_candidates - before, 2);
+        assert_eq!(world.soldiers.data[recovering.index()].inventory.medical, 3);
+        assert_eq!(
+            world.resource_totals(),
+            ResourceTotals {
+                carried_medical: 20_040,
+                sourced_medical: 20_044,
+                consumed_medical: 4,
+                ..ResourceTotals::default()
+            }
+        );
         let active = world.active_by_entity[&patient];
         assert_eq!(
             world
@@ -8353,6 +8542,7 @@ mod private_invariants {
 
         let removed = world.apply(Command::DespawnSoldier { id: recovering });
         assert_eq!(removed.error, None);
+        assert!(!world.medic_index[&(0, 0)].contains(&recovering));
         assert!(!world.availability_by_medic.contains_key(&recovering));
         assert!(world
             .available_medics
@@ -8361,18 +8551,77 @@ mod private_invariants {
         let replacement = spawn(&mut world, medic_spec(4));
         assert_eq!(replacement.index(), recovering.index());
         assert_eq!(replacement.generation(), recovering.generation() + 1);
+        assert_eq!(world.availability_by_medic[&replacement], availability_keys);
+        assert_eq!(
+            world.medic_index[&(0, 0)],
+            BTreeSet::from([
+                patient,
+                marching,
+                busy,
+                poor,
+                replacement,
+                dead,
+                eligible,
+                helper
+            ])
+        );
+        assert!(world
+            .available_medics
+            .values()
+            .all(|ids| !ids.contains(&recovering)));
+        for id in [marching, busy, poor, dead] {
+            assert!(!world.availability_by_medic.contains_key(&id));
+        }
+        for id in [patient, replacement, eligible, helper] {
+            assert_eq!(world.availability_by_medic[&id], availability_keys);
+        }
+        for cost in [HEMOSTATIC_COST, SHOCK_TREATMENT_COST] {
+            assert_eq!(
+                world.available_medics[&(0, 0, cost)],
+                BTreeSet::from([patient, replacement, eligible, helper])
+            );
+            assert_eq!(world.available_medics[&(1, 0, cost)], other_faction);
+            assert_eq!(world.available_medics[&(0, 99, cost)], other_cell);
+        }
         let third_wound = gate_wound(&mut world, patient, 1, 0);
+        assert_eq!(
+            world.available_medics[&(0, 0, HEMOSTATIC_COST)],
+            BTreeSet::from([patient, replacement, eligible, helper])
+        );
         let before = world.selection_candidates;
         let reused_selected = world.apply(Command::RequestTreatment {
             patient,
             wound: Some(third_wound),
             kind: TreatmentKind::Hemostatic,
         });
-        assert!(matches!(
-            reused_selected.events[0].event,
-            Event::TreatmentStarted { medic, .. } if medic == eligible
-        ));
+        assert_eq!(reused_selected.error, None);
+        assert_eq!(
+            reused_selected.events,
+            vec![TimedEvent {
+                at: 15,
+                event: Event::TreatmentStarted {
+                    id: TreatmentId(4),
+                    medic: eligible,
+                    patient,
+                    wound: Some(third_wound),
+                    kind: TreatmentKind::Hemostatic,
+                    completes_at: 25,
+                    consumed: HEMOSTATIC_COST
+                }
+            }]
+        );
         assert_eq!(world.selection_candidates - before, 2);
+        assert_eq!(world.soldiers.data[eligible.index()].inventory.medical, 2);
+        assert_eq!(
+            world.resource_totals(),
+            ResourceTotals {
+                carried_medical: 20_040,
+                sourced_medical: 20_048,
+                consumed_medical: 5,
+                lost_medical: 3,
+                ..ResourceTotals::default()
+            }
+        );
         assert!(world
             .available_medics
             .values()
@@ -8385,9 +8634,17 @@ mod private_invariants {
     fn gate_b_acceptance_10_materialized_removal_cleans_both_endpoint_roles() {
         for remove_medic in [true, false] {
             let mut world = World::new(if remove_medic { 410 } else { 411 });
+            assert_eq!(
+                world.apply(Command::CreateSquad { id: 77 }).events,
+                vec![TimedEvent {
+                    at: 0,
+                    event: Event::SquadCreated { id: 77 }
+                }]
+            );
             let medic = spawn(
                 &mut world,
                 SoldierSpec {
+                    squad: Some(77),
                     role: Role::Medic,
                     inventory: Inventory {
                         food: 7,
@@ -8400,6 +8657,7 @@ mod private_invariants {
             let patient = spawn(
                 &mut world,
                 SoldierSpec {
+                    squad: Some(77),
                     inventory: Inventory {
                         food: 11,
                         water: 12,
@@ -8415,6 +8673,8 @@ mod private_invariants {
             assert_eq!(world.clock, 3);
             assert_eq!(world.casualty[&medic].materialized_at, 0);
             assert_eq!(world.casualty[&patient].materialized_at, 0);
+            assert_eq!(world.squads[&77].members, BTreeSet::from([medic, patient]));
+            assert_eq!(world.cell_members[&0], BTreeSet::from([medic, patient]));
 
             let removed = if remove_medic { medic } else { patient };
             let survivor = if remove_medic { patient } else { medic };
@@ -8459,8 +8719,20 @@ mod private_invariants {
                     },
                 ]
             );
+            assert_eq!(world.soldiers.living[removed.index()].materialized_at, 3);
+            assert_eq!(world.soldiers.living[removed.index()].health, 1_000);
+            assert_eq!(
+                world.soldiers.data[removed.index()].inventory,
+                Inventory {
+                    food: expected_loadout.food,
+                    water: expected_loadout.water,
+                    medical: expected_loadout.medical
+                }
+            );
             assert!(!world.soldiers.valid(removed));
             assert!(world.soldiers.valid(survivor));
+            assert_eq!(world.squads[&77].members, BTreeSet::from([survivor]));
+            assert_eq!(world.cell_members[&0], BTreeSet::from([survivor]));
             assert!(!world.casualty.contains_key(&removed));
             assert!(!world.wound_ids_by_patient.contains_key(&removed));
             assert!(!world.bleeding_rate_by_patient.contains_key(&removed));
@@ -8476,6 +8748,17 @@ mod private_invariants {
             assert!(!world.treatment_ids_by_entity.contains_key(&removed));
             assert!(!world.treatment_ids_by_entity.contains_key(&survivor));
             assert!(!world.availability_by_medic.contains_key(&removed));
+            if remove_medic {
+                assert_eq!(world.medic_index.get(&(0, 0)), None);
+                assert!(!world.availability_by_medic.contains_key(&survivor));
+            } else {
+                assert_eq!(world.medic_index[&(0, 0)], BTreeSet::from([survivor]));
+                let keys = BTreeSet::from([(0, 0, HEMOSTATIC_COST), (0, 0, SHOCK_TREATMENT_COST)]);
+                assert_eq!(world.availability_by_medic[&survivor], keys);
+                for key in keys {
+                    assert_eq!(world.available_medics[&key], BTreeSet::from([survivor]));
+                }
+            }
             assert!(world
                 .available_medics
                 .values()
@@ -8529,6 +8812,66 @@ mod private_invariants {
                 carried_water + world.consumed_water + world.lost_water
             );
 
+            let survivor_wound = if remove_medic {
+                patient_wound
+            } else {
+                medic_wound
+            };
+            assert_eq!(
+                world.wound_ids_by_patient[&survivor],
+                BTreeSet::from([survivor_wound])
+            );
+            assert_eq!(world.wounds[&survivor_wound].patient, survivor);
+            assert_eq!(
+                world.wounds[&survivor_wound].spec.bleeding_per_second,
+                if remove_medic { 2 } else { 1 }
+            );
+            assert!(!world.wounds[&survivor_wound].controlled);
+            assert!(!world.wounds[&survivor_wound].healed);
+            assert_eq!(
+                world.bleeding_rate_by_patient[&survivor],
+                if remove_medic { 2 } else { 1 }
+            );
+            assert_eq!(world.casualty[&survivor].materialized_at, 0);
+            assert_eq!(world.casualty[&survivor].blood, 5_000);
+            assert_eq!(world.casualty[&survivor].shock, 0);
+            assert!(!world.casualty[&survivor].incapacitated);
+            assert!(!world.casualty[&survivor].recovering);
+            assert_eq!(world.casualty[&survivor].recovery_next_at, None);
+            assert_eq!(
+                world.soldiers.living[survivor.index()].life,
+                LifeState::Alive
+            );
+            assert_eq!(
+                world.soldiers.living[survivor.index()].activity,
+                Activity::Idle
+            );
+            assert_eq!(world.due_by_entity[&survivor], 50);
+            assert!(world.living_due[&50].contains(&survivor));
+            assert_eq!(world.treatment_ids_by_entity.get(&survivor), None);
+
+            let after_deadline = world.apply(Command::AdvanceTo { target: 20 });
+            assert_eq!(after_deadline.error, None);
+            assert_eq!(
+                after_deadline.events,
+                vec![TimedEvent {
+                    at: 20,
+                    event: Event::TimeAdvanced {
+                        from: 3,
+                        to: 20,
+                        hot_cells_stepped: 0,
+                        fixed_steps_per_hot_cell: 0
+                    }
+                }]
+            );
+            assert!(world.treatments.is_empty());
+            assert!(world.treatment_due.values().all(BTreeSet::is_empty));
+            assert!(world.due_by_treatment.is_empty());
+            assert!(world.active_by_entity.is_empty());
+            assert!(world.treatment_ids_by_entity.is_empty());
+            assert!(world.living_due.values().all(|ids| !ids.contains(&removed)));
+            assert!(!world.due_by_entity.contains_key(&removed));
+
             let replacement = spawn(&mut world, SoldierSpec::default());
             assert_eq!(replacement.index(), removed.index());
             assert_eq!(replacement.generation(), removed.generation() + 1);
@@ -8536,11 +8879,129 @@ mod private_invariants {
             assert!(!world.wound_ids_by_patient.contains_key(&replacement));
             assert!(!world.active_by_entity.contains_key(&replacement));
             assert!(!world.treatment_ids_by_entity.contains_key(&replacement));
+            assert_eq!(world.squads[&77].members, BTreeSet::from([survivor]));
+            assert_eq!(
+                world.cell_members[&0],
+                BTreeSet::from([survivor, replacement])
+            );
+            assert!(world.cell_members[&0].contains(&replacement));
+            assert!(!world.cell_members[&0].contains(&removed));
+            let stable_digest = world.state_digest();
             let before = world.snapshot();
+            let stable_allocator = (
+                world.soldiers.generation.clone(),
+                world.soldiers.alive.clone(),
+                world.soldiers.free.clone(),
+                world.soldiers.live,
+            );
+            let stable_private = (
+                (
+                    world.medic_index.clone(),
+                    world.available_medics.clone(),
+                    world.availability_by_medic.clone(),
+                    world.living_due.clone(),
+                    world.due_by_entity.clone(),
+                    world.treatment_due.clone(),
+                    world.due_by_treatment.clone(),
+                ),
+                (
+                    world.active_by_entity.clone(),
+                    world.treatment_ids_by_entity.clone(),
+                    world.wound_ids_by_patient.clone(),
+                    world.bleeding_rate_by_patient.clone(),
+                    world.cell_members.clone(),
+                    world.squads.clone(),
+                ),
+            );
+            let stable_scalars = (
+                (
+                    world.next_wound_id,
+                    world.next_treatment_id,
+                    world.sourced_food,
+                    world.sourced_water,
+                    world.consumed_food,
+                    world.consumed_water,
+                    world.lost_food,
+                    world.lost_water,
+                    world.sourced_medical,
+                    world.consumed_medical,
+                ),
+                (
+                    world.lost_medical,
+                    world.hot_member_steps,
+                    world.cold_boundaries,
+                    world.automatic_journal_visits,
+                    world.automatic_execution_visits,
+                    world.medical_entity_candidates,
+                    world.wound_index_visits,
+                    world.treatment_completion_candidates,
+                    world.selection_candidates,
+                ),
+            );
             let stale = world.apply(Command::DespawnSoldier { id: removed });
             assert_eq!(stale.error, Some(SimError::InvalidEntity));
             assert!(stale.events.is_empty());
             assert_eq!(world.snapshot(), before);
+            assert_eq!(world.state_digest(), stable_digest);
+            assert_eq!(
+                stable_allocator,
+                (
+                    world.soldiers.generation.clone(),
+                    world.soldiers.alive.clone(),
+                    world.soldiers.free.clone(),
+                    world.soldiers.live,
+                )
+            );
+            assert_eq!(
+                stable_private,
+                (
+                    (
+                        world.medic_index.clone(),
+                        world.available_medics.clone(),
+                        world.availability_by_medic.clone(),
+                        world.living_due.clone(),
+                        world.due_by_entity.clone(),
+                        world.treatment_due.clone(),
+                        world.due_by_treatment.clone(),
+                    ),
+                    (
+                        world.active_by_entity.clone(),
+                        world.treatment_ids_by_entity.clone(),
+                        world.wound_ids_by_patient.clone(),
+                        world.bleeding_rate_by_patient.clone(),
+                        world.cell_members.clone(),
+                        world.squads.clone(),
+                    ),
+                )
+            );
+            assert_eq!(
+                stable_scalars,
+                (
+                    (
+                        world.next_wound_id,
+                        world.next_treatment_id,
+                        world.sourced_food,
+                        world.sourced_water,
+                        world.consumed_food,
+                        world.consumed_water,
+                        world.lost_food,
+                        world.lost_water,
+                        world.sourced_medical,
+                        world.consumed_medical,
+                    ),
+                    (
+                        world.lost_medical,
+                        world.hot_member_steps,
+                        world.cold_boundaries,
+                        world.automatic_journal_visits,
+                        world.automatic_execution_visits,
+                        world.medical_entity_candidates,
+                        world.wound_index_visits,
+                        world.treatment_completion_candidates,
+                        world.selection_candidates,
+                    ),
+                )
+            );
         }
     }
 }
