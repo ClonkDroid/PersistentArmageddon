@@ -1,6 +1,6 @@
 # M1.2 contract-to-test map
 
-Gate B acceptance is **not complete or accepted**. Acceptance tranche 1 implements recovery scenarios 01–05, tranche 2A implements scenarios 06–08, and tranche 2B implements scenarios 09–10. Scenarios 11–14 remain pending and no Gate C or M1.3 work is claimed.
+Gate B acceptance is **not complete or accepted**. Acceptance tranche 1 implements recovery scenarios 01–05, tranche 2A implements scenarios 06–08, tranche 2B implements scenarios 09–10, and tranche 3A implements scenarios 11–12. Scenarios 13–14 remain pending and no Gate C or M1.3 work is claimed.
 
 | Gate B scenario | Status | Dedicated evidence | Private structural evidence |
 | --- | --- | --- | --- |
@@ -14,8 +14,8 @@ Gate B acceptance is **not complete or accepted**. Acceptance tranche 1 implemen
 | 08 automatic medic/patient interruption and death precedence | Implemented in tranche 2A | `gate_b_acceptance_08_automatic_incapacity_interrupts_before_completion` | `gate_b_acceptance_08_automatic_incapacity_preserves_audit_and_cleans_indexes`; `gate_b_acceptance_08_living_death_at_completion_has_role_precedence_and_cleans_indexes` |
 | 09 real-entity availability churn and exact candidate visits | Implemented in tranche 2B | — | `gate_b_acceptance_09_real_medic_churn_visits_only_eligible_candidates` |
 | 10 medic/patient removal, conservation, and generation cleanup | Implemented in tranche 2B | — | `gate_b_acceptance_10_materialized_removal_cleans_both_endpoint_roles` |
-| 11 hot/cold cycles during treatment and recovery | Pending | — | — |
-| 12 rollback after recovery/healing/availability/interruption work | Pending | — | — |
+| 11 hot/cold cycles during treatment and recovery | Implemented in tranche 3A | — | `gate_b_acceptance_11_repeated_fidelity_cycles_preserve_medical_deadlines` |
+| 12 rollback after recovery/healing/availability/interruption work | Implemented in tranche 3A | — | `gate_b_acceptance_12_late_recovery_overflow_rolls_back_all_earlier_medical_work` |
 | 13 combined active-treatment/recovery snapshot continuation and corruption rejection | Pending | — | — |
 | 14 bleeding/recovery query purity including private authority | Pending | — | — |
 

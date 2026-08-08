@@ -9004,4 +9004,581 @@ mod private_invariants {
             );
         }
     }
+
+    #[test]
+    fn gate_b_acceptance_11_repeated_fidelity_cycles_preserve_medical_deadlines() {
+        let mut world = World::new(11_011);
+        let medic = spawn(
+            &mut world,
+            SoldierSpec {
+                role: Role::Medic,
+                inventory: Inventory {
+                    medical: 1,
+                    ..Inventory::default()
+                },
+                ..SoldierSpec::default()
+            },
+        );
+        let patient = spawn(&mut world, SoldierSpec::default());
+        let wound = match world
+            .apply(Command::InflictWound {
+                patient,
+                wound: WoundSpec {
+                    trauma: 50,
+                    bleeding_per_second: 2,
+                    shock: 100,
+                },
+            })
+            .events[0]
+            .event
+        {
+            Event::WoundInflicted { id, .. } => id,
+            _ => unreachable!(),
+        };
+        let started = world.apply(Command::StartTreatment {
+            medic,
+            patient,
+            wound: Some(wound),
+            kind: TreatmentKind::Hemostatic,
+        });
+        assert_eq!(
+            started.events,
+            vec![TimedEvent {
+                at: 0,
+                event: Event::TreatmentStarted {
+                    id: TreatmentId(0),
+                    medic,
+                    patient,
+                    wound: Some(wound),
+                    kind: TreatmentKind::Hemostatic,
+                    completes_at: 10,
+                    consumed: 1,
+                }
+            }]
+        );
+        assert_eq!(
+            world.active_by_entity,
+            BTreeMap::from([(medic, TreatmentId(0)), (patient, TreatmentId(0))])
+        );
+        assert_eq!(
+            world.treatment_due,
+            BTreeMap::from([(10, BTreeSet::from([TreatmentId(0)]))])
+        );
+        assert_eq!(
+            world.cell_members.get(&0),
+            Some(&BTreeSet::from([medic, patient]))
+        );
+
+        for (hot, fixed) in [(true, 0), (false, 0), (true, 0), (false, 0)] {
+            assert_eq!(
+                world.apply(Command::SetRegionHot { cell: 0, hot }).events,
+                vec![TimedEvent {
+                    at: 0,
+                    event: Event::RegionFidelityChanged {
+                        cell: 0,
+                        hot,
+                        fixed_steps: fixed
+                    }
+                }]
+            );
+            assert_eq!(world.treatments[&TreatmentId(0)].completes_at, 10);
+            assert_eq!(
+                world.due_by_treatment,
+                BTreeMap::from([(TreatmentId(0), 10)])
+            );
+        }
+        assert_eq!(
+            world.apply(Command::AdvanceTo { target: 10 }).events,
+            vec![
+                TimedEvent {
+                    at: 10,
+                    event: Event::TreatmentCompleted {
+                        id: TreatmentId(0),
+                        medic,
+                        patient,
+                        kind: TreatmentKind::Hemostatic
+                    }
+                },
+                TimedEvent {
+                    at: 10,
+                    event: Event::RecoveryChanged {
+                        id: patient,
+                        before: false,
+                        after: true,
+                        next_at: Some(15)
+                    }
+                },
+                TimedEvent {
+                    at: 10,
+                    event: Event::TimeAdvanced {
+                        from: 0,
+                        to: 10,
+                        hot_cells_stepped: 0,
+                        fixed_steps_per_hot_cell: 0
+                    }
+                },
+            ]
+        );
+        assert_eq!(world.casualty[&patient].recovery_next_at, Some(15));
+        assert_eq!(world.next_treatment_id, 1);
+        assert_eq!(world.consumed_medical, 1);
+        assert_eq!(world.treatments[&TreatmentId(0)].started_at, 0);
+        assert_eq!(world.treatments[&TreatmentId(0)].completes_at, 10);
+        assert_eq!(world.soldiers.data[medic.index()].inventory.medical, 0);
+
+        for hot in [true, false, true, false] {
+            let outcome = world.apply(Command::SetRegionHot { cell: 0, hot });
+            assert_eq!(
+                outcome.events,
+                vec![TimedEvent {
+                    at: 10,
+                    event: Event::RegionFidelityChanged {
+                        cell: 0,
+                        hot,
+                        fixed_steps: 0
+                    }
+                }]
+            );
+            assert_eq!(world.casualty[&patient].recovery_next_at, Some(15));
+            if hot {
+                assert!(!world.due_by_entity.contains_key(&patient));
+            } else {
+                assert_eq!(world.due_by_entity.get(&patient), Some(&15));
+            }
+        }
+        let at_15 = world.apply(Command::AdvanceTo { target: 15 });
+        assert_eq!(
+            at_15.events,
+            vec![
+                TimedEvent {
+                    at: 15,
+                    event: Event::RecoveryTicked {
+                        id: patient,
+                        blood_before: 4_980,
+                        blood_after: 5_000,
+                        shock_before: 102,
+                        shock_after: 52,
+                        health_before: 950,
+                        health_after: 975
+                    }
+                },
+                TimedEvent {
+                    at: 15,
+                    event: Event::TimeAdvanced {
+                        from: 10,
+                        to: 15,
+                        hot_cells_stepped: 0,
+                        fixed_steps_per_hot_cell: 0
+                    }
+                },
+            ]
+        );
+        assert_eq!(world.casualty[&patient].recovery_next_at, Some(20));
+        assert_eq!(
+            world
+                .apply(Command::SetRegionHot { cell: 0, hot: true })
+                .events,
+            vec![TimedEvent {
+                at: 15,
+                event: Event::RegionFidelityChanged {
+                    cell: 0,
+                    hot: true,
+                    fixed_steps: 0
+                }
+            }]
+        );
+        assert_eq!(
+            world.apply(Command::AdvanceTo { target: 20 }).events,
+            vec![
+                TimedEvent {
+                    at: 20,
+                    event: Event::RecoveryTicked {
+                        id: patient,
+                        blood_before: 5_000,
+                        blood_after: 5_000,
+                        shock_before: 52,
+                        shock_after: 2,
+                        health_before: 975,
+                        health_after: 1_000
+                    }
+                },
+                TimedEvent {
+                    at: 20,
+                    event: Event::TimeAdvanced {
+                        from: 15,
+                        to: 20,
+                        hot_cells_stepped: 1,
+                        fixed_steps_per_hot_cell: 5
+                    }
+                },
+            ]
+        );
+        assert_eq!(
+            world
+                .apply(Command::SetRegionHot {
+                    cell: 0,
+                    hot: false
+                })
+                .events,
+            vec![TimedEvent {
+                at: 20,
+                event: Event::RegionFidelityChanged {
+                    cell: 0,
+                    hot: false,
+                    fixed_steps: 5
+                }
+            }]
+        );
+        let healed = world.apply(Command::AdvanceTo { target: 40 });
+        assert_eq!(
+            healed.events,
+            vec![
+                TimedEvent {
+                    at: 25,
+                    event: Event::RecoveryTicked {
+                        id: patient,
+                        blood_before: 5_000,
+                        blood_after: 5_000,
+                        shock_before: 2,
+                        shock_after: 0,
+                        health_before: 1_000,
+                        health_after: 1_000
+                    }
+                },
+                TimedEvent {
+                    at: 25,
+                    event: Event::WoundHealed { id: wound, patient }
+                },
+                TimedEvent {
+                    at: 25,
+                    event: Event::RecoveryChanged {
+                        id: patient,
+                        before: true,
+                        after: false,
+                        next_at: None
+                    }
+                },
+                TimedEvent {
+                    at: 40,
+                    event: Event::TimeAdvanced {
+                        from: 20,
+                        to: 40,
+                        hot_cells_stepped: 0,
+                        fixed_steps_per_hot_cell: 0
+                    }
+                },
+            ]
+        );
+        assert!(!world.casualty[&patient].recovering);
+        assert!(!world.due_by_entity.contains_key(&patient) || world.due_by_entity[&patient] > 40);
+        assert!(world.active_by_entity.is_empty());
+        assert!(world.due_by_treatment.is_empty());
+        assert!(world.treatment_due.is_empty());
+        assert_eq!(
+            world
+                .apply(Command::SetRegionHot { cell: 0, hot: true })
+                .events,
+            vec![TimedEvent {
+                at: 40,
+                event: Event::RegionFidelityChanged {
+                    cell: 0,
+                    hot: true,
+                    fixed_steps: 0
+                }
+            }]
+        );
+        assert_eq!(
+            world
+                .apply(Command::SetRegionHot {
+                    cell: 0,
+                    hot: false
+                })
+                .events,
+            vec![TimedEvent {
+                at: 40,
+                event: Event::RegionFidelityChanged {
+                    cell: 0,
+                    hot: false,
+                    fixed_steps: 0
+                }
+            }]
+        );
+        let later = world.apply(Command::AdvanceTo { target: 45 });
+        assert!(!later.events.iter().any(|e| matches!(
+            e.event,
+            Event::TreatmentCompleted { .. }
+                | Event::RecoveryTicked { .. }
+                | Event::WoundHealed { .. }
+        )));
+    }
+
+    #[test]
+    fn gate_b_acceptance_12_late_recovery_overflow_rolls_back_all_earlier_medical_work() {
+        let base = u64::MAX - 3;
+        let mut world = World::new(12_012);
+        let healing = spawn(
+            &mut world,
+            SoldierSpec {
+                health: 975,
+                ..SoldierSpec::default()
+            },
+        );
+        let leaving = spawn(
+            &mut world,
+            SoldierSpec {
+                role: Role::Medic,
+                inventory: Inventory {
+                    medical: 2,
+                    ..Inventory::default()
+                },
+                ..SoldierSpec::default()
+            },
+        );
+        let busy = spawn(
+            &mut world,
+            SoldierSpec {
+                role: Role::Medic,
+                inventory: Inventory {
+                    medical: 2,
+                    ..Inventory::default()
+                },
+                ..SoldierSpec::default()
+            },
+        );
+        let patient = spawn(&mut world, SoldierSpec::default());
+        let overflow = spawn(
+            &mut world,
+            SoldierSpec {
+                health: 500,
+                ..SoldierSpec::default()
+            },
+        );
+        world.clock = base;
+        for id in [healing, leaving, busy, patient, overflow] {
+            world.soldiers.living[id.index()].materialized_at = base;
+            world.unschedule_due(id);
+        }
+        let controlled = WoundId(0);
+        world.wounds.insert(
+            controlled,
+            Wound {
+                id: controlled,
+                patient: healing,
+                created_at: base,
+                spec: WoundSpec {
+                    trauma: 25,
+                    bleeding_per_second: 0,
+                    shock: 0,
+                },
+                controlled: true,
+                healed: false,
+            },
+        );
+        world
+            .wound_ids_by_patient
+            .insert(healing, BTreeSet::from([controlled]));
+        world.next_wound_id = 3;
+        world.casualty.insert(
+            healing,
+            CasualtyState {
+                blood: BLOOD_MAX,
+                shock: 20,
+                recovering: true,
+                recovery_next_at: Some(base + 1),
+                materialized_at: base,
+                ..CasualtyState::default()
+            },
+        );
+        for (id, wid) in [(leaving, WoundId(1)), (patient, WoundId(2))] {
+            world.wounds.insert(
+                wid,
+                Wound {
+                    id: wid,
+                    patient: id,
+                    created_at: base,
+                    spec: WoundSpec {
+                        trauma: 0,
+                        bleeding_per_second: 167,
+                        shock: 0,
+                    },
+                    controlled: false,
+                    healed: false,
+                },
+            );
+            world.wound_ids_by_patient.insert(id, BTreeSet::from([wid]));
+            world.bleeding_rate_by_patient.insert(id, 167);
+            world.casualty.insert(
+                id,
+                CasualtyState {
+                    blood: 2_000,
+                    materialized_at: base,
+                    ..CasualtyState::default()
+                },
+            );
+        }
+        world.casualty.insert(
+            overflow,
+            CasualtyState {
+                blood: 4_000,
+                shock: 100,
+                recovering: true,
+                recovery_next_at: Some(u64::MAX),
+                materialized_at: base,
+                ..CasualtyState::default()
+            },
+        );
+        let treatment = TreatmentId(0);
+        world.treatments.insert(
+            treatment,
+            Treatment {
+                id: treatment,
+                medic: busy,
+                patient,
+                wound: Some(WoundId(2)),
+                kind: TreatmentKind::Hemostatic,
+                started_at: base,
+                completes_at: u64::MAX,
+                consumed: 1,
+                status: TreatmentStatus::Active,
+            },
+        );
+        world.next_treatment_id = 1;
+        world.soldiers.data[busy.index()].inventory.medical = 1;
+        world.consumed_medical = 1;
+        world
+            .active_by_entity
+            .extend([(busy, treatment), (patient, treatment)]);
+        world
+            .treatment_ids_by_entity
+            .insert(busy, BTreeSet::from([treatment]));
+        world
+            .treatment_ids_by_entity
+            .insert(patient, BTreeSet::from([treatment]));
+        world
+            .treatment_due
+            .insert(u64::MAX, BTreeSet::from([treatment]));
+        world.due_by_treatment.insert(treatment, u64::MAX);
+        for id in [healing, leaving, patient, overflow] {
+            world.schedule_due(id).unwrap();
+        }
+        world.refresh_medic_availability(leaving);
+        world.refresh_medic_availability(busy);
+        assert!(world.availability_by_medic.contains_key(&leaving));
+        assert!(!world.availability_by_medic.contains_key(&busy));
+        assert_eq!(world.due_by_entity[&healing], base + 1);
+        assert_eq!(world.due_by_entity[&leaving], base + 2);
+        assert_eq!(world.due_by_entity[&patient], base + 2);
+        assert_eq!(world.due_by_entity[&overflow], u64::MAX);
+
+        let checkpoint = world.snapshot();
+        let digest = world.state_digest();
+        let counters = (
+            world.cold_boundaries,
+            world.hot_member_steps,
+            world.automatic_journal_visits,
+            world.automatic_execution_visits,
+            world.medical_entity_candidates,
+            world.wound_index_visits,
+            world.treatment_completion_candidates,
+            world.selection_candidates,
+        );
+        let mut control = world.clone();
+        let control_out = control.apply(Command::AdvanceTo { target: base + 2 });
+        assert_eq!(control_out.error, None);
+        assert_eq!(
+            control_out.events[..3],
+            [
+                TimedEvent {
+                    at: base + 1,
+                    event: Event::RecoveryTicked {
+                        id: healing,
+                        blood_before: 5_000,
+                        blood_after: 5_000,
+                        shock_before: 20,
+                        shock_after: 0,
+                        health_before: 975,
+                        health_after: 1_000
+                    }
+                },
+                TimedEvent {
+                    at: base + 1,
+                    event: Event::WoundHealed {
+                        id: controlled,
+                        patient: healing
+                    }
+                },
+                TimedEvent {
+                    at: base + 1,
+                    event: Event::RecoveryChanged {
+                        id: healing,
+                        before: true,
+                        after: false,
+                        next_at: None
+                    }
+                },
+            ]
+        );
+        assert!(control_out.events.contains(&TimedEvent {
+            at: base + 2,
+            event: Event::TreatmentInterrupted {
+                id: treatment,
+                reason: InterruptionReason::Ineligible
+            }
+        }));
+        assert!(!control.availability_by_medic.contains_key(&leaving));
+        assert!(control.availability_by_medic.contains_key(&busy));
+
+        let outcome = world.apply(Command::AdvanceTo { target: u64::MAX });
+        assert_eq!(outcome.error, Some(SimError::ArithmeticOverflow));
+        assert_eq!(outcome.clock, base);
+        assert!(outcome.events.is_empty());
+        assert_eq!(outcome.blocked, None);
+        assert_eq!(world.snapshot(), checkpoint);
+        assert_eq!(world.state_digest(), digest);
+        assert_eq!(
+            (
+                world.cold_boundaries,
+                world.hot_member_steps,
+                world.automatic_journal_visits,
+                world.automatic_execution_visits,
+                world.medical_entity_candidates,
+                world.wound_index_visits,
+                world.treatment_completion_candidates,
+                world.selection_candidates
+            ),
+            counters
+        );
+        assert_eq!(world.treatments[&treatment].status, TreatmentStatus::Active);
+        assert_eq!(
+            world.active_by_entity,
+            BTreeMap::from([(busy, treatment), (patient, treatment)])
+        );
+        assert_eq!(
+            world.due_by_treatment,
+            BTreeMap::from([(treatment, u64::MAX)])
+        );
+        assert_eq!(
+            world.treatment_due,
+            BTreeMap::from([(u64::MAX, BTreeSet::from([treatment]))])
+        );
+        assert!(world.availability_by_medic.contains_key(&leaving));
+        assert!(!world.availability_by_medic.contains_key(&busy));
+        assert!(!world.wounds[&controlled].healed);
+        assert!(world.casualty[&healing].recovering);
+        assert_eq!(world.next_wound_id, 3);
+        assert_eq!(world.next_treatment_id, 1);
+        assert_eq!(world.consumed_medical, 1);
+        assert_eq!(world.sourced_medical, 4);
+        assert_eq!(
+            world.sourced_medical,
+            world
+                .soldiers
+                .data
+                .iter()
+                .map(|s| u128::from(s.inventory.medical))
+                .sum::<u128>()
+                + world.consumed_medical
+                + world.lost_medical
+        );
+    }
 }
