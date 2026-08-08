@@ -10642,6 +10642,11 @@ mod private_invariants {
     /// fixture construction rather than silently moving an opaque byte offset.
     #[derive(Clone, Debug)]
     struct V7MedicalLayout {
+        sourced_food: usize,
+        sourced_water: usize,
+        sourced_medical: usize,
+        consumed_medical: usize,
+        lost_medical: usize,
         next_wound_id: usize,
         next_treatment_id: usize,
         casualty_count: usize,
@@ -10661,9 +10666,19 @@ mod private_invariants {
             r.u64().unwrap(); // seed
             r.u64().unwrap(); // rng
             r.u64().unwrap(); // next schedule
-            for _ in 0..9 {
+            let sourced_food = r.p;
+            r.u128().unwrap();
+            let sourced_water = r.p;
+            r.u128().unwrap();
+            for _ in 0..4 {
                 r.u128().unwrap();
             }
+            let sourced_medical = r.p;
+            r.u128().unwrap();
+            let consumed_medical = r.p;
+            r.u128().unwrap();
+            let lost_medical = r.p;
+            r.u128().unwrap();
             let next_wound_id = r.p;
             r.u64().unwrap();
             let next_treatment_id = r.p;
@@ -10847,6 +10862,11 @@ mod private_invariants {
                 "v7 layout must consume the canonical image"
             );
             Self {
+                sourced_food,
+                sourced_water,
+                sourced_medical,
+                consumed_medical,
+                lost_medical,
                 next_wound_id,
                 next_treatment_id,
                 casualty_count,
@@ -10868,6 +10888,9 @@ mod private_invariants {
     }
     fn put_u64(bytes: &mut [u8], at: usize, value: u64) {
         bytes[at..at + 8].copy_from_slice(&value.to_le_bytes());
+    }
+    fn put_u128(bytes: &mut [u8], at: usize, value: u128) {
+        bytes[at..at + 16].copy_from_slice(&value.to_le_bytes());
     }
 
     fn assert_snapshot_category(bytes: &[u8], category: &'static str) {
@@ -11401,6 +11424,259 @@ mod private_invariants {
             .treatments
             .iter()
             .any(|x| x.wound.is_some() && x.status_at.is_some()));
+    }
+
+    #[test]
+    fn gate_c1_2a_omitted_medical_boundaries_ledgers_and_status_payloads() {
+        let (control, medic, patient, wound, treatment) = gate_c1_active_world();
+        let canonical = control.snapshot();
+        let layout = V7MedicalLayout::parse(&canonical);
+        let restored = World::from_snapshot(&canonical).unwrap();
+        assert_eq!(restored.snapshot(), canonical);
+        assert_eq!(restored.wound_ids_by_patient, control.wound_ids_by_patient);
+        assert_eq!(
+            restored.bleeding_rate_by_patient,
+            control.bleeding_rate_by_patient
+        );
+        assert_eq!(restored.active_by_entity, control.active_by_entity);
+        assert_eq!(restored.treatment_due, control.treatment_due);
+        assert_eq!(restored.due_by_treatment, control.due_by_treatment);
+        assert_eq!(
+            restored.treatment_ids_by_entity,
+            control.treatment_ids_by_entity
+        );
+        assert_eq!(restored.available_medics, control.available_medics);
+        assert_eq!(
+            restored.availability_by_medic,
+            control.availability_by_medic
+        );
+
+        macro_rules! state_case {
+            ($name:literal, $category:literal, $edit:expr) => {{
+                let mut invalid = control.clone();
+                $edit(&mut invalid);
+                assert_eq!(
+                    World::from_snapshot(&invalid.snapshot()).err(),
+                    Some(SimError::Snapshot($category)),
+                    "named schema state {}",
+                    $name
+                );
+            }};
+        }
+
+        // Literal valid maxima and relationship controls precede their invalid peers.
+        assert!(World::from_snapshot(&canonical).is_ok());
+        state_case!(
+            "blood zero while alive",
+            "casualty life",
+            |w: &mut World| {
+                let c = w.casualty.get_mut(&patient).unwrap();
+                c.blood = 0;
+                c.incapacitated = true;
+            }
+        );
+        state_case!(
+            "shock fatal while alive",
+            "casualty life",
+            |w: &mut World| {
+                let c = w.casualty.get_mut(&patient).unwrap();
+                c.shock = 1000;
+                c.incapacitated = true;
+            }
+        );
+        state_case!(
+            "blood incapacity false",
+            "casualty incapacity",
+            |w: &mut World| {
+                let c = w.casualty.get_mut(&patient).unwrap();
+                c.blood = BLOOD_MAX / 3;
+                c.incapacitated = false;
+            }
+        );
+        state_case!(
+            "shock incapacity false",
+            "casualty incapacity",
+            |w: &mut World| {
+                let c = w.casualty.get_mut(&patient).unwrap();
+                c.shock = INCAPACITATED_SHOCK;
+                c.incapacitated = false;
+            }
+        );
+        state_case!(
+            "casualty without wound",
+            "casualty wound ownership",
+            |w: &mut World| {
+                w.treatments.clear();
+                w.wounds.clear();
+            }
+        );
+        state_case!(
+            "shock treatment without casualty",
+            "treatment patient",
+            |w: &mut World| {
+                let t = w.treatments.get_mut(&treatment).unwrap();
+                t.kind = TreatmentKind::Shock;
+                t.wound = None;
+                t.consumed = SHOCK_TREATMENT_COST;
+                t.completes_at = t.started_at + SHOCK_TREATMENT_DURATION;
+                w.casualty.remove(&patient);
+                w.wounds.clear();
+            }
+        );
+        state_case!(
+            "wound created after materialization",
+            "wound creation time",
+            |w: &mut World| {
+                w.wounds.get_mut(&wound).unwrap().created_at = 1;
+                w.casualty.get_mut(&patient).unwrap().materialized_at = 0;
+                w.soldiers.living[patient.index()].materialized_at = 0;
+            }
+        );
+        for (name, controlled, healed, valid) in [
+            ("uncontrolled unhealed", false, false, true),
+            ("controlled unhealed", true, false, true),
+            ("controlled healed", true, true, true),
+            ("uncontrolled healed", false, true, false),
+        ] {
+            let mut candidate = control.clone();
+            let x = candidate.wounds.get_mut(&wound).unwrap();
+            x.controlled = controlled;
+            x.healed = healed;
+            if valid && controlled {
+                candidate.apply(Command::InterruptTreatment { id: treatment });
+            }
+            let result = World::from_snapshot(&candidate.snapshot());
+            if valid {
+                assert!(result.is_ok(), "valid wound state {name}");
+            } else {
+                assert_eq!(
+                    result.err(),
+                    Some(SimError::Snapshot("wound state")),
+                    "{name}"
+                );
+            }
+        }
+        state_case!(
+            "non medic endpoint",
+            "treatment relationship",
+            |w: &mut World| {
+                w.soldiers.data[medic.index()].role = Role::Rifle;
+            }
+        );
+        state_case!(
+            "faction mismatch",
+            "treatment relationship",
+            |w: &mut World| {
+                w.soldiers.data[medic.index()].faction = 9;
+            }
+        );
+        state_case!(
+            "cell mismatch",
+            "treatment relationship",
+            |w: &mut World| {
+                w.soldiers.data[medic.index()].position.cell = 9;
+            }
+        );
+        state_case!(
+            "marching medic",
+            "active treatment eligibility",
+            |w: &mut World| {
+                w.soldiers.living[medic.index()].activity = Activity::March;
+            }
+        );
+        state_case!(
+            "marching patient",
+            "active treatment eligibility",
+            |w: &mut World| {
+                w.soldiers.living[patient.index()].activity = Activity::March;
+            }
+        );
+        state_case!(
+            "controlled active hemostatic target",
+            "active treatment eligibility",
+            |w: &mut World| {
+                w.wounds.get_mut(&wound).unwrap().controlled = true;
+            }
+        );
+
+        // Named raw endpoint generations, option/status payload shapes, ledgers, and truncations.
+        let raw_case =
+            |name: &str, category: &'static str, edit: &dyn Fn(&mut Vec<u8>, &V7MedicalLayout)| {
+                let mut bytes = canonical.clone();
+                edit(&mut bytes, &layout);
+                assert_eq!(
+                    World::from_snapshot(&bytes).err(),
+                    Some(SimError::Snapshot(category)),
+                    "{name}"
+                );
+            };
+        raw_case("stale casualty owner", "casualty", &|b, l| {
+            put_u64(b, l.casualties[0].owner, patient.raw() + (1u64 << 32))
+        });
+        raw_case("invalid casualty owner", "casualty", &|b, l| {
+            put_u64(b, l.casualties[0].owner, u64::MAX)
+        });
+        raw_case("stale medic endpoint", "active treatment", &|b, l| {
+            put_u64(b, l.treatments[0].medic, medic.raw() + (1u64 << 32))
+        });
+        raw_case("stale patient endpoint", "active treatment", &|b, l| {
+            put_u64(b, l.treatments[0].patient, patient.raw() + (1u64 << 32))
+        });
+        raw_case("missing wound id", "treatment target", &|b, l| {
+            put_u64(b, l.treatments[0].wound.unwrap(), u64::MAX - 1)
+        });
+        raw_case("medical ledger mismatch", "resource ledger", &|b, l| {
+            put_u128(b, l.sourced_medical, 0)
+        });
+        raw_case(
+            "medical consumed overflow relation",
+            "resource ledger",
+            &|b, l| put_u128(b, l.consumed_medical, u128::MAX),
+        );
+        raw_case(
+            "medical lost overflow relation",
+            "resource ledger",
+            &|b, l| put_u128(b, l.lost_medical, u128::MAX),
+        );
+        // Nonzero food and water controls remain conserved before medical-only corruption.
+        let mut resources = World::new(72);
+        spawn(
+            &mut resources,
+            SoldierSpec {
+                inventory: Inventory {
+                    food: 7,
+                    water: 9,
+                    medical: 3,
+                },
+                ..SoldierSpec::default()
+            },
+        );
+        let resource_bytes = resources.snapshot();
+        assert!(World::from_snapshot(&resource_bytes).is_ok());
+        let resource_layout = V7MedicalLayout::parse(&resource_bytes);
+        for (name, at) in [
+            ("food ledger mismatch", resource_layout.sourced_food),
+            ("water ledger mismatch", resource_layout.sourced_water),
+        ] {
+            let mut bytes = resource_bytes.clone();
+            put_u128(&mut bytes, at, 0);
+            assert_snapshot_category(&bytes, "resource ledger");
+            assert!(!name.is_empty());
+        }
+        for (name, cut) in [
+            ("medical allocator", layout.next_wound_id + 4),
+            ("casualty count", layout.casualty_count + 2),
+            ("casualty record", layout.casualties[0].range.end - 1),
+            ("wound count", layout.wound_count + 2),
+            ("wound record", layout.wounds[0].range.end - 1),
+            ("treatment count", layout.treatment_count + 2),
+        ] {
+            assert_eq!(
+                World::from_snapshot(&canonical[..cut]).err(),
+                Some(SimError::Snapshot("truncated")),
+                "named truncation {name}"
+            );
+        }
     }
 
     #[test]
