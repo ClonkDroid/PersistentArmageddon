@@ -1276,7 +1276,10 @@ impl World {
             .next_wound_id
             .checked_add(1)
             .ok_or(SimError::ArithmeticOverflow)?;
-        let old = self.soldiers.living[patient.index()];
+        // Preserve lazily projected living work before trauma changes the
+        // shared materialization boundary.
+        let mut old = self.soldiers.living[patient.index()];
+        Self::project(&mut old, self.clock)?;
         let health = old.health.saturating_sub(spec.trauma);
         let mut casualty = self
             .casualty
@@ -1324,6 +1327,7 @@ impl World {
                 healed: false,
             },
         );
+        self.schedule_due(patient)?;
         Ok(Event::WoundInflicted {
             id,
             patient,
@@ -1348,6 +1352,14 @@ impl World {
             return Err(SimError::InvalidTreatment);
         }
         if kind == TreatmentKind::Shock && wound.is_some() {
+            return Err(SimError::InvalidTreatment);
+        }
+        if kind == TreatmentKind::Shock
+            && !self
+                .casualty
+                .get(&patient)
+                .is_some_and(|c| c.shock > 0 || c.incapacitated)
+        {
             return Err(SimError::InvalidTreatment);
         }
         let consumed = match kind {
@@ -1702,6 +1714,37 @@ impl World {
             .filter(|x| x.status == TreatmentStatus::Active && x.completes_at <= target)
             .map(|x| x.completes_at)
             .collect();
+        // A direct advance must stop at the actual hemorrhage/shock boundary,
+        // not stamp the consequence at the caller's target time.
+        for (id, casualty) in &self.casualty {
+            if !self.soldiers.valid(*id)
+                || self.soldiers.living[id.index()].life != LifeState::Alive
+            {
+                continue;
+            }
+            let rate = self
+                .wounds
+                .values()
+                .filter(|w| w.patient == *id && !w.controlled && !w.healed)
+                .try_fold(0_u64, |sum, wound| {
+                    sum.checked_add(u64::from(wound.spec.bleeding_per_second))
+                })
+                .ok_or(SimError::ArithmeticOverflow)?;
+            if rate != 0 {
+                let ceil = |amount: u64| amount.saturating_add(rate - 1) / rate;
+                let blood = ceil(u64::from(casualty.blood)).max(1);
+                let shock =
+                    ceil(u64::from(1000_u32.saturating_sub(casualty.shock)).saturating_mul(10))
+                        .max(1);
+                if let Some(at) = casualty
+                    .materialized_at
+                    .checked_add(blood.min(shock))
+                    .filter(|at| *at <= target)
+                {
+                    boundaries.push(at);
+                }
+            }
+        }
         boundaries.push(target);
         boundaries.sort_unstable();
         boundaries.dedup();
@@ -1722,8 +1765,10 @@ impl World {
                     .wounds
                     .values()
                     .filter(|w| w.patient == id && !w.controlled && !w.healed)
-                    .map(|w| u64::from(w.spec.bleeding_per_second))
-                    .sum();
+                    .try_fold(0_u64, |sum, wound| {
+                        sum.checked_add(u64::from(wound.spec.bleeding_per_second))
+                    })
+                    .ok_or(SimError::ArithmeticOverflow)?;
                 let loss = rate
                     .checked_mul(elapsed)
                     .ok_or(SimError::ArithmeticOverflow)?;
@@ -1751,6 +1796,7 @@ impl World {
                     self.soldiers.living[id.index()].materialized_at = at;
                     self.soldiers.data[id.index()].health = 0;
                     self.unschedule_due(id);
+                    let mut interrupted = None;
                     if let Some(tid) = self.active_by_entity.get(&id).copied() {
                         let reason = if self.treatments[&tid].medic == id {
                             InterruptionReason::MedicDied
@@ -1761,10 +1807,7 @@ impl World {
                         self.clock = at;
                         self.interrupt_internal(tid, reason)?;
                         self.clock = clock;
-                        out.push(TimedEvent {
-                            at,
-                            event: Event::TreatmentInterrupted { id: tid, reason },
-                        });
+                        interrupted = Some((tid, reason));
                     }
                     out.push(TimedEvent {
                         at,
@@ -1774,6 +1817,12 @@ impl World {
                             health_before,
                         },
                     });
+                    if let Some((tid, reason)) = interrupted {
+                        out.push(TimedEvent {
+                            at,
+                            event: Event::TreatmentInterrupted { id: tid, reason },
+                        });
+                    }
                 }
             }
             let due: Vec<_> = self
@@ -2773,6 +2822,9 @@ impl R<'_> {
                     0 => DeathCause::Dehydration,
                     1 => DeathCause::Starvation,
                     2 => DeathCause::Exhaustion,
+                    3 => DeathCause::ImmediateTrauma,
+                    4 => DeathCause::Hemorrhage,
+                    5 => DeathCause::TraumaticShock,
                     _ => return Err(SimError::Snapshot("death cause")),
                 };
                 LifeState::Dead { at, cause }

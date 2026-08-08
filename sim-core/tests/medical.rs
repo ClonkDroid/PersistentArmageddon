@@ -123,3 +123,76 @@ fn interruption_releases_endpoints_without_refund() {
         .error
         .is_none());
 }
+
+#[test]
+fn direct_advance_stamps_hemorrhage_at_the_causal_second() {
+    let mut world = World::new(11);
+    let patient = spawn(&mut world, Role::Rifle, 0);
+    world.apply(Command::InflictWound {
+        patient,
+        wound: WoundSpec {
+            trauma: 0,
+            bleeding_per_second: 100,
+            shock: 0,
+        },
+    });
+    let outcome = world.apply(Command::AdvanceTo { target: 100 });
+    assert!(outcome.error.is_none());
+    assert!(outcome.events.iter().any(|event| {
+        event.at == 50
+            && matches!(
+                event.event,
+                Event::SoldierDied {
+                    id,
+                    cause: DeathCause::Hemorrhage,
+                    ..
+                } if id == patient
+            )
+    }));
+    assert_eq!(
+        world.soldier(patient).unwrap().living.life,
+        LifeState::Dead {
+            at: 50,
+            cause: DeathCause::Hemorrhage
+        }
+    );
+    assert_eq!(
+        World::from_snapshot(&world.snapshot()).unwrap().snapshot(),
+        world.snapshot()
+    );
+}
+
+#[test]
+fn wounding_a_lazy_soldier_preserves_living_projection() {
+    let mut world = World::new(12);
+    let patient = spawn(&mut world, Role::Rifle, 0);
+    world.apply(Command::AdvanceTo { target: 10 });
+    world.apply(Command::InflictWound {
+        patient,
+        wound: WoundSpec {
+            trauma: 1,
+            bleeding_per_second: 1,
+            shock: 1,
+        },
+    });
+    let living = world.soldier(patient).unwrap().living;
+    assert_eq!((living.hunger, living.thirst, living.fatigue), (10, 20, 10));
+    assert_eq!(living.materialized_at, 10);
+}
+
+#[test]
+fn shock_treatment_rejects_an_unaffected_patient_without_consumption() {
+    let mut world = World::new(13);
+    let medic = spawn(&mut world, Role::Medic, SHOCK_TREATMENT_COST);
+    let patient = spawn(&mut world, Role::Rifle, 0);
+    let before = world.snapshot();
+    let outcome = world.apply(Command::StartTreatment {
+        medic,
+        patient,
+        wound: None,
+        kind: TreatmentKind::Shock,
+    });
+    assert_eq!(outcome.error, Some(SimError::InvalidTreatment));
+    assert_eq!(world.snapshot(), before);
+    assert_eq!(world.resource_totals().consumed_medical, 0);
+}
