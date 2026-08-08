@@ -3449,7 +3449,7 @@ impl World {
                 .entry(wound.patient)
                 .or_default()
                 .insert(*id);
-            if !wound.controlled && !wound.healed {
+            if !wound.controlled && !wound.healed && wound.spec.bleeding_per_second != 0 {
                 let rate = w.bleeding_rate_by_patient.entry(wound.patient).or_default();
                 *rate = rate
                     .checked_add(u64::from(wound.spec.bleeding_per_second))
@@ -3590,7 +3590,7 @@ impl World {
                 .entry(wound.patient)
                 .or_default()
                 .insert(*id);
-            if !wound.controlled && !wound.healed {
+            if !wound.controlled && !wound.healed && wound.spec.bleeding_per_second != 0 {
                 let rate = expected_bleeding.entry(wound.patient).or_default();
                 *rate = rate
                     .checked_add(u64::from(wound.spec.bleeding_per_second))
@@ -13828,10 +13828,7 @@ mod private_invariants {
                 BTreeMap::from([(expected_wound.id, expected_wound)])
             );
             assert_eq!(restored.wound_ids_by_patient, world.wound_ids_by_patient);
-            assert_eq!(
-                restored.bleeding_rate_by_patient,
-                BTreeMap::from([(patient, expected_bleeding)])
-            );
+            assert_eq!(restored.bleeding_rate_by_patient, expected_bleeding_map);
             (bytes, layout)
         }
 
