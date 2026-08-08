@@ -14540,6 +14540,478 @@ mod private_invariants {
     }
 
     #[test]
+    fn gate_c1_2a_r5_treatment_cost_duration_numeric_boundaries() {
+        #[derive(Clone, Copy)]
+        struct Case {
+            kind: TreatmentKind,
+            cost: u32,
+            duration: u64,
+            wound_spec: WoundSpec,
+        }
+
+        fn read_u32(bytes: &[u8], at: usize) -> u32 {
+            u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())
+        }
+        fn read_u64(bytes: &[u8], at: usize) -> u64 {
+            u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap())
+        }
+        fn changed_bytes(before: &[u8], after: &[u8]) -> Vec<usize> {
+            before
+                .iter()
+                .zip(after)
+                .enumerate()
+                .filter_map(|(i, (a, b))| (a != b).then_some(i))
+                .collect()
+        }
+        fn scalar_bytes(at: usize, width: usize, before: u64, after: u64) -> Vec<usize> {
+            let before = before.to_le_bytes();
+            let after = after.to_le_bytes();
+            (0..width)
+                .filter_map(|i| (before[i] != after[i]).then_some(at + i))
+                .collect()
+        }
+        fn make_control(case: Case) -> (World, EntityId, EntityId, WoundId, TreatmentId) {
+            let mut world = World::new(501);
+            let medic = spawn(
+                &mut world,
+                SoldierSpec {
+                    role: Role::Medic,
+                    inventory: Inventory {
+                        medical: 8,
+                        ..Inventory::default()
+                    },
+                    ..SoldierSpec::default()
+                },
+            );
+            let patient = spawn(&mut world, SoldierSpec::default());
+            assert_eq!(world.apply(Command::AdvanceTo { target: 1 }).error, None);
+            let inflicted = world.apply(Command::InflictWound {
+                patient,
+                wound: case.wound_spec,
+            });
+            assert_eq!(inflicted.error, None);
+            let wound = match inflicted.events.as_slice() {
+                [TimedEvent {
+                    at: 1,
+                    event: Event::WoundInflicted { id, patient: p, .. },
+                }] if *p == patient => *id,
+                events => panic!("unexpected wound events: {events:?}"),
+            };
+            let target = (case.kind == TreatmentKind::Hemostatic).then_some(wound);
+            assert_eq!(world.soldiers.data[medic.index()].inventory.medical, 8);
+            assert!(8 >= case.cost);
+            let started = world.apply(Command::StartTreatment {
+                medic,
+                patient,
+                wound: target,
+                kind: case.kind,
+            });
+            assert_eq!(started.error, None);
+            let treatment = match started.events.as_slice() {
+                [TimedEvent {
+                    at: 1,
+                    event:
+                        Event::TreatmentStarted {
+                            id,
+                            medic: m,
+                            patient: p,
+                            wound: w,
+                            kind,
+                            completes_at,
+                            consumed,
+                        },
+                }] if *m == medic
+                    && *p == patient
+                    && *w == target
+                    && *kind == case.kind
+                    && *completes_at == 1 + case.duration
+                    && *consumed == case.cost =>
+                {
+                    *id
+                }
+                events => panic!("unexpected treatment events: {events:?}"),
+            };
+            (world, medic, patient, wound, treatment)
+        }
+        fn assert_control(
+            world: &World,
+            case: Case,
+            medic: EntityId,
+            patient: EntityId,
+            wound: WoundId,
+            treatment: TreatmentId,
+        ) -> (Vec<u8>, V7MedicalLayout) {
+            assert_eq!(world.clock, 1);
+            assert!(world.soldiers.valid(medic));
+            assert!(world.soldiers.valid(patient));
+            assert_ne!(medic, patient);
+            let medic_spec = world.soldiers.data[medic.index()];
+            let patient_spec = world.soldiers.data[patient.index()];
+            assert_eq!(medic_spec.role, Role::Medic);
+            assert_eq!(medic_spec.faction, 0);
+            assert_eq!(patient_spec.faction, 0);
+            assert_eq!(medic_spec.position.cell, 0);
+            assert_eq!(patient_spec.position.cell, 0);
+            assert_eq!(medic_spec.inventory.medical, 8 - case.cost);
+            for (id, materialized_at) in [(medic, 0), (patient, 1)] {
+                let living = world.soldiers.living[id.index()];
+                assert_eq!(living.life, LifeState::Alive);
+                assert_eq!(living.activity, Activity::Idle);
+                assert_eq!(living.health, 1000);
+                assert_eq!(living.materialized_at, materialized_at);
+                assert!(!world.is_incapacitated(id));
+            }
+            let expected_wound = Wound {
+                id: wound,
+                patient,
+                created_at: 1,
+                spec: case.wound_spec,
+                controlled: false,
+                healed: false,
+            };
+            let expected_casualty = CasualtyState {
+                blood: BLOOD_MAX,
+                shock: u32::from(case.wound_spec.shock),
+                shock_remainder: 0,
+                incapacitated: false,
+                recovering: false,
+                recovery_next_at: None,
+                materialized_at: 1,
+            };
+            let target = (case.kind == TreatmentKind::Hemostatic).then_some(wound);
+            let expected_treatment = Treatment {
+                id: treatment,
+                medic,
+                patient,
+                wound: target,
+                kind: case.kind,
+                started_at: 1,
+                completes_at: 1 + case.duration,
+                consumed: case.cost,
+                status: TreatmentStatus::Active,
+            };
+            assert_eq!(
+                world.casualty,
+                BTreeMap::from([(patient, expected_casualty)])
+            );
+            assert_eq!(world.wounds, BTreeMap::from([(wound, expected_wound)]));
+            assert_eq!(
+                world.treatments,
+                BTreeMap::from([(treatment, expected_treatment)])
+            );
+            assert_eq!(world.next_wound_id, 1);
+            assert_eq!(world.next_treatment_id, 1);
+            assert_eq!(
+                world.wound_ids_by_patient,
+                BTreeMap::from([(patient, BTreeSet::from([wound]))])
+            );
+            let expected_bleeding = if case.wound_spec.bleeding_per_second == 0 {
+                BTreeMap::new()
+            } else {
+                BTreeMap::from([(patient, u64::from(case.wound_spec.bleeding_per_second))])
+            };
+            assert_eq!(world.bleeding_rate_by_patient, expected_bleeding);
+            assert_eq!(
+                world.active_by_entity,
+                BTreeMap::from([(medic, treatment), (patient, treatment)])
+            );
+            assert_eq!(
+                world.due_by_treatment,
+                BTreeMap::from([(treatment, 1 + case.duration)])
+            );
+            assert_eq!(
+                world.treatment_due,
+                BTreeMap::from([(1 + case.duration, BTreeSet::from([treatment]))])
+            );
+            assert_eq!(
+                world.treatment_ids_by_entity,
+                BTreeMap::from([
+                    (medic, BTreeSet::from([treatment])),
+                    (patient, BTreeSet::from([treatment]))
+                ])
+            );
+            assert_eq!(world.available_medics, BTreeMap::new());
+            assert_eq!(world.availability_by_medic, BTreeMap::new());
+            assert_eq!(world.sourced_medical, 8);
+            assert_eq!(world.consumed_medical, u128::from(case.cost));
+            assert_eq!(world.lost_medical, 0);
+            let totals = world.resource_totals();
+            assert_eq!(totals.sourced_medical, 8);
+            assert_eq!(totals.carried_medical, u128::from(8 - case.cost));
+            assert_eq!(totals.consumed_medical, u128::from(case.cost));
+            assert_eq!(totals.lost_medical, 0);
+            assert_eq!(
+                totals.sourced_medical,
+                totals.carried_medical + totals.consumed_medical + totals.lost_medical
+            );
+
+            let bytes = world.snapshot();
+            let layout = V7MedicalLayout::parse(&bytes);
+            assert_eq!(read_u32(&bytes, layout.treatment_count), 1);
+            assert_eq!(layout.treatments[0].range.start, layout.treatment_count + 4);
+            assert_eq!(layout.treatments[0].range.end, layout.end);
+            assert_eq!(layout.end, bytes.len());
+            let encoded = &layout.treatments[0];
+            assert_eq!(read_u64(&bytes, encoded.id), treatment.0);
+            assert_eq!(read_u64(&bytes, encoded.medic), medic.raw());
+            assert_eq!(read_u64(&bytes, encoded.patient), patient.raw());
+            assert_eq!(bytes[encoded.wound_option], u8::from(target.is_some()));
+            assert_eq!(
+                encoded.wound.map(|at| read_u64(&bytes, at)),
+                target.map(|id| id.0)
+            );
+            assert_eq!(
+                bytes[encoded.kind],
+                if case.kind == TreatmentKind::Hemostatic {
+                    0
+                } else {
+                    1
+                }
+            );
+            assert_eq!(read_u64(&bytes, encoded.started_at), 1);
+            assert_eq!(read_u64(&bytes, encoded.completes_at), 1 + case.duration);
+            assert_eq!(read_u32(&bytes, encoded.consumed), case.cost);
+            assert_eq!(bytes[encoded.status], 0);
+
+            let restored = World::from_snapshot(&bytes).unwrap();
+            assert_eq!(restored.snapshot(), bytes);
+            assert_eq!(restored.state_digest(), world.state_digest());
+            assert_eq!(restored.casualty, world.casualty);
+            assert_eq!(restored.wounds, world.wounds);
+            assert_eq!(restored.treatments, world.treatments);
+            assert_eq!(restored.active_by_entity, world.active_by_entity);
+            assert_eq!(restored.treatment_due, world.treatment_due);
+            assert_eq!(restored.due_by_treatment, world.due_by_treatment);
+            assert_eq!(
+                restored.treatment_ids_by_entity,
+                world.treatment_ids_by_entity
+            );
+            assert_eq!(restored.wound_ids_by_patient, world.wound_ids_by_patient);
+            assert_eq!(
+                restored.bleeding_rate_by_patient,
+                world.bleeding_rate_by_patient
+            );
+            assert_eq!(restored.available_medics, world.available_medics);
+            assert_eq!(restored.availability_by_medic, world.availability_by_medic);
+            assert_eq!(restored.resource_totals(), totals);
+            (bytes, layout)
+        }
+
+        for case in [
+            Case {
+                kind: TreatmentKind::Hemostatic,
+                cost: HEMOSTATIC_COST,
+                duration: HEMOSTATIC_DURATION,
+                wound_spec: WoundSpec {
+                    trauma: 0,
+                    bleeding_per_second: 1,
+                    shock: 0,
+                },
+            },
+            Case {
+                kind: TreatmentKind::Shock,
+                cost: SHOCK_TREATMENT_COST,
+                duration: SHOCK_TREATMENT_DURATION,
+                wound_spec: WoundSpec {
+                    trauma: 0,
+                    bleeding_per_second: 0,
+                    shock: 400,
+                },
+            },
+        ] {
+            assert!(case.cost > 0);
+            assert!(case.duration > 0);
+            let (world, medic, patient, wound, treatment) = make_control(case);
+            let (bytes, layout) = assert_control(&world, case, medic, patient, wound, treatment);
+            let encoded = &layout.treatments[0];
+
+            for invalid_cost in [case.cost - 1, case.cost + 1] {
+                let mut changed = bytes.clone();
+                assert_eq!(read_u32(&bytes, encoded.consumed), case.cost);
+                put_u32(&mut changed, encoded.consumed, invalid_cost);
+                let changed_layout = V7MedicalLayout::parse(&changed);
+                assert_eq!(
+                    read_u32(&changed, changed_layout.treatments[0].consumed),
+                    invalid_cost
+                );
+                assert_eq!(
+                    changed_bytes(&bytes, &changed),
+                    scalar_bytes(
+                        encoded.consumed,
+                        4,
+                        u64::from(case.cost),
+                        u64::from(invalid_cost)
+                    )
+                );
+                assert_eq!(
+                    World::from_snapshot(&changed).err(),
+                    Some(SimError::Snapshot("treatment cost"))
+                );
+            }
+            for invalid_duration in [case.duration - 1, case.duration + 1] {
+                let invalid_completion = 1 + invalid_duration;
+                assert!(invalid_completion > world.clock);
+                let mut changed = bytes.clone();
+                assert_eq!(read_u64(&bytes, encoded.completes_at), 1 + case.duration);
+                put_u64(&mut changed, encoded.completes_at, invalid_completion);
+                let changed_layout = V7MedicalLayout::parse(&changed);
+                assert_eq!(
+                    read_u64(&changed, changed_layout.treatments[0].completes_at),
+                    invalid_completion
+                );
+                assert_eq!(
+                    changed_bytes(&bytes, &changed),
+                    scalar_bytes(
+                        encoded.completes_at,
+                        8,
+                        1 + case.duration,
+                        invalid_completion
+                    )
+                );
+                assert_eq!(
+                    World::from_snapshot(&changed).err(),
+                    Some(SimError::Snapshot("treatment duration"))
+                );
+            }
+
+            // Canonical schema-level neighbor: the valid checked sum lands exactly
+            // on the terminal instant while the Active relationship remains future.
+            let terminal_start = u64::MAX - case.duration;
+            let mut terminal = world.clone();
+            terminal.clock = terminal_start;
+            for id in [medic, patient] {
+                terminal.unschedule_due(id);
+                terminal.soldiers.living[id.index()].materialized_at = terminal_start;
+            }
+            terminal.casualty.get_mut(&patient).unwrap().materialized_at = terminal_start;
+            terminal.wounds.get_mut(&wound).unwrap().created_at = terminal_start;
+            let record = terminal.treatments.get_mut(&treatment).unwrap();
+            record.started_at = terminal_start;
+            record.completes_at = u64::MAX;
+            terminal.treatment_due = BTreeMap::from([(u64::MAX, BTreeSet::from([treatment]))]);
+            terminal.due_by_treatment = BTreeMap::from([(treatment, u64::MAX)]);
+            terminal.schedule_due(medic).unwrap();
+            terminal.schedule_due(patient).unwrap();
+            assert_eq!(terminal_start.checked_add(case.duration), Some(u64::MAX));
+            assert_eq!(
+                terminal.treatments[&treatment].status,
+                TreatmentStatus::Active
+            );
+            assert!(terminal.treatments[&treatment].completes_at > terminal.clock);
+            let terminal_bytes = terminal.snapshot();
+            let terminal_layout = V7MedicalLayout::parse(&terminal_bytes);
+            let terminal_encoded = &terminal_layout.treatments[0];
+            assert_eq!(
+                read_u64(&terminal_bytes, terminal_layout.clock),
+                terminal_start
+            );
+            assert_eq!(
+                read_u64(&terminal_bytes, terminal_encoded.started_at),
+                terminal_start
+            );
+            assert_eq!(
+                read_u64(&terminal_bytes, terminal_encoded.completes_at),
+                u64::MAX
+            );
+            assert_eq!(
+                read_u32(&terminal_bytes, terminal_encoded.consumed),
+                case.cost
+            );
+            assert_eq!(read_u64(&terminal_bytes, terminal_encoded.id), treatment.0);
+            assert_eq!(
+                read_u64(&terminal_bytes, terminal_encoded.medic),
+                medic.raw()
+            );
+            assert_eq!(
+                read_u64(&terminal_bytes, terminal_encoded.patient),
+                patient.raw()
+            );
+            assert_eq!(
+                terminal_bytes[terminal_encoded.kind],
+                if case.kind == TreatmentKind::Hemostatic {
+                    0
+                } else {
+                    1
+                }
+            );
+            assert_eq!(terminal_bytes[terminal_encoded.status], 0);
+            assert_eq!(
+                terminal_bytes[terminal_encoded.wound_option],
+                u8::from(case.kind == TreatmentKind::Hemostatic)
+            );
+            let terminal_restored = World::from_snapshot(&terminal_bytes).unwrap();
+            assert_eq!(terminal_restored.snapshot(), terminal_bytes);
+            assert_eq!(terminal_restored.state_digest(), terminal.state_digest());
+            assert_eq!(terminal_restored.treatments, terminal.treatments);
+            assert_eq!(
+                terminal_restored.active_by_entity,
+                terminal.active_by_entity
+            );
+            assert_eq!(terminal_restored.treatment_due, terminal.treatment_due);
+            assert_eq!(
+                terminal_restored.due_by_treatment,
+                terminal.due_by_treatment
+            );
+            assert_eq!(
+                terminal_restored.treatment_ids_by_entity,
+                terminal.treatment_ids_by_entity
+            );
+            assert_eq!(terminal_restored.casualty, terminal.casualty);
+            assert_eq!(terminal_restored.wounds, terminal.wounds);
+            assert_eq!(
+                terminal_restored.wound_ids_by_patient,
+                terminal.wound_ids_by_patient
+            );
+            assert_eq!(
+                terminal_restored.bleeding_rate_by_patient,
+                terminal.bleeding_rate_by_patient
+            );
+            assert_eq!(
+                terminal_restored.available_medics,
+                terminal.available_medics
+            );
+            assert_eq!(
+                terminal_restored.availability_by_medic,
+                terminal.availability_by_medic
+            );
+            assert_eq!(
+                terminal_restored.resource_totals(),
+                terminal.resource_totals()
+            );
+
+            let overflow_start = terminal_start + 1;
+            assert_eq!(overflow_start.checked_add(case.duration), None);
+            let mut overflow = terminal_bytes.clone();
+            put_u64(&mut overflow, terminal_layout.clock, overflow_start);
+            put_u64(&mut overflow, terminal_encoded.started_at, overflow_start);
+            let overflow_layout = V7MedicalLayout::parse(&overflow);
+            assert_eq!(read_u64(&overflow, overflow_layout.clock), overflow_start);
+            assert_eq!(
+                read_u64(&overflow, overflow_layout.treatments[0].started_at),
+                overflow_start
+            );
+            assert_eq!(
+                read_u64(&overflow, overflow_layout.treatments[0].completes_at),
+                u64::MAX
+            );
+            let mut expected_changes =
+                scalar_bytes(terminal_layout.clock, 8, terminal_start, overflow_start);
+            expected_changes.extend(scalar_bytes(
+                terminal_encoded.started_at,
+                8,
+                terminal_start,
+                overflow_start,
+            ));
+            expected_changes.sort_unstable();
+            assert_eq!(changed_bytes(&terminal_bytes, &overflow), expected_changes);
+            assert_eq!(
+                World::from_snapshot(&overflow).err(),
+                Some(SimError::Snapshot("treatment duration"))
+            );
+        }
+    }
+
+    #[test]
     fn gate_c1_all_six_death_causes_preserve_medical_history() {
         fn history_world(food: u32, water: u32) -> (World, EntityId, WoundId, TreatmentId) {
             let mut world = World::new(91);
