@@ -455,7 +455,9 @@ pub struct World {
     /// indexed hot membership for an automatic timestamp. This is deliberately
     /// absent from snapshots, digests, and release builds.
     #[cfg(test)]
-    automatic_candidate_visits: u64,
+    automatic_journal_visits: u64,
+    #[cfg(test)]
+    automatic_execution_visits: u64,
 }
 
 #[derive(Clone)]
@@ -714,7 +716,9 @@ impl World {
             cold_boundaries: 0,
             hot_member_steps: 0,
             #[cfg(test)]
-            automatic_candidate_visits: 0,
+            automatic_journal_visits: 0,
+            #[cfg(test)]
+            automatic_execution_visits: 0,
         }
     }
     pub fn clock(&self) -> u64 {
@@ -1177,7 +1181,7 @@ impl World {
             for id in ids {
                 #[cfg(test)]
                 {
-                    self.automatic_candidate_visits += 1;
+                    self.automatic_execution_visits += 1;
                 }
                 if !self.soldiers.valid(id)
                     || self.soldiers.living[id.index()].life != LifeState::Alive
@@ -1285,6 +1289,10 @@ impl World {
     fn automatic_to(&mut self, t: u64, out: &mut Vec<TimedEvent>) -> Result<(u64, u64), SimError> {
         let mut touched = BTreeSet::new();
         for (_, ids) in self.living_due.range(..=t) {
+            #[cfg(test)]
+            {
+                self.automatic_journal_visits += ids.len() as u64;
+            }
             touched.extend(ids.iter().copied());
         }
         for cell in self.hot_cells.keys() {
@@ -1751,7 +1759,9 @@ impl World {
             cold_boundaries,
             hot_member_steps,
             #[cfg(test)]
-            automatic_candidate_visits: 0,
+            automatic_journal_visits: 0,
+            #[cfg(test)]
+            automatic_execution_visits: 0,
         };
         let mut w = w;
         for i in 0..w.soldiers.alive.len() {
@@ -3034,12 +3044,50 @@ mod private_invariants {
             266,
             "fixture layout changed; update named offsets"
         );
-        let mut cases: Vec<(&str, Vec<u8>)> = Vec::new();
+        fn expected(name: &str) -> SimError {
+            SimError::Snapshot(match name {
+                "unsupported_version" => "unsupported version",
+                "noncanonical_alive_boolean" => "boolean",
+                "invalid_role_tag" => "role",
+                "invalid_activity_tag" => "activity",
+                "invalid_life_tag" => "life state",
+                "hunger_range" | "thirst_range" | "fatigue_range" | "sleep_debt_range"
+                | "morale_range" | "health_range" => "living range",
+                "alive_zero_health" | "health_mirror" | "future_materialization" => {
+                    "living timestamp"
+                }
+                "food_source_equation"
+                | "water_source_equation"
+                | "consumed_food_equation"
+                | "consumed_water_equation"
+                | "lost_food_equation"
+                | "lost_water_equation"
+                | "food_checked_sum_hazard"
+                | "water_checked_sum_hazard" => "resource ledger",
+                "clock_makes_due_stale" | "noncanonical_due_order" => "living due time",
+                "trailing_byte" => "trailing bytes",
+                "noncanonical_due_time"
+                | "missing_reverse_due_coverage"
+                | "hot_entity_due_entry" => "living due coverage",
+                "stale_due_id" | "dead_entity_due_entry" | "duplicate_due_entity" => {
+                    "living due entity"
+                }
+                "hot_activated_after_last" | "hot_last_not_clock" | "hot_fixed_step_mismatch" => {
+                    "hot cell"
+                }
+                "invalid_death_cause" => "death cause",
+                "death_time_mismatch" | "dead_materialization_mismatch" | "dead_nonzero_health" => {
+                    "death state"
+                }
+                _ => panic!("missing expected category for {name}"),
+            })
+        }
+        let mut cases: Vec<(&str, Vec<u8>, SimError)> = Vec::new();
         macro_rules! mutated {
             ($name:expr, $offset:expr, $value:expr) => {{
                 let mut b = base.clone();
                 overwrite(&mut b, $offset, $value);
-                cases.push(($name, b));
+                cases.push(($name, b, expected($name)));
             }};
         }
         mutated!("unsupported_version", VERSION, 5_u32.to_le_bytes());
@@ -3087,7 +3135,7 @@ mod private_invariants {
         mutated!("clock_makes_due_stale", CLOCK, 100_u64.to_le_bytes());
         let mut trailing = base.clone();
         trailing.push(0);
-        cases.push(("trailing_byte", trailing));
+        cases.push(("trailing_byte", trailing, expected("trailing_byte")));
 
         // The final cold due tuple is [bucket time, count, entity id].
         let due_at = base.len() - 20;
@@ -3097,7 +3145,11 @@ mod private_invariants {
         let mut missing_due = base[..base.len() - 20].to_vec();
         // Replace the final due-bucket count with canonical zero coverage.
         overwrite(&mut missing_due, 242, 0_u32.to_le_bytes());
-        cases.push(("missing_reverse_due_coverage", missing_due));
+        cases.push((
+            "missing_reverse_due_coverage",
+            missing_due,
+            expected("missing_reverse_due_coverage"),
+        ));
 
         let mut hot = World::new(7);
         hot.apply(Command::SetRegionHot { cell: 0, hot: true });
@@ -3110,15 +3162,26 @@ mod private_invariants {
             ("hot_fixed_step_mismatch", 258, 1_u64),
         ] {
             let mut b = hot_base.clone();
-            overwrite(&mut b, offset, value.to_le_bytes());
-            cases.push((name, b));
+            if name == "hot_last_not_clock" {
+                // Isolate last-step versus clock: fixed steps remains canonical
+                // for activated=0,last=1 while only clock equality is broken.
+                overwrite(&mut b, offset, 1_u64.to_le_bytes());
+                overwrite(&mut b, 258, 1_u64.to_le_bytes());
+            } else {
+                overwrite(&mut b, offset, value.to_le_bytes());
+            }
+            cases.push((name, b, expected(name)));
         }
         let mut hot_due = hot_base.clone();
         overwrite(&mut hot_due, 270, 1_u32.to_le_bytes());
         hot_due.extend(1_u64.to_le_bytes());
         hot_due.extend(1_u32.to_le_bytes());
         hot_due.extend(0_u64.to_le_bytes());
-        cases.push(("hot_entity_due_entry", hot_due));
+        cases.push((
+            "hot_entity_due_entry",
+            hot_due,
+            expected("hot_entity_due_entry"),
+        ));
 
         let mut dead = World::new(7);
         let dead_id = spawn(
@@ -3143,15 +3206,28 @@ mod private_invariants {
             } else {
                 overwrite(&mut b, offset, value.to_le_bytes());
             }
-            cases.push((name, b));
+            cases.push((name, b, expected(name)));
         }
+        let mut dead_health = dead_base.clone();
+        overwrite(&mut dead_health, SPEC_HEALTH, 1_u16.to_le_bytes());
+        overwrite(&mut dead_health, LIVING_HEALTH, 1_u16.to_le_bytes());
+        cases.push((
+            "dead_nonzero_health",
+            dead_health,
+            expected("dead_nonzero_health"),
+        ));
+
         let mut dead_due = dead_base.clone();
         let dead_due_count = dead_due.len() - 4;
         overwrite(&mut dead_due, dead_due_count, 1_u32.to_le_bytes());
         dead_due.extend(2_u64.to_le_bytes());
         dead_due.extend(1_u32.to_le_bytes());
         dead_due.extend(dead_id.raw().to_le_bytes());
-        cases.push(("dead_entity_due_entry", dead_due));
+        cases.push((
+            "dead_entity_due_entry",
+            dead_due,
+            expected("dead_entity_due_entry"),
+        ));
 
         let mut two = World::new(7);
         let first = spawn(&mut two, SoldierSpec::default());
@@ -3163,7 +3239,11 @@ mod private_invariants {
             two_base.len() - 8,
             first.raw().to_le_bytes(),
         );
-        cases.push(("duplicate_due_entity", duplicate));
+        cases.push((
+            "duplicate_due_entity",
+            duplicate,
+            expected("duplicate_due_entity"),
+        ));
         assert_ne!(first, second);
 
         let mut ordered = World::new(7);
@@ -3186,18 +3266,23 @@ mod private_invariants {
             ordered_base.len() - 20,
             first_at.to_le_bytes(),
         );
-        cases.push(("noncanonical_due_order", unordered));
+        cases.push((
+            "noncanonical_due_order",
+            unordered,
+            expected("noncanonical_due_order"),
+        ));
 
-        let names: Vec<_> = cases.iter().map(|(name, _)| *name).collect();
+        let names: Vec<_> = cases.iter().map(|(name, _, _)| *name).collect();
         eprintln!(
             "v6 byte mutation cases ({}): {}",
             names.len(),
             names.join(", ")
         );
-        for (name, bytes) in cases {
-            assert!(
-                World::from_snapshot(&bytes).is_err(),
-                "accepted mutation {name}"
+        for (name, bytes, category) in cases {
+            assert_eq!(
+                World::from_snapshot(&bytes).err(),
+                Some(category),
+                "mutation {name}"
             );
         }
     }
@@ -3233,20 +3318,60 @@ mod private_invariants {
                 },
             });
         }
-        assert_eq!(world.automatic_candidate_visits, 0);
+        assert_eq!(world.automatic_journal_visits, 0);
         assert!(world
             .apply(Command::AdvanceTo { target: 49 })
             .error
             .is_none());
-        assert_eq!(world.automatic_candidate_visits, 0);
+        assert_eq!(world.automatic_journal_visits, 0);
+        assert_eq!(world.automatic_execution_visits, 0);
         assert_eq!(world.cold_boundaries, 0);
         // At second 50 every record is an actual ration candidate, exactly once.
         assert!(world
             .apply(Command::AdvanceTo { target: 50 })
             .error
             .is_none());
-        assert_eq!(world.automatic_candidate_visits, 2_000);
+        assert_eq!(world.automatic_journal_visits, 2_000);
+        assert_eq!(world.automatic_execution_visits, 2_000);
         assert_eq!(world.cold_boundaries, 2_000);
+
+        // An unrelated later segment adds no traversal on either phase.
+        world.apply(Command::Schedule {
+            at: 51,
+            command: ScheduledCommand::SetRegionHot {
+                cell: 99_999,
+                hot: true,
+            },
+        });
+        assert!(world
+            .apply(Command::AdvanceTo { target: 51 })
+            .error
+            .is_none());
+        assert_eq!(world.automatic_journal_visits, 2_000);
+        assert_eq!(world.automatic_execution_visits, 2_000);
+
+        // A small independently due cohort increments both phases exactly once.
+        for cell in 20_000..20_007 {
+            let id = spawn(
+                &mut world,
+                SoldierSpec {
+                    position: Position {
+                        cell,
+                        ..Position::default()
+                    },
+                    ..SoldierSpec::default()
+                },
+            );
+            world.soldiers.living[id.index()].thirst = SEVERE_THIRST - 2;
+            world.schedule_due(id).unwrap();
+        }
+        assert!(world
+            .apply(Command::AdvanceTo { target: 52 })
+            .error
+            .is_none());
+        assert_eq!(world.automatic_journal_visits, 2_007);
+        assert_eq!(world.automatic_execution_visits, 2_007);
+        assert_eq!(world.cold_boundaries, 2_007);
     }
 
     #[test]
@@ -3425,32 +3550,58 @@ mod private_invariants {
                     "{} hot={hot}",
                     fixture.name
                 );
-                let actual: Vec<_> = outcome
-                    .events
-                    .into_iter()
-                    .filter(|e| {
-                        matches!(
-                            e.event,
-                            Event::RationConsumed { .. }
-                                | Event::ActivityChanged { forced: true, .. }
-                                | Event::LivingDeteriorated { .. }
-                                | Event::SoldierDied { .. }
-                        )
-                    })
-                    .map(|e| e.event)
+                let mut expected_events: Vec<_> = fixture
+                    .expected_events
+                    .iter()
+                    .cloned()
+                    .map(|event| TimedEvent { at: 1, event })
                     .collect();
+                expected_events.push(TimedEvent {
+                    at: 1,
+                    event: Event::TimeAdvanced {
+                        from: 0,
+                        to: 1,
+                        hot_cells_stepped: u64::from(hot),
+                        fixed_steps_per_hot_cell: u64::from(hot),
+                    },
+                });
                 assert_eq!(
-                    actual, fixture.expected_events,
+                    outcome.events, expected_events,
                     "{} hot={hot}",
                     fixture.name
                 );
+                let public = world.soldier(got).unwrap();
+                assert_eq!(public.health, fixture.expected.health);
+                assert_eq!(public.living, fixture.expected);
+                assert_eq!(public.inventory, fixture.expected_inventory);
                 assert_eq!(
-                    world.resource_totals().consumed_food,
-                    u128::from(fixture.name == "ration-at")
+                    public.position,
+                    Position {
+                        cell: 1,
+                        ..Position::default()
+                    }
                 );
+                assert_eq!(public.faction, 0);
+                assert_eq!(public.squad, None);
+                assert_eq!(public.role, Role::Rifle);
+                assert_eq!(public.rank, 0);
+                assert_eq!(public.ammunition, 0);
+                let consumed = u128::from(fixture.name == "ration-at");
                 assert_eq!(
-                    world.resource_totals().consumed_water,
-                    u128::from(fixture.name == "ration-at")
+                    world.resource_totals(),
+                    ResourceTotals {
+                        ammunition: 0,
+                        stockpile_supplies: 0,
+                        carried_food: u128::from(fixture.expected_inventory.food),
+                        carried_water: u128::from(fixture.expected_inventory.water),
+                        carried_medical: u128::from(fixture.expected_inventory.medical),
+                        sourced_food: u128::from(fixture.inventory.food),
+                        sourced_water: u128::from(fixture.inventory.water),
+                        consumed_food: consumed,
+                        consumed_water: consumed,
+                        lost_food: 0,
+                        lost_water: 0,
+                    }
                 );
                 assert_eq!(
                     world.living_work_counters(),
@@ -3640,6 +3791,13 @@ mod private_invariants {
         assert_ne!(replacement, removed);
         let checkpoint = world.snapshot();
         let mut restored = World::from_snapshot(&checkpoint).unwrap();
+        assert_eq!(restored.cell_members[&10], BTreeSet::from([dying]));
+        assert_eq!(restored.cell_members[&20], BTreeSet::from([replacement]));
+        assert_eq!(restored.cell_members[&30], BTreeSet::from([cold]));
+        assert!(restored
+            .cell_members
+            .values()
+            .all(|members| !members.contains(&removed)));
 
         let expected = vec![
             TimedEvent {
@@ -3699,5 +3857,35 @@ mod private_invariants {
         assert_eq!(world.snapshot(), restored.snapshot());
         assert_eq!(world.state_digest(), restored.state_digest());
         assert_eq!(world.state_digest(), 0x4efc_41f8_9a7f_a833);
+
+        let later = vec![TimedEvent {
+            at: 3,
+            event: Event::TimeAdvanced {
+                from: 1,
+                to: 3,
+                hot_cells_stepped: 2,
+                fixed_steps_per_hot_cell: 2,
+            },
+        }];
+        for candidate in [&mut world, &mut restored] {
+            let outcome = candidate.apply(Command::AdvanceTo { target: 3 });
+            assert_eq!(outcome.error, None);
+            assert_eq!(outcome.events, later);
+            assert_eq!(candidate.hot_member_steps, 4);
+            assert_eq!(candidate.hot_cells[&10].fixed_steps, 3);
+            assert_eq!(candidate.hot_cells[&20].fixed_steps, 3);
+            assert_eq!(
+                candidate.soldiers.living[replacement.index()].materialized_at,
+                3
+            );
+            assert_eq!(candidate.soldiers.living[dying.index()].materialized_at, 1);
+            assert_eq!(candidate.soldiers.living[cold.index()].materialized_at, 0);
+            assert!(candidate
+                .cell_members
+                .values()
+                .all(|members| !members.contains(&removed)));
+        }
+        assert_eq!(world.snapshot(), restored.snapshot());
+        assert_eq!(world.state_digest(), restored.state_digest());
     }
 }
