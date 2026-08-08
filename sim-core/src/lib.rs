@@ -3375,6 +3375,715 @@ mod private_invariants {
     }
 
     #[test]
+    fn cold_analytical_path_matches_hand_authored_duration_matrix() {
+        #[derive(Clone)]
+        struct Case {
+            name: &'static str,
+            target: u64,
+            living: LivingState,
+            inventory: Inventory,
+            expected: LivingState,
+            expected_inventory: Inventory,
+            expected_events: Vec<TimedEvent>,
+            expected_due: Option<u64>,
+            expected_consumed: (u128, u128),
+            expected_cold_work: u64,
+        }
+
+        let id = EntityId::from_parts(0, 0);
+        let living = |activity, hunger, thirst, fatigue, health| LivingState {
+            activity,
+            hunger,
+            thirst,
+            fatigue,
+            health,
+            ..LivingState::default()
+        };
+        let inventory = |food, water| Inventory {
+            food,
+            water,
+            medical: 7,
+        };
+        let advanced = |to| TimedEvent {
+            at: to,
+            event: Event::TimeAdvanced {
+                from: 0,
+                to,
+                hot_cells_stepped: 0,
+                fixed_steps_per_hot_cell: 0,
+            },
+        };
+        let deterioration = |at, morale_before, health_before, health_after| TimedEvent {
+            at,
+            event: Event::LivingDeteriorated {
+                id,
+                morale_before,
+                morale_after: morale_before - 1,
+                health_before,
+                health_after,
+            },
+        };
+        let cases = vec![
+            Case {
+                name: "duration-zero-rest-both-present",
+                target: 0,
+                living: living(Activity::Rest, 0, 0, 6, 1000),
+                inventory: inventory(2, 2),
+                expected: living(Activity::Rest, 0, 0, 6, 1000),
+                expected_inventory: inventory(2, 2),
+                expected_events: vec![],
+                expected_due: Some(100),
+                expected_consumed: (0, 0),
+                expected_cold_work: 0,
+            },
+            Case {
+                name: "ration-before-idle-both-present",
+                target: 1,
+                living: living(Activity::Idle, 98, 97, 0, 1000),
+                inventory: inventory(1, 1),
+                expected: LivingState {
+                    hunger: 99,
+                    thirst: 99,
+                    fatigue: 1,
+                    sleep_debt: 1,
+                    materialized_at: 1,
+                    ..LivingState::default()
+                },
+                expected_inventory: inventory(1, 1),
+                expected_events: vec![advanced(1)],
+                expected_due: Some(2),
+                expected_consumed: (0, 0),
+                expected_cold_work: 0,
+            },
+            Case {
+                name: "ration-at-idle-both-present",
+                target: 1,
+                living: living(Activity::Idle, 99, 98, 0, 1000),
+                inventory: inventory(1, 1),
+                expected: LivingState {
+                    fatigue: 1,
+                    sleep_debt: 1,
+                    materialized_at: 1,
+                    ..LivingState::default()
+                },
+                expected_inventory: inventory(0, 0),
+                expected_events: vec![
+                    TimedEvent {
+                        at: 1,
+                        event: Event::RationConsumed {
+                            id,
+                            food: 1,
+                            water: 1,
+                            hunger_before: 100,
+                            hunger_after: 0,
+                            thirst_before: 100,
+                            thirst_after: 0,
+                        },
+                    },
+                    advanced(1),
+                ],
+                expected_due: Some(401),
+                expected_consumed: (1, 1),
+                expected_cold_work: 1,
+            },
+            Case {
+                name: "ration-after-idle-food-only",
+                target: 1,
+                living: living(Activity::Idle, 100, 0, 0, 1000),
+                inventory: inventory(1, 0),
+                expected: LivingState {
+                    hunger: 1,
+                    thirst: 2,
+                    fatigue: 1,
+                    sleep_debt: 1,
+                    materialized_at: 1,
+                    ..LivingState::default()
+                },
+                expected_inventory: inventory(0, 0),
+                expected_events: vec![
+                    TimedEvent {
+                        at: 1,
+                        event: Event::RationConsumed {
+                            id,
+                            food: 1,
+                            water: 0,
+                            hunger_before: 101,
+                            hunger_after: 1,
+                            thirst_before: 2,
+                            thirst_after: 2,
+                        },
+                    },
+                    advanced(1),
+                ],
+                expected_due: Some(400),
+                expected_consumed: (1, 0),
+                expected_cold_work: 1,
+            },
+            Case {
+                name: "ration-at-idle-water-only",
+                target: 1,
+                living: living(Activity::Idle, 0, 98, 0, 1000),
+                inventory: inventory(0, 1),
+                expected: LivingState {
+                    hunger: 1,
+                    fatigue: 1,
+                    sleep_debt: 1,
+                    materialized_at: 1,
+                    ..LivingState::default()
+                },
+                expected_inventory: inventory(0, 0),
+                expected_events: vec![
+                    TimedEvent {
+                        at: 1,
+                        event: Event::RationConsumed {
+                            id,
+                            food: 0,
+                            water: 1,
+                            hunger_before: 1,
+                            hunger_after: 1,
+                            thirst_before: 100,
+                            thirst_after: 0,
+                        },
+                    },
+                    advanced(1),
+                ],
+                expected_due: Some(401),
+                expected_consumed: (0, 1),
+                expected_cold_work: 1,
+            },
+            Case {
+                name: "ration-duration-boundary-minus-one",
+                target: 49,
+                living: living(Activity::Idle, 49, 0, 0, 1000),
+                inventory: inventory(1, 1),
+                expected: LivingState {
+                    hunger: 98,
+                    thirst: 98,
+                    fatigue: 49,
+                    sleep_debt: 49,
+                    materialized_at: 49,
+                    ..LivingState::default()
+                },
+                expected_inventory: inventory(1, 1),
+                expected_events: vec![advanced(49)],
+                expected_due: Some(50),
+                expected_consumed: (0, 0),
+                expected_cold_work: 0,
+            },
+            Case {
+                name: "ration-duration-boundary",
+                target: 50,
+                living: living(Activity::Idle, 49, 0, 0, 1000),
+                inventory: inventory(1, 1),
+                expected: LivingState {
+                    hunger: 99,
+                    fatigue: 50,
+                    sleep_debt: 50,
+                    materialized_at: 50,
+                    ..LivingState::default()
+                },
+                expected_inventory: inventory(1, 0),
+                expected_events: vec![
+                    TimedEvent {
+                        at: 50,
+                        event: Event::RationConsumed {
+                            id,
+                            food: 0,
+                            water: 1,
+                            hunger_before: 99,
+                            hunger_after: 99,
+                            thirst_before: 100,
+                            thirst_after: 0,
+                        },
+                    },
+                    advanced(50),
+                ],
+                expected_due: Some(51),
+                expected_consumed: (0, 1),
+                expected_cold_work: 1,
+            },
+            Case {
+                name: "ration-duration-boundary-plus-one-multi-boundary",
+                target: 51,
+                living: living(Activity::Idle, 49, 0, 0, 1000),
+                inventory: inventory(1, 1),
+                expected: LivingState {
+                    thirst: 2,
+                    fatigue: 51,
+                    sleep_debt: 51,
+                    materialized_at: 51,
+                    ..LivingState::default()
+                },
+                expected_inventory: inventory(0, 0),
+                expected_events: vec![
+                    TimedEvent {
+                        at: 50,
+                        event: Event::RationConsumed {
+                            id,
+                            food: 0,
+                            water: 1,
+                            hunger_before: 99,
+                            hunger_after: 99,
+                            thirst_before: 100,
+                            thirst_after: 0,
+                        },
+                    },
+                    TimedEvent {
+                        at: 51,
+                        event: Event::RationConsumed {
+                            id,
+                            food: 1,
+                            water: 0,
+                            hunger_before: 100,
+                            hunger_after: 0,
+                            thirst_before: 2,
+                            thirst_after: 2,
+                        },
+                    },
+                    advanced(51),
+                ],
+                expected_due: Some(450),
+                expected_consumed: (1, 1),
+                expected_cold_work: 2,
+            },
+            Case {
+                name: "severe-hunger-before-rest-food-exhausted",
+                target: 1,
+                living: living(Activity::Rest, 798, 0, 2, 1000),
+                inventory: inventory(0, 1),
+                expected: LivingState {
+                    hunger: 799,
+                    thirst: 1,
+                    fatigue: 0,
+                    materialized_at: 1,
+                    activity: Activity::Rest,
+                    ..LivingState::default()
+                },
+                expected_inventory: inventory(0, 1),
+                expected_events: vec![advanced(1)],
+                expected_due: Some(2),
+                expected_consumed: (0, 0),
+                expected_cold_work: 0,
+            },
+            Case {
+                name: "severe-hunger-at-idle-food-exhausted",
+                target: 1,
+                living: living(Activity::Idle, 799, 0, 0, 1000),
+                inventory: inventory(0, 1),
+                expected: LivingState {
+                    hunger: 800,
+                    thirst: 2,
+                    fatigue: 1,
+                    sleep_debt: 1,
+                    morale: 999,
+                    health: 996,
+                    materialized_at: 1,
+                    ..LivingState::default()
+                },
+                expected_inventory: inventory(0, 1),
+                expected_events: vec![deterioration(1, 1000, 1000, 996), advanced(1)],
+                expected_due: Some(2),
+                expected_consumed: (0, 0),
+                expected_cold_work: 1,
+            },
+            Case {
+                name: "severe-hunger-after-idle-food-exhausted",
+                target: 1,
+                living: living(Activity::Idle, 800, 0, 0, 1000),
+                inventory: inventory(0, 1),
+                expected: LivingState {
+                    hunger: 801,
+                    thirst: 2,
+                    fatigue: 1,
+                    sleep_debt: 1,
+                    morale: 999,
+                    health: 996,
+                    materialized_at: 1,
+                    ..LivingState::default()
+                },
+                expected_inventory: inventory(0, 1),
+                expected_events: vec![deterioration(1, 1000, 1000, 996), advanced(1)],
+                expected_due: Some(2),
+                expected_consumed: (0, 0),
+                expected_cold_work: 1,
+            },
+            Case {
+                name: "severe-thirst-before-idle-water-exhausted",
+                target: 1,
+                living: living(Activity::Idle, 0, 797, 0, 1000),
+                inventory: inventory(1, 0),
+                expected: LivingState {
+                    hunger: 1,
+                    thirst: 799,
+                    fatigue: 1,
+                    sleep_debt: 1,
+                    materialized_at: 1,
+                    ..LivingState::default()
+                },
+                expected_inventory: inventory(1, 0),
+                expected_events: vec![advanced(1)],
+                expected_due: Some(2),
+                expected_consumed: (0, 0),
+                expected_cold_work: 0,
+            },
+            Case {
+                name: "severe-thirst-at-idle-water-exhausted",
+                target: 1,
+                living: living(Activity::Idle, 0, 798, 0, 1000),
+                inventory: inventory(1, 0),
+                expected: LivingState {
+                    hunger: 1,
+                    thirst: 800,
+                    fatigue: 1,
+                    sleep_debt: 1,
+                    morale: 999,
+                    health: 990,
+                    materialized_at: 1,
+                    ..LivingState::default()
+                },
+                expected_inventory: inventory(1, 0),
+                expected_events: vec![deterioration(1, 1000, 1000, 990), advanced(1)],
+                expected_due: Some(2),
+                expected_consumed: (0, 0),
+                expected_cold_work: 1,
+            },
+            Case {
+                name: "severe-thirst-after-idle-water-exhausted",
+                target: 1,
+                living: living(Activity::Idle, 0, 799, 0, 1000),
+                inventory: inventory(1, 0),
+                expected: LivingState {
+                    hunger: 1,
+                    thirst: 801,
+                    fatigue: 1,
+                    sleep_debt: 1,
+                    morale: 999,
+                    health: 990,
+                    materialized_at: 1,
+                    ..LivingState::default()
+                },
+                expected_inventory: inventory(1, 0),
+                expected_events: vec![deterioration(1, 1000, 1000, 990), advanced(1)],
+                expected_due: Some(2),
+                expected_consumed: (0, 0),
+                expected_cold_work: 1,
+            },
+            Case {
+                name: "forced-idle-before-march-both-exhausted",
+                target: 1,
+                living: living(Activity::March, 0, 0, 896, 1000),
+                inventory: inventory(0, 0),
+                expected: LivingState {
+                    hunger: 2,
+                    thirst: 3,
+                    fatigue: 899,
+                    sleep_debt: 2,
+                    activity: Activity::March,
+                    materialized_at: 1,
+                    ..LivingState::default()
+                },
+                expected_inventory: inventory(0, 0),
+                expected_events: vec![advanced(1)],
+                expected_due: Some(2),
+                expected_consumed: (0, 0),
+                expected_cold_work: 0,
+            },
+            Case {
+                name: "forced-idle-at-march-both-exhausted",
+                target: 1,
+                living: living(Activity::March, 0, 0, 897, 1000),
+                inventory: inventory(0, 0),
+                expected: LivingState {
+                    hunger: 2,
+                    thirst: 3,
+                    fatigue: 900,
+                    sleep_debt: 2,
+                    activity: Activity::Idle,
+                    materialized_at: 1,
+                    ..LivingState::default()
+                },
+                expected_inventory: inventory(0, 0),
+                expected_events: vec![
+                    TimedEvent {
+                        at: 1,
+                        event: Event::ActivityChanged {
+                            id,
+                            before: Activity::March,
+                            after: Activity::Idle,
+                            forced: true,
+                        },
+                    },
+                    advanced(1),
+                ],
+                expected_due: Some(400),
+                expected_consumed: (0, 0),
+                expected_cold_work: 1,
+            },
+            Case {
+                name: "forced-idle-after-march-both-exhausted",
+                target: 1,
+                living: living(Activity::March, 0, 0, 898, 1000),
+                inventory: inventory(0, 0),
+                expected: LivingState {
+                    hunger: 2,
+                    thirst: 3,
+                    fatigue: 901,
+                    sleep_debt: 2,
+                    activity: Activity::Idle,
+                    materialized_at: 1,
+                    ..LivingState::default()
+                },
+                expected_inventory: inventory(0, 0),
+                expected_events: vec![
+                    TimedEvent {
+                        at: 1,
+                        event: Event::ActivityChanged {
+                            id,
+                            before: Activity::March,
+                            after: Activity::Idle,
+                            forced: true,
+                        },
+                    },
+                    advanced(1),
+                ],
+                expected_due: Some(400),
+                expected_consumed: (0, 0),
+                expected_cold_work: 1,
+            },
+            Case {
+                name: "boundary-plus-one-starvation-death",
+                target: 2,
+                living: living(Activity::Idle, 799, 0, 0, 8),
+                inventory: inventory(0, 1),
+                expected: LivingState {
+                    hunger: 801,
+                    thirst: 4,
+                    fatigue: 2,
+                    sleep_debt: 2,
+                    morale: 998,
+                    health: 0,
+                    life: LifeState::Dead {
+                        at: 2,
+                        cause: DeathCause::Starvation,
+                    },
+                    materialized_at: 2,
+                    ..LivingState::default()
+                },
+                expected_inventory: inventory(0, 1),
+                expected_events: vec![
+                    deterioration(1, 1000, 8, 4),
+                    deterioration(2, 999, 4, 0),
+                    TimedEvent {
+                        at: 2,
+                        event: Event::SoldierDied {
+                            id,
+                            cause: DeathCause::Starvation,
+                            health_before: 4,
+                        },
+                    },
+                    advanced(2),
+                ],
+                expected_due: None,
+                expected_consumed: (0, 0),
+                expected_cold_work: 2,
+            },
+            Case {
+                name: "multi-boundary-both-exhausted",
+                target: 3,
+                living: living(Activity::Idle, 799, 798, 0, 40),
+                inventory: inventory(0, 0),
+                expected: LivingState {
+                    hunger: 802,
+                    thirst: 804,
+                    fatigue: 3,
+                    sleep_debt: 3,
+                    morale: 997,
+                    health: 10,
+                    materialized_at: 3,
+                    ..LivingState::default()
+                },
+                expected_inventory: inventory(0, 0),
+                expected_events: vec![
+                    deterioration(1, 1000, 40, 30),
+                    deterioration(2, 999, 30, 20),
+                    deterioration(3, 998, 20, 10),
+                    advanced(3),
+                ],
+                expected_due: Some(4),
+                expected_consumed: (0, 0),
+                expected_cold_work: 3,
+            },
+            Case {
+                name: "huge-time-terminal-dehydration-death",
+                target: u64::MAX,
+                living: living(Activity::Idle, 0, 798, 0, 10),
+                inventory: inventory(1, 0),
+                expected: LivingState {
+                    hunger: 1,
+                    thirst: 800,
+                    fatigue: 1,
+                    sleep_debt: 1,
+                    morale: 999,
+                    health: 0,
+                    life: LifeState::Dead {
+                        at: 1,
+                        cause: DeathCause::Dehydration,
+                    },
+                    materialized_at: 1,
+                    ..LivingState::default()
+                },
+                expected_inventory: inventory(1, 0),
+                expected_events: vec![
+                    deterioration(1, 1000, 10, 0),
+                    TimedEvent {
+                        at: 1,
+                        event: Event::SoldierDied {
+                            id,
+                            cause: DeathCause::Dehydration,
+                            health_before: 10,
+                        },
+                    },
+                    advanced(u64::MAX),
+                ],
+                expected_due: None,
+                expected_consumed: (0, 0),
+                expected_cold_work: 1,
+            },
+        ];
+        assert_eq!(cases.len(), 20);
+
+        for case in cases {
+            let mut world = World::new(0xC01D);
+            let got = spawn(
+                &mut world,
+                SoldierSpec {
+                    faction: 9,
+                    position: Position {
+                        x_mm: -12,
+                        y_mm: 34,
+                        cell: 56,
+                    },
+                    squad: None,
+                    role: Role::Logistics,
+                    rank: 4,
+                    health: case.living.health,
+                    ammunition: 23,
+                    inventory: case.inventory,
+                },
+            );
+            assert_eq!(got, id, "{}", case.name);
+            world.soldiers.living[0] = case.living;
+            world.soldiers.data[0].health = case.living.health;
+            world.schedule_due(id).unwrap();
+
+            let outcome = world.apply(Command::AdvanceTo {
+                target: case.target,
+            });
+            assert_eq!(outcome.error, None, "{}", case.name);
+            assert_eq!(outcome.events, case.expected_events, "{}", case.name);
+            let expected_persistent = if case.expected_cold_work == 0 {
+                case.living
+            } else {
+                case.expected
+            };
+            assert_eq!(
+                world.soldiers.living[0], expected_persistent,
+                "{}",
+                case.name
+            );
+            assert_eq!(
+                world.soldiers.data[0].inventory, case.expected_inventory,
+                "{}",
+                case.name
+            );
+            let public = world.soldier(id).unwrap();
+            assert_eq!(
+                public,
+                Soldier {
+                    id,
+                    faction: 9,
+                    position: Position {
+                        x_mm: -12,
+                        y_mm: 34,
+                        cell: 56
+                    },
+                    squad: None,
+                    role: Role::Logistics,
+                    rank: 4,
+                    health: case.expected.health,
+                    needs: Needs {
+                        fatigue: case.expected.fatigue,
+                        hunger: case.expected.hunger,
+                        thirst: case.expected.thirst,
+                        sleep_debt: case.expected.sleep_debt
+                    },
+                    ammunition: 23,
+                    inventory: case.expected_inventory,
+                    living: case.expected,
+                },
+                "{}",
+                case.name
+            );
+            assert_eq!(
+                world.resource_totals(),
+                ResourceTotals {
+                    ammunition: 23,
+                    stockpile_supplies: 0,
+                    carried_food: u128::from(case.expected_inventory.food),
+                    carried_water: u128::from(case.expected_inventory.water),
+                    carried_medical: 7,
+                    sourced_food: u128::from(case.inventory.food),
+                    sourced_water: u128::from(case.inventory.water),
+                    consumed_food: case.expected_consumed.0,
+                    consumed_water: case.expected_consumed.1,
+                    lost_food: 0,
+                    lost_water: 0,
+                },
+                "{}",
+                case.name
+            );
+            assert_eq!(
+                world.living_work_counters(),
+                (case.expected_cold_work, 0),
+                "{}",
+                case.name
+            );
+            assert!(world.hot_cells.is_empty(), "{}", case.name);
+            assert_eq!(
+                world.due_by_entity.get(&id).copied(),
+                case.expected_due,
+                "{}",
+                case.name
+            );
+            assert_eq!(
+                world.living_due.values().map(BTreeSet::len).sum::<usize>(),
+                usize::from(case.expected_due.is_some()),
+                "{}",
+                case.name
+            );
+            if let Some(at) = case.expected_due {
+                assert_eq!(
+                    world.living_due.get(&at),
+                    Some(&BTreeSet::from([id])),
+                    "{}",
+                    case.name
+                );
+            }
+            if matches!(case.expected.life, LifeState::Dead { .. }) {
+                let snapshot = world.snapshot();
+                let counters = world.living_work_counters();
+                let repeated = world.apply(Command::AdvanceTo {
+                    target: case.target,
+                });
+                assert_eq!(repeated.error, None, "{}", case.name);
+                assert!(repeated.events.is_empty(), "{}", case.name);
+                assert_eq!(world.snapshot(), snapshot, "{}", case.name);
+                assert_eq!(world.living_work_counters(), counters, "{}", case.name);
+            }
+        }
+    }
+
+    #[test]
     fn cold_and_hot_paths_each_match_hand_authored_boundary_fixtures() {
         #[derive(Clone, Copy)]
         struct Fixture<'a> {
