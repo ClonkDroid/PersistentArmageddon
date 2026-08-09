@@ -15664,7 +15664,9 @@ mod private_invariants {
             },
         );
         let advanced = world.apply(Command::AdvanceTo { target: 100 });
+        assert_eq!(advanced.clock, 100);
         assert_eq!(advanced.error, None);
+        assert_eq!(advanced.blocked, None);
         assert_eq!(
             advanced.events,
             vec![
@@ -15758,6 +15760,9 @@ mod private_invariants {
             wound: wound_spec,
         });
         let wound = WoundId(0);
+        assert_eq!(wound_outcome.clock, 100);
+        assert_eq!(wound_outcome.error, None);
+        assert_eq!(wound_outcome.blocked, None);
         assert_eq!(
             wound_outcome.events,
             vec![TimedEvent {
@@ -15776,6 +15781,9 @@ mod private_invariants {
             kind: TreatmentKind::Shock,
         });
         let treatment = TreatmentId(0);
+        assert_eq!(treatment_outcome.clock, 100);
+        assert_eq!(treatment_outcome.error, None);
+        assert_eq!(treatment_outcome.blocked, None);
         assert_eq!(
             treatment_outcome.events,
             vec![TimedEvent {
@@ -15798,6 +15806,9 @@ mod private_invariants {
             medical: 9,
         };
         let removal = world.apply(Command::DespawnSoldier { id: removed });
+        assert_eq!(removal.clock, 100);
+        assert_eq!(removal.error, None);
+        assert_eq!(removal.blocked, None);
         assert_eq!(
             removal.events,
             vec![TimedEvent {
@@ -15821,8 +15832,15 @@ mod private_invariants {
             materialized_at: 100,
         };
         let living_fresh = LivingState {
+            hunger: 0,
+            thirst: 0,
+            fatigue: 0,
+            sleep_debt: 0,
+            morale: 1000,
+            health: 1000,
+            activity: Activity::Idle,
+            life: LifeState::Alive,
             materialized_at: 100,
-            ..LivingState::default()
         };
         let casualty = CasualtyState {
             blood: BLOOD_MAX,
@@ -15993,30 +16011,30 @@ mod private_invariants {
                 ),
                 (31, 2, 9)
             );
-            assert_eq!(
-                16,
-                survivor_inventory
-                    .values()
-                    .map(|i| u128::from(i.food))
-                    .sum::<u128>()
-            );
-            assert_eq!(
-                18,
-                survivor_inventory
-                    .values()
-                    .map(|i| u128::from(i.water))
-                    .sum::<u128>()
-            );
-            assert_eq!(
-                20,
-                survivor_inventory
-                    .values()
-                    .map(|i| u128::from(i.medical))
-                    .sum::<u128>()
-            );
-            assert_eq!(24, 16 + 1 + 7);
-            assert_eq!(28, 18 + 2 + 8);
-            assert_eq!(31, 20 + 2 + 9);
+            let checked_sum = |values: &[u32]| {
+                values
+                    .iter()
+                    .try_fold(0_u128, |sum, value| sum.checked_add(u128::from(*value)))
+            };
+            assert_eq!(checked_sum(&[2, 1, 2, 11]), Some(16));
+            assert_eq!(checked_sum(&[2, 1, 3, 12]), Some(18));
+            assert_eq!(checked_sum(&[0, 3, 4, 13]), Some(20));
+            for (sourced, carried, consumed, lost) in [
+                (24_u128, 16_u128, 1_u128, 7_u128),
+                (28, 18, 2, 8),
+                (31, 20, 2, 9),
+            ] {
+                assert!(sourced > 0);
+                assert!(carried > 0);
+                assert!(consumed > 0);
+                assert!(lost > 0);
+                assert_eq!(
+                    carried
+                        .checked_add(consumed)
+                        .and_then(|value| value.checked_add(lost)),
+                    Some(sourced)
+                );
+            }
         };
         assert_control(&world);
         let bytes = world.snapshot();
@@ -16032,7 +16050,70 @@ mod private_invariants {
             .soldiers
             .iter()
             .find(|s| s.slot as usize == carrier.index())
-            .unwrap();
+            .unwrap()
+            .clone();
+        let ledger_offsets = |layout: &V7MedicalLayout| {
+            (
+                layout.sourced_food,
+                layout.sourced_water,
+                layout.consumed_food,
+                layout.consumed_water,
+                layout.lost_food,
+                layout.lost_water,
+                layout.sourced_medical,
+                layout.consumed_medical,
+                layout.lost_medical,
+            )
+        };
+        let carrier_offsets = |image: &[u8], layout: &V7MedicalLayout| {
+            let soldier = layout
+                .soldiers
+                .iter()
+                .find(|soldier| soldier.slot as usize == carrier.index())
+                .unwrap();
+            assert_eq!(soldier.slot as usize, carrier.index());
+            assert_eq!(read_u32(image, soldier.generation), carrier.generation());
+            assert_eq!(image[soldier.alive], 1);
+            assert_eq!(soldier.food + 4, soldier.water);
+            assert_eq!(soldier.water + 4, soldier.medical);
+            assert!(soldier.range.start <= soldier.generation);
+            assert!(soldier.range.contains(&soldier.alive));
+            assert!(soldier.range.contains(&soldier.food));
+            assert!(soldier.range.contains(&(soldier.food + 3)));
+            assert!(soldier.range.contains(&soldier.water));
+            assert!(soldier.range.contains(&(soldier.water + 3)));
+            assert!(soldier.range.contains(&soldier.medical));
+            assert!(soldier.range.contains(&(soldier.medical + 3)));
+            (
+                soldier.food,
+                soldier.water,
+                soldier.medical,
+                soldier.range.clone(),
+            )
+        };
+        let resource_tuples = |image: &[u8], layout: &V7MedicalLayout| {
+            let (food, water, medical, _) = carrier_offsets(image, layout);
+            [
+                (
+                    read_u128(image, layout.sourced_food),
+                    u128::from(read_u32(image, food)).checked_add(5).unwrap(),
+                    read_u128(image, layout.consumed_food),
+                    read_u128(image, layout.lost_food),
+                ),
+                (
+                    read_u128(image, layout.sourced_water),
+                    u128::from(read_u32(image, water)).checked_add(6).unwrap(),
+                    read_u128(image, layout.consumed_water),
+                    read_u128(image, layout.lost_water),
+                ),
+                (
+                    read_u128(image, layout.sourced_medical),
+                    u128::from(read_u32(image, medical)).checked_add(7).unwrap(),
+                    read_u128(image, layout.consumed_medical),
+                    read_u128(image, layout.lost_medical),
+                ),
+            ]
+        };
         assert_eq!(
             read_u32(&bytes, carrier_layout.generation),
             carrier.generation()
@@ -16175,6 +16256,7 @@ mod private_invariants {
             }
             let changed_layout = V7MedicalLayout::parse(&changed);
             assert_eq!(changed_layout.end, changed.len());
+            assert_eq!(ledger_offsets(&changed_layout), ledger_offsets(&layout));
             let changed_carrier = changed_layout
                 .soldiers
                 .iter()
@@ -16182,37 +16264,68 @@ mod private_invariants {
                 .unwrap();
             assert_eq!(changed_carrier.range, carrier_layout.range);
             assert_eq!(
+                carrier_offsets(&changed, &changed_layout),
+                carrier_offsets(&bytes, &layout)
+            );
+            assert_eq!(
                 read_u32(&changed, changed_carrier.generation),
                 carrier.generation()
             );
             assert_eq!(changed[changed_carrier.alive], 1);
-            for (at, value) in ledger_fields.into_iter().zip(ledger_values) {
+            let changed_ledger_fields = [
+                changed_layout.sourced_food,
+                changed_layout.sourced_water,
+                changed_layout.consumed_food,
+                changed_layout.consumed_water,
+                changed_layout.lost_food,
+                changed_layout.lost_water,
+                changed_layout.sourced_medical,
+                changed_layout.consumed_medical,
+                changed_layout.lost_medical,
+            ];
+            for (at, value) in changed_ledger_fields.into_iter().zip(ledger_values) {
                 assert_eq!(
                     read_u128(&changed, at),
                     if at == case.at { value + 1 } else { value }
                 );
             }
             for (at, value) in [
-                (carrier_layout.food, 11_u32),
-                (carrier_layout.water, 12),
-                (carrier_layout.medical, 13),
+                (changed_carrier.food, 11_u32),
+                (changed_carrier.water, 12),
+                (changed_carrier.medical, 13),
             ] {
                 assert_eq!(
                     read_u32(&changed, at),
                     if at == case.at { value + 1 } else { value }
                 );
             }
-            let mut equations = families;
-            equations[case.family].0 += u128::from(case.term == 0);
-            equations[case.family].1 += u128::from(case.term == 1);
-            equations[case.family].2 += u128::from(case.term == 2);
-            equations[case.family].3 += u128::from(case.term == 3);
+            let equations: [(u128, u128, u128, u128); 3] = match (case.family, case.term) {
+                (0, 0) => [(25, 16, 1, 7), (28, 18, 2, 8), (31, 20, 2, 9)],
+                (0, 1) => [(24, 17, 1, 7), (28, 18, 2, 8), (31, 20, 2, 9)],
+                (0, 2) => [(24, 16, 2, 7), (28, 18, 2, 8), (31, 20, 2, 9)],
+                (0, 3) => [(24, 16, 1, 8), (28, 18, 2, 8), (31, 20, 2, 9)],
+                (1, 0) => [(24, 16, 1, 7), (29, 18, 2, 8), (31, 20, 2, 9)],
+                (1, 1) => [(24, 16, 1, 7), (28, 19, 2, 8), (31, 20, 2, 9)],
+                (1, 2) => [(24, 16, 1, 7), (28, 18, 3, 8), (31, 20, 2, 9)],
+                (1, 3) => [(24, 16, 1, 7), (28, 18, 2, 9), (31, 20, 2, 9)],
+                (2, 0) => [(24, 16, 1, 7), (28, 18, 2, 8), (32, 20, 2, 9)],
+                (2, 1) => [(24, 16, 1, 7), (28, 18, 2, 8), (31, 21, 2, 9)],
+                (2, 2) => [(24, 16, 1, 7), (28, 18, 2, 8), (31, 20, 3, 9)],
+                (2, 3) => [(24, 16, 1, 7), (28, 18, 2, 8), (31, 20, 2, 10)],
+                _ => unreachable!(),
+            };
+            assert_eq!(resource_tuples(&changed, &changed_layout), equations);
             for (i, (source, carried, consumed, lost)) in equations.into_iter().enumerate() {
                 let rhs = carried
                     .checked_add(consumed)
-                    .and_then(|v| v.checked_add(lost))
-                    .unwrap();
-                assert_eq!(source.abs_diff(rhs), u128::from(i == case.family));
+                    .and_then(|v| v.checked_add(lost));
+                if i != case.family {
+                    assert_eq!(rhs, Some(source));
+                } else if case.term == 0 {
+                    assert_eq!(rhs.and_then(|value| value.checked_add(1)), Some(source));
+                } else {
+                    assert_eq!(source.checked_add(1), rhs);
+                }
             }
             let expected_changes = if case.width == 16 {
                 scalar_changes(
@@ -16241,16 +16354,20 @@ mod private_invariants {
                     [layout.consumed_water, layout.lost_water],
                     [layout.consumed_medical, layout.lost_medical],
                 ][family][term - 2];
-                let before = families[family].2
-                    + if term == 3 {
-                        families[family].3 - families[family].2
-                    } else {
-                        0
-                    };
+                let before = match (family, term) {
+                    (0, 2) => 1_u128,
+                    (0, 3) => 7,
+                    (1, 2) => 2,
+                    (1, 3) => 8,
+                    (2, 2) => 2,
+                    (2, 3) => 9,
+                    _ => unreachable!(),
+                };
                 let mut changed = bytes.clone();
                 put_u128(&mut changed, at, u128::MAX);
                 let parsed = V7MedicalLayout::parse(&changed);
                 assert_eq!(parsed.end, changed.len());
+                assert_eq!(ledger_offsets(&parsed), ledger_offsets(&layout));
                 let parsed_carrier = parsed
                     .soldiers
                     .iter()
@@ -16258,13 +16375,46 @@ mod private_invariants {
                     .unwrap();
                 assert_eq!(parsed_carrier.range, carrier_layout.range);
                 assert_eq!(
+                    carrier_offsets(&changed, &parsed),
+                    carrier_offsets(&bytes, &layout)
+                );
+                assert_eq!(
                     read_u32(&changed, parsed_carrier.generation),
                     carrier.generation()
                 );
                 assert_eq!(changed[parsed_carrier.alive], 1);
                 assert_eq!(read_u128(&changed, at), u128::MAX);
-                let (_, carried, consumed, _) = families[family];
-                for (field, value) in ledger_fields.into_iter().zip(ledger_values) {
+                let affected = match (family, term) {
+                    (0, 2) => (24_u128, 16_u128, u128::MAX, 7_u128),
+                    (0, 3) => (24, 16, 1, u128::MAX),
+                    (1, 2) => (28, 18, u128::MAX, 8),
+                    (1, 3) => (28, 18, 2, u128::MAX),
+                    (2, 2) => (31, 20, u128::MAX, 9),
+                    (2, 3) => (31, 20, 2, u128::MAX),
+                    _ => unreachable!(),
+                };
+                let expected_tuples = match (family, term) {
+                    (0, 2) => [(24, 16, u128::MAX, 7), (28, 18, 2, 8), (31, 20, 2, 9)],
+                    (0, 3) => [(24, 16, 1, u128::MAX), (28, 18, 2, 8), (31, 20, 2, 9)],
+                    (1, 2) => [(24, 16, 1, 7), (28, 18, u128::MAX, 8), (31, 20, 2, 9)],
+                    (1, 3) => [(24, 16, 1, 7), (28, 18, 2, u128::MAX), (31, 20, 2, 9)],
+                    (2, 2) => [(24, 16, 1, 7), (28, 18, 2, 8), (31, 20, u128::MAX, 9)],
+                    (2, 3) => [(24, 16, 1, 7), (28, 18, 2, 8), (31, 20, 2, u128::MAX)],
+                    _ => unreachable!(),
+                };
+                assert_eq!(resource_tuples(&changed, &parsed), expected_tuples);
+                let parsed_ledger_fields = [
+                    parsed.sourced_food,
+                    parsed.sourced_water,
+                    parsed.consumed_food,
+                    parsed.consumed_water,
+                    parsed.lost_food,
+                    parsed.lost_water,
+                    parsed.sourced_medical,
+                    parsed.consumed_medical,
+                    parsed.lost_medical,
+                ];
+                for (field, value) in parsed_ledger_fields.into_iter().zip(ledger_values) {
                     assert_eq!(
                         read_u128(&changed, field),
                         if field == at { u128::MAX } else { value }
@@ -16272,22 +16422,25 @@ mod private_invariants {
                 }
                 assert_eq!(
                     (
-                        read_u32(&changed, carrier_layout.food),
-                        read_u32(&changed, carrier_layout.water),
-                        read_u32(&changed, carrier_layout.medical),
+                        read_u32(&changed, parsed_carrier.food),
+                        read_u32(&changed, parsed_carrier.water),
+                        read_u32(&changed, parsed_carrier.medical),
                     ),
                     (11, 12, 13)
                 );
                 if term == 2 {
-                    assert_eq!(carried.checked_add(u128::MAX), None);
+                    assert_eq!(affected.1.checked_add(affected.2), None);
                 } else {
-                    let intermediate = carried.checked_add(consumed).unwrap();
+                    let intermediate = affected.1.checked_add(affected.2).unwrap();
                     assert!(intermediate > 0);
-                    assert_eq!(intermediate.checked_add(u128::MAX), None);
+                    assert_eq!(intermediate.checked_add(affected.3), None);
                 }
                 for (i, (s, c, x, l)) in families.into_iter().enumerate() {
                     if i != family {
-                        assert_eq!(s, c + x + l);
+                        assert_eq!(
+                            c.checked_add(x).and_then(|value| value.checked_add(l)),
+                            Some(s)
+                        );
                     }
                 }
                 assert_eq!(
