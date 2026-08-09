@@ -996,9 +996,42 @@ mod tests {
                 supplies: 6,
             },
         });
-        assert_eq!(outcome.error, None);
-        assert_eq!(outcome.clock, 0);
+        assert_eq!(
+            outcome,
+            sim_core::ApplyOutcome {
+                clock: 0,
+                events: vec![TimedEvent {
+                    at: 0,
+                    event: Event::StockpileCreated {
+                        id: 9,
+                        initial: Stock {
+                            ammunition: 17,
+                            supplies: 6,
+                        },
+                    },
+                }],
+                error: None,
+                blocked: None,
+            }
+        );
+        world
+    }
+
+    fn assert_pinned_http_fixture(world: &World) {
         assert_eq!(world.clock(), 0);
+        assert_eq!(world.soldier_count(), 0);
+        for raw in [0, 1, 77, u64::MAX] {
+            let id = sim_core::EntityId::from_raw(raw);
+            assert_eq!(world.soldier(id), None);
+            assert_eq!(world.casualty_state(id), None);
+            assert_eq!(world.wounds_of(id), Vec::<sim_core::Wound>::new());
+        }
+        for id in [WoundId(0), WoundId(1), WoundId(u64::MAX)] {
+            assert_eq!(world.wound(id), None);
+        }
+        for id in [TreatmentId(0), TreatmentId(1), TreatmentId(u64::MAX)] {
+            assert_eq!(world.treatment(id), None);
+        }
         assert_eq!(
             world.stockpile(9),
             Some(Stock {
@@ -1006,7 +1039,30 @@ mod tests {
                 supplies: 6,
             })
         );
-        world
+        assert_eq!(world.stockpile(8), None);
+        assert_eq!(world.squad(0), None);
+        assert_eq!(world.hot_cell(0), None);
+        assert_eq!(world.hot_cell_count(), 0);
+        assert_eq!(
+            world.resource_totals(),
+            sim_core::ResourceTotals {
+                ammunition: 17,
+                stockpile_supplies: 6,
+                carried_food: 0,
+                carried_water: 0,
+                carried_medical: 0,
+                sourced_food: 0,
+                sourced_water: 0,
+                consumed_food: 0,
+                consumed_water: 0,
+                lost_food: 0,
+                lost_water: 0,
+                sourced_medical: 0,
+                consumed_medical: 0,
+                lost_medical: 0,
+            }
+        );
+        assert_eq!(world.state_digest(), 0x2bd7_8a3a_f7ee_2a90);
     }
 
     fn parse_wire(body: &str) -> Result<Command, ()> {
@@ -7403,213 +7459,333 @@ mod tests {
 
     #[test]
     fn gate_c2_http_malformed_matrix_is_byte_and_digest_atomic() {
-        let cases = [
-            (
-                "missing version",
-                r#"{"command":"interrupt_treatment","treatment":0}"#,
-            ),
-            (
-                "null command",
-                r#"{"version":1,"command":null,"treatment":0}"#,
-            ),
-            (
-                "duplicate payload",
-                r#"{"version":1,"command":"interrupt_treatment","treatment":0,"treatment":0}"#,
-            ),
-            (
-                "inapplicable recognized",
-                r#"{"version":1,"command":"interrupt_treatment","treatment":0,"wound":null}"#,
-            ),
-            (
-                "unknown",
-                r#"{"version":1,"command":"interrupt_treatment","treatment":0,"surprise":1}"#,
-            ),
-            (
-                "negative",
-                r#"{"version":1,"command":"interrupt_treatment","treatment":-1}"#,
-            ),
-            (
-                "fractional",
-                r#"{"version":1,"command":"inflict_wound","patient":0,"trauma":1.5,"bleeding_per_second":0,"shock":0}"#,
-            ),
-            (
-                "array",
-                r#"{"version":1,"command":"inflict_wound","patient":[],"trauma":1,"bleeding_per_second":0,"shock":0}"#,
-            ),
-            (
-                "shock wound",
-                r#"{"version":1,"command":"request_treatment","patient":0,"kind":"shock","wound":null}"#,
-            ),
-            (
-                "hemostatic null wound",
-                r#"{"version":1,"command":"request_treatment","patient":0,"kind":"hemostatic","wound":null}"#,
-            ),
-            ("missing command", r#"{"version":1,"treatment":0}"#),
-            (
-                "null version",
-                r#"{"version":null,"command":"interrupt_treatment","treatment":0}"#,
-            ),
-            (
-                "wrong version type",
-                r#"{"version":"1","command":"interrupt_treatment","treatment":0}"#,
-            ),
-            (
-                "duplicate version",
-                r#"{"version":1,"version":1,"command":"interrupt_treatment","treatment":0}"#,
-            ),
-            (
-                "wrong command type",
-                r#"{"version":1,"command":false,"treatment":0}"#,
-            ),
-            (
-                "duplicate command",
-                r#"{"version":1,"command":"interrupt_treatment","command":"interrupt_treatment","treatment":0}"#,
-            ),
-            (
-                "unsupported version",
-                r#"{"version":2,"command":"interrupt_treatment","treatment":0}"#,
-            ),
-            (
-                "unknown command",
-                r#"{"version":1,"command":"operate","treatment":0}"#,
-            ),
-            (
-                "case command",
-                r#"{"version":1,"command":"Inflict_Wound","patient":0,"trauma":1,"bleeding_per_second":0,"shock":0}"#,
-            ),
-            (
-                "missing wound patient",
-                r#"{"version":1,"command":"inflict_wound","trauma":1,"bleeding_per_second":0,"shock":0}"#,
-            ),
-            (
-                "null wound patient",
-                r#"{"version":1,"command":"inflict_wound","patient":null,"trauma":1,"bleeding_per_second":0,"shock":0}"#,
-            ),
-            (
-                "missing trauma",
-                r#"{"version":1,"command":"inflict_wound","patient":0,"bleeding_per_second":1,"shock":0}"#,
-            ),
-            (
-                "null trauma",
-                r#"{"version":1,"command":"inflict_wound","patient":0,"trauma":null,"bleeding_per_second":1,"shock":0}"#,
-            ),
-            (
-                "missing bleeding",
-                r#"{"version":1,"command":"inflict_wound","patient":0,"trauma":1,"shock":0}"#,
-            ),
-            (
-                "null bleeding",
-                r#"{"version":1,"command":"inflict_wound","patient":0,"trauma":1,"bleeding_per_second":null,"shock":0}"#,
-            ),
-            (
-                "missing shock",
-                r#"{"version":1,"command":"inflict_wound","patient":0,"trauma":1,"bleeding_per_second":0}"#,
-            ),
-            (
-                "null shock",
-                r#"{"version":1,"command":"inflict_wound","patient":0,"trauma":1,"bleeding_per_second":0,"shock":null}"#,
-            ),
-            (
-                "direct missing medic",
-                r#"{"version":1,"command":"start_treatment","patient":0,"wound":0,"kind":"hemostatic"}"#,
-            ),
-            (
-                "direct null medic",
-                r#"{"version":1,"command":"start_treatment","medic":null,"patient":0,"wound":0,"kind":"hemostatic"}"#,
-            ),
-            (
-                "direct missing patient",
-                r#"{"version":1,"command":"start_treatment","medic":0,"wound":0,"kind":"hemostatic"}"#,
-            ),
-            (
-                "direct null patient",
-                r#"{"version":1,"command":"start_treatment","medic":0,"patient":null,"wound":0,"kind":"hemostatic"}"#,
-            ),
-            (
-                "direct missing kind",
-                r#"{"version":1,"command":"start_treatment","medic":0,"patient":1,"wound":0}"#,
-            ),
-            (
-                "direct null kind",
-                r#"{"version":1,"command":"start_treatment","medic":0,"patient":1,"wound":0,"kind":null}"#,
-            ),
-            (
-                "request missing patient",
-                r#"{"version":1,"command":"request_treatment","kind":"shock"}"#,
-            ),
-            (
-                "request null patient",
-                r#"{"version":1,"command":"request_treatment","patient":null,"kind":"shock"}"#,
-            ),
-            (
-                "unknown kind",
-                r#"{"version":1,"command":"request_treatment","patient":0,"kind":"bandage"}"#,
-            ),
-            (
-                "case kind",
-                r#"{"version":1,"command":"request_treatment","patient":0,"kind":"Shock"}"#,
-            ),
-            (
-                "string numeric",
-                r#"{"version":1,"command":"inflict_wound","patient":"0","trauma":1,"bleeding_per_second":0,"shock":0}"#,
-            ),
-            (
-                "boolean numeric",
-                r#"{"version":1,"command":"inflict_wound","patient":false,"trauma":1,"bleeding_per_second":0,"shock":0}"#,
-            ),
-            (
-                "object numeric",
-                r#"{"version":1,"command":"inflict_wound","patient":{},"trauma":1,"bleeding_per_second":0,"shock":0}"#,
-            ),
-            (
-                "entity overflow",
-                r#"{"version":1,"command":"inflict_wound","patient":18446744073709551616,"trauma":1,"bleeding_per_second":0,"shock":0}"#,
-            ),
-            (
-                "wound overflow",
-                r#"{"version":1,"command":"start_treatment","medic":0,"patient":1,"wound":18446744073709551616,"kind":"hemostatic"}"#,
-            ),
-            (
-                "treatment overflow",
-                r#"{"version":1,"command":"interrupt_treatment","treatment":18446744073709551616}"#,
-            ),
-            (
-                "bleeding u16 overflow",
-                r#"{"version":1,"command":"inflict_wound","patient":0,"trauma":0,"bleeding_per_second":65536,"shock":0}"#,
-            ),
-            (
-                "shock u16 overflow",
-                r#"{"version":1,"command":"inflict_wound","patient":0,"trauma":0,"bleeding_per_second":0,"shock":65536}"#,
-            ),
-            (
-                "duplicate patient",
-                r#"{"version":1,"command":"inflict_wound","patient":0,"patient":0,"trauma":1,"bleeding_per_second":0,"shock":0}"#,
-            ),
-            (
-                "duplicate wound",
-                r#"{"version":1,"command":"start_treatment","medic":0,"patient":1,"wound":0,"wound":0,"kind":"hemostatic"}"#,
-            ),
-            (
-                "malformed json",
-                r#"{"version":1,"command":"interrupt_treatment","treatment":0"#,
-            ),
+        #[derive(Clone, Copy)]
+        struct Shape {
+            name: &'static str,
+            base: &'static str,
+            allowed: &'static [&'static str],
+            required: &'static [&'static str],
+            numeric: &'static [&'static str],
+        }
+        const SHAPES: &[Shape] = &[
+            Shape {
+                name: "inflict_wound",
+                base: r#"{"version":1,"command":"inflict_wound","patient":7,"trauma":10,"bleeding_per_second":20,"shock":30}"#,
+                allowed: &[
+                    "version",
+                    "command",
+                    "patient",
+                    "trauma",
+                    "bleeding_per_second",
+                    "shock",
+                ],
+                required: &["patient", "trauma", "bleeding_per_second", "shock"],
+                numeric: &["patient", "trauma", "bleeding_per_second", "shock"],
+            },
+            Shape {
+                name: "start_hemostatic",
+                base: r#"{"version":1,"command":"start_treatment","medic":2,"patient":7,"wound":4,"kind":"hemostatic"}"#,
+                allowed: &["version", "command", "medic", "patient", "wound", "kind"],
+                required: &["medic", "patient", "wound", "kind"],
+                numeric: &["medic", "patient", "wound"],
+            },
+            Shape {
+                name: "start_shock",
+                base: r#"{"version":1,"command":"start_treatment","medic":2,"patient":7,"kind":"shock"}"#,
+                allowed: &["version", "command", "medic", "patient", "kind"],
+                required: &["medic", "patient", "kind"],
+                numeric: &["medic", "patient"],
+            },
+            Shape {
+                name: "request_hemostatic",
+                base: r#"{"version":1,"command":"request_treatment","patient":7,"wound":4,"kind":"hemostatic"}"#,
+                allowed: &["version", "command", "patient", "wound", "kind"],
+                required: &["patient", "wound", "kind"],
+                numeric: &["patient", "wound"],
+            },
+            Shape {
+                name: "request_shock",
+                base: r#"{"version":1,"command":"request_treatment","patient":7,"kind":"shock"}"#,
+                allowed: &["version", "command", "patient", "kind"],
+                required: &["patient", "kind"],
+                numeric: &["patient"],
+            },
+            Shape {
+                name: "interrupt",
+                base: r#"{"version":1,"command":"interrupt_treatment","treatment":4}"#,
+                allowed: &["version", "command", "treatment"],
+                required: &["treatment"],
+                numeric: &["treatment"],
+            },
         ];
-        for (name, body) in cases {
-            let world = pinned_http_fixture(77);
-            let before = world.snapshot();
-            let digest = world.state_digest();
-            assert_eq!(digest, 0x2bd7_8a3a_f7ee_2a90, "{name}");
-            let (response, world) = exchange(req(body), false, world);
+        const FIELDS: &[&str] = &[
+            "version",
+            "command",
+            "target",
+            "id",
+            "from",
+            "to",
+            "ammunition",
+            "supplies",
+            "cell",
+            "hot",
+            "at",
+            "activity",
+            "patient",
+            "medic",
+            "wound",
+            "trauma",
+            "bleeding_per_second",
+            "shock",
+            "kind",
+            "treatment",
+        ];
+        fn historical(field: &str) -> Value {
+            match field {
+                "command" => json!("advance_to"),
+                "hot" => json!(true),
+                "activity" => json!("idle"),
+                "kind" => json!("shock"),
+                _ => json!(1),
+            }
+        }
+        fn changed(base: &str, field: &str, value: Option<Value>) -> String {
+            let mut object = serde_json::from_str::<Value>(base)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .clone();
+            match value {
+                Some(value) => {
+                    object.insert(field.to_owned(), value);
+                }
+                None => {
+                    object.remove(field);
+                }
+            }
+            Value::Object(object).to_string()
+        }
+        fn extra(base: &str, field: &str, value: Value) -> String {
+            changed(base, field, Some(value))
+        }
+        fn changed_raw_number(base: &str, field: &str, number: &str) -> String {
+            let ordinary = changed(base, field, Some(json!(1)));
+            ordinary.replacen(
+                &format!(r#""{field}":1"#),
+                &format!(r#""{field}":{number}"#),
+                1,
+            )
+        }
+        fn duplicate(base: &str, field: &str) -> String {
+            let value = serde_json::from_str::<Value>(base).unwrap()[field].clone();
+            format!(r#"{{"{field}":{},{}"#, value, &base[1..])
+        }
+
+        let mut rows: Vec<(String, String)> = Vec::new();
+        let mut required_rows = Vec::new();
+        let mut inapplicable_rows = Vec::new();
+        let mut wrong_type_rows = Vec::new();
+        let mut overflow_id_rows = Vec::new();
+        let mut duplicate_rows = Vec::new();
+
+        assert_eq!(SHAPES.iter().map(|s| s.required.len()).sum::<usize>(), 17);
+        assert_eq!(SHAPES.iter().map(|s| s.numeric.len()).sum::<usize>(), 13);
+        for shape in SHAPES {
+            for field in shape.required {
+                required_rows.push((
+                    format!("required/{}/{field}/missing", shape.name),
+                    changed(shape.base, field, None),
+                ));
+                required_rows.push((
+                    format!("required/{}/{field}/null", shape.name),
+                    changed(shape.base, field, Some(Value::Null)),
+                ));
+            }
+            let inapplicable: Vec<_> = FIELDS
+                .iter()
+                .filter(|field| !shape.allowed.contains(field))
+                .collect();
+            let expected = match shape.name {
+                "inflict_wound" | "start_hemostatic" => 14,
+                "start_shock" | "request_hemostatic" => 15,
+                "request_shock" => 16,
+                "interrupt" => 17,
+                _ => unreachable!(),
+            };
+            assert_eq!(inapplicable.len(), expected, "{}", shape.name);
+            for field in inapplicable {
+                inapplicable_rows.push((
+                    format!("inapplicable/{}/{field}/value", shape.name),
+                    extra(shape.base, field, historical(field)),
+                ));
+                inapplicable_rows.push((
+                    format!("inapplicable/{}/{field}/null", shape.name),
+                    extra(shape.base, field, Value::Null),
+                ));
+            }
+            rows.push((
+                format!("unknown-field/{}", shape.name),
+                extra(shape.base, "truly_unknown", json!(1)),
+            ));
+            for field in shape.numeric {
+                for (form, value) in [
+                    ("negative", json!(-1)),
+                    ("fractional", json!(1.5)),
+                    ("string", json!("1")),
+                    ("boolean", json!(true)),
+                    ("array", json!([1])),
+                    ("object", json!({"v":1})),
+                ] {
+                    wrong_type_rows.push((
+                        format!("numeric/{}/{field}/{form}", shape.name),
+                        changed(shape.base, field, Some(value)),
+                    ));
+                }
+                if matches!(*field, "patient" | "medic" | "wound" | "treatment") {
+                    overflow_id_rows.push((
+                        format!("u64-overflow/{}/{field}", shape.name),
+                        changed_raw_number(shape.base, field, "18446744073709551616"),
+                    ));
+                }
+            }
+            for field in shape.allowed {
+                duplicate_rows.push((
+                    format!("duplicate/{}/{field}", shape.name),
+                    duplicate(shape.base, field),
+                ));
+            }
+        }
+        assert_eq!(required_rows.len(), 34);
+        assert_eq!(inapplicable_rows.len(), 182);
+        assert_eq!(wrong_type_rows.len(), 78);
+        assert_eq!(overflow_id_rows.len(), 10);
+        assert_eq!(duplicate_rows.len(), 29);
+        rows.extend(required_rows);
+        rows.extend(inapplicable_rows);
+        rows.extend(wrong_type_rows);
+        rows.extend(overflow_id_rows);
+        rows.extend(duplicate_rows);
+
+        for shape in &SHAPES[1..5] {
+            for (form, value) in [
+                ("unknown", json!("bandage")),
+                ("case", json!("Shock")),
+                ("number", json!(1)),
+                ("boolean", json!(true)),
+                ("array", json!([])),
+                ("object", json!({})),
+            ] {
+                rows.push((
+                    format!("kind/{}/{form}", shape.name),
+                    changed(shape.base, "kind", Some(value)),
+                ));
+            }
+        }
+        for (form, value) in [
+            ("missing", None),
+            ("null", Some(Value::Null)),
+            ("wrong-string", Some(json!("1"))),
+            ("wrong-bool", Some(json!(true))),
+            ("wrong-array", Some(json!([]))),
+            ("wrong-object", Some(json!({}))),
+            ("unsupported", Some(json!(2))),
+            ("zero", Some(json!(0))),
+            ("overflow", Some(json!(2))),
+        ] {
+            rows.push((
+                format!("version/{form}"),
+                if form == "overflow" {
+                    changed_raw_number(SHAPES[5].base, "version", "18446744073709551616")
+                } else {
+                    changed(SHAPES[5].base, "version", value)
+                },
+            ));
+        }
+        for (form, value) in [
+            ("missing", None),
+            ("null", Some(Value::Null)),
+            ("numeric", Some(json!(1))),
+            ("boolean", Some(json!(true))),
+            ("array", Some(json!([]))),
+            ("object", Some(json!({}))),
+            ("unknown", Some(json!("operate"))),
+            ("case", Some(json!("Interrupt_Treatment"))),
+        ] {
+            rows.push((
+                format!("command/{form}"),
+                changed(SHAPES[5].base, "command", value),
+            ));
+        }
+        for field in ["trauma", "bleeding_per_second", "shock"] {
+            rows.push((
+                format!("u16-overflow/{field}"),
+                changed(SHAPES[0].base, field, Some(json!(65536))),
+            ));
+        }
+        rows.extend([
+            ("json/empty".into(), "".into()),
+            ("json/null".into(), "null".into()),
+            ("json/array".into(), "[]".into()),
+            ("json/string".into(), r#""x""#.into()),
+            (
+                "json/truncated".into(),
+                r#"{"version":1,"command":"interrupt_treatment","treatment":4"#.into(),
+            ),
+            (
+                "json/malformed".into(),
+                r#"{"version":1,,"command":"interrupt_treatment"}"#.into(),
+            ),
+            (
+                "json/trailing".into(),
+                format!("{} trailing", SHAPES[5].base),
+            ),
+        ]);
+
+        let names: std::collections::BTreeSet<_> = rows.iter().map(|(name, _)| name).collect();
+        assert_eq!(names.len(), rows.len(), "matrix row names must be unique");
+        for (name, body) in rows {
+            let source = pinned_http_fixture(77);
+            let source_bytes = source.snapshot();
+            assert_pinned_http_fixture(&source);
+            let restored = World::from_snapshot(&source_bytes).unwrap();
+            assert_pinned_http_fixture(&restored);
+            assert_eq!(
+                restored.snapshot(),
+                source_bytes,
+                "pre-request restore bytes: {name}"
+            );
+            assert_eq!(
+                restored.state_digest(),
+                0x2bd7_8a3a_f7ee_2a90,
+                "pre-request digest: {name}"
+            );
+            let (response, rejected) = exchange(req(&body), false, restored);
             assert_eq!(status(&response), "HTTP/1.1 400 Bad Request", "{name}");
             assert_eq!(
-                json_body(&response),
-                json!({"error":"malformed_or_unsupported"}),
+                raw_body(&response),
+                br#"{"error":"malformed_or_unsupported"}"#,
                 "{name}"
             );
-            assert_eq!(world.clock(), 0, "{name}");
-            assert_eq!(world.snapshot(), before, "{name}");
-            assert_eq!(world.state_digest(), digest, "{name}");
-            assert_eq!(world.state_digest(), 0x2bd7_8a3a_f7ee_2a90, "{name}");
+            assert_eq!(rejected.clock(), 0, "{name}");
+            assert_pinned_http_fixture(&rejected);
+            assert_eq!(rejected.snapshot(), source_bytes, "rejection bytes: {name}");
+            assert_eq!(
+                rejected.state_digest(),
+                0x2bd7_8a3a_f7ee_2a90,
+                "rejection digest: {name}"
+            );
+            let twice = World::from_snapshot(&rejected.snapshot()).unwrap();
+            assert_pinned_http_fixture(&twice);
+            assert_eq!(
+                twice.snapshot(),
+                source_bytes,
+                "second restore bytes: {name}"
+            );
+            assert_eq!(
+                twice.state_digest(),
+                0x2bd7_8a3a_f7ee_2a90,
+                "second restore digest: {name}"
+            );
         }
     }
 
