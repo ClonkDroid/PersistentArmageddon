@@ -16502,130 +16502,139 @@ mod private_invariants {
             );
         }
 
-        #[allow(clippy::too_many_arguments)]
-        fn assert_canonical_checkpoint(
-            label: &str,
-            world: &World,
-            expected_clock: u64,
-            expected_next_wound: u64,
-            expected_next_treatment: u64,
-            expected_wounds: &BTreeMap<WoundId, Wound>,
-            expected_treatments: &BTreeMap<TreatmentId, Treatment>,
-            expected_active: &BTreeMap<EntityId, TreatmentId>,
-            expected_consumed: u128,
-            expected_lost: u128,
-        ) {
-            assert_eq!(world.clock, expected_clock, "{label}: clock");
-            assert_eq!(
-                world.next_wound_id, expected_next_wound,
-                "{label}: wound id"
-            );
-            assert_eq!(
-                world.next_treatment_id, expected_next_treatment,
-                "{label}: treatment id"
-            );
-            assert_eq!(world.wounds, *expected_wounds, "{label}: wounds");
-            assert_eq!(
-                world.treatments, *expected_treatments,
-                "{label}: treatments"
-            );
-            assert_eq!(world.active_by_entity, *expected_active, "{label}: active");
-            assert_eq!(
-                world.consumed_medical, expected_consumed,
-                "{label}: consumed"
-            );
-            assert_eq!(world.lost_medical, expected_lost, "{label}: lost");
-            assert_eq!(world.sourced_medical, 18, "{label}: source");
-            let totals = world.resource_totals();
-            assert_eq!(totals.sourced_food, 12, "{label}: food source");
-            assert_eq!(totals.sourced_water, 12, "{label}: water source");
-            assert_eq!(totals.consumed_food, 0, "{label}: food consumed");
-            assert_eq!(totals.consumed_water, 0, "{label}: water consumed");
-            assert_eq!(totals.lost_food, 0, "{label}: food lost");
-            assert_eq!(totals.lost_water, 0, "{label}: water lost");
-            assert_eq!(
-                totals
-                    .carried_medical
-                    .checked_add(totals.consumed_medical)
-                    .and_then(|v| v.checked_add(totals.lost_medical)),
-                Some(totals.sourced_medical),
-                "{label}: medical conservation"
-            );
-            assert_eq!(
-                totals
-                    .carried_food
-                    .checked_add(totals.consumed_food)
-                    .and_then(|v| v.checked_add(totals.lost_food)),
-                Some(totals.sourced_food),
-                "{label}: food conservation"
-            );
-            assert_eq!(
-                totals
-                    .carried_water
-                    .checked_add(totals.consumed_water)
-                    .and_then(|v| v.checked_add(totals.lost_water)),
-                Some(totals.sourced_water),
-                "{label}: water conservation"
-            );
-            let expected_history = expected_treatments.values().fold(
-                BTreeMap::<EntityId, BTreeSet<TreatmentId>>::new(),
-                |mut map, treatment| {
-                    map.entry(treatment.medic).or_default().insert(treatment.id);
-                    map.entry(treatment.patient)
-                        .or_default()
-                        .insert(treatment.id);
-                    map
-                },
-            );
-            assert_eq!(
-                world.treatment_ids_by_entity, expected_history,
-                "{label}: history"
-            );
-            let expected_membership = expected_wounds.values().fold(
-                BTreeMap::<EntityId, BTreeSet<WoundId>>::new(),
-                |mut map, wound| {
-                    map.entry(wound.patient).or_default().insert(wound.id);
-                    map
-                },
-            );
-            assert_eq!(
-                world.wound_ids_by_patient, expected_membership,
-                "{label}: ownership"
-            );
-            let expected_bleeding = expected_wounds.values().fold(
-                BTreeMap::<EntityId, u64>::new(),
-                |mut map, wound| {
-                    if !wound.controlled && !wound.healed && wound.spec.bleeding_per_second != 0 {
-                        *map.entry(wound.patient).or_default() +=
-                            u64::from(wound.spec.bleeding_per_second);
-                    }
-                    map
-                },
-            );
-            assert_eq!(
-                world.bleeding_rate_by_patient, expected_bleeding,
-                "{label}: bleeding"
-            );
-            let expected_due = expected_treatments
-                .values()
-                .filter(|t| t.status == TreatmentStatus::Active)
-                .fold(
-                    BTreeMap::<u64, BTreeSet<TreatmentId>>::new(),
-                    |mut map, t| {
-                        map.entry(t.completes_at).or_default().insert(t.id);
-                        map
-                    },
+        #[derive(Clone)]
+        struct CheckpointFixture {
+            name: &'static str,
+            clock: u64,
+            generation: Vec<u32>,
+            alive: Vec<bool>,
+            data: Vec<SoldierSpec>,
+            living: Vec<LivingState>,
+            free: Vec<u32>,
+            live: usize,
+            casualty: BTreeMap<EntityId, CasualtyState>,
+            wounds: BTreeMap<WoundId, Wound>,
+            treatments: BTreeMap<TreatmentId, Treatment>,
+            next_wound_id: u64,
+            next_treatment_id: u64,
+            wound_ownership: BTreeMap<EntityId, BTreeSet<WoundId>>,
+            bleeding: BTreeMap<EntityId, u64>,
+            treatment_history: BTreeMap<EntityId, BTreeSet<TreatmentId>>,
+            active: BTreeMap<EntityId, TreatmentId>,
+            treatment_due: BTreeMap<u64, BTreeSet<TreatmentId>>,
+            due_by_treatment: BTreeMap<TreatmentId, u64>,
+            living_due: BTreeMap<u64, BTreeSet<EntityId>>,
+            due_by_entity: HashMap<EntityId, u64>,
+            medic_index: BTreeMap<(u16, u32), BTreeSet<EntityId>>,
+            available_medics: BTreeMap<(u16, u32, u32), BTreeSet<EntityId>>,
+            availability_by_medic: BTreeMap<EntityId, BTreeSet<(u16, u32, u32)>>,
+            cell_members: BTreeMap<u32, BTreeSet<EntityId>>,
+            hot_cells: BTreeMap<u32, HotCellState>,
+            totals: ResourceTotals,
+        }
+
+        impl CheckpointFixture {
+            fn assert_world(&self, world: &World) {
+                let label = self.name;
+                assert_eq!(world.clock, self.clock, "{label}: clock");
+                assert_eq!(world.seed, 909, "{label}: seed");
+                assert_eq!(world.rng_counter, 0, "{label}: rng");
+                assert_eq!(world.next_schedule_id, 0, "{label}: schedule allocator");
+                assert!(world.scheduled.is_empty(), "{label}: scheduled");
+                assert!(world.schedule_index.is_empty(), "{label}: schedule reverse");
+                assert_eq!(
+                    world.soldiers.generation, self.generation,
+                    "{label}: generation"
                 );
-            let expected_reverse = expected_treatments
-                .values()
-                .filter(|t| t.status == TreatmentStatus::Active)
-                .map(|t| (t.id, t.completes_at))
-                .collect::<BTreeMap<_, _>>();
-            assert_eq!(world.treatment_due, expected_due, "{label}: treatment due");
-            assert_eq!(
-                world.due_by_treatment, expected_reverse,
-                "{label}: reverse due"
-            );
+                assert_eq!(world.soldiers.alive, self.alive, "{label}: alive");
+                assert_eq!(world.soldiers.data, self.data, "{label}: specs");
+                assert_eq!(world.soldiers.living, self.living, "{label}: living");
+                assert_eq!(world.soldiers.free, self.free, "{label}: free");
+                assert_eq!(world.soldiers.live, self.live, "{label}: live");
+                for index in 0..self.data.len() {
+                    assert_eq!(
+                        self.data[index].health, self.living[index].health,
+                        "{label}: health mirror {index}"
+                    );
+                }
+                assert_eq!(world.casualty, self.casualty, "{label}: casualty");
+                assert_eq!(world.wounds, self.wounds, "{label}: wounds");
+                assert_eq!(world.treatments, self.treatments, "{label}: treatments");
+                assert_eq!(
+                    world.next_wound_id, self.next_wound_id,
+                    "{label}: wound allocator"
+                );
+                assert_eq!(
+                    world.next_treatment_id, self.next_treatment_id,
+                    "{label}: treatment allocator"
+                );
+                assert_eq!(
+                    world.wound_ids_by_patient, self.wound_ownership,
+                    "{label}: wound ownership"
+                );
+                assert_eq!(
+                    world.bleeding_rate_by_patient, self.bleeding,
+                    "{label}: bleeding"
+                );
+                assert_eq!(
+                    world.treatment_ids_by_entity, self.treatment_history,
+                    "{label}: history"
+                );
+                assert_eq!(world.active_by_entity, self.active, "{label}: active");
+                assert_eq!(
+                    world.treatment_due, self.treatment_due,
+                    "{label}: treatment due"
+                );
+                assert_eq!(
+                    world.due_by_treatment, self.due_by_treatment,
+                    "{label}: treatment reverse"
+                );
+                assert_eq!(world.living_due, self.living_due, "{label}: living due");
+                assert_eq!(
+                    world.due_by_entity, self.due_by_entity,
+                    "{label}: living reverse"
+                );
+                assert_eq!(world.medic_index, self.medic_index, "{label}: medic index");
+                assert_eq!(
+                    world.available_medics, self.available_medics,
+                    "{label}: availability"
+                );
+                assert_eq!(
+                    world.availability_by_medic, self.availability_by_medic,
+                    "{label}: availability reverse"
+                );
+                assert_eq!(world.cell_members, self.cell_members, "{label}: cells");
+                assert_eq!(world.hot_cells, self.hot_cells, "{label}: hot cells");
+                assert_eq!(world.resource_totals(), self.totals, "{label}: resources");
+                for (source, carried, consumed, lost) in [
+                    (
+                        self.totals.sourced_food,
+                        self.totals.carried_food,
+                        self.totals.consumed_food,
+                        self.totals.lost_food,
+                    ),
+                    (
+                        self.totals.sourced_water,
+                        self.totals.carried_water,
+                        self.totals.consumed_water,
+                        self.totals.lost_water,
+                    ),
+                    (
+                        self.totals.sourced_medical,
+                        self.totals.carried_medical,
+                        self.totals.consumed_medical,
+                        self.totals.lost_medical,
+                    ),
+                ] {
+                    assert_eq!(
+                        carried
+                            .checked_add(consumed)
+                            .and_then(|v| v.checked_add(lost)),
+                        Some(source),
+                        "{label}: conservation"
+                    );
+                }
+            }
         }
 
         let mut original = World::new(909);
@@ -16903,18 +16912,7 @@ mod private_invariants {
             ),
         ]);
         let expected_active0 = BTreeMap::from([(m0, TreatmentId(2)), (p5, TreatmentId(2))]);
-        assert_canonical_checkpoint(
-            "initial original",
-            &original,
-            12,
-            3,
-            3,
-            &expected_wounds0,
-            &expected_treatments0,
-            &expected_active0,
-            3,
-            0,
-        );
+
         assert_eq!(
             original.casualty[&p3],
             CasualtyState {
@@ -16992,107 +16990,141 @@ mod private_invariants {
             (m1, BTreeSet::from([(0, 0, 1), (0, 0, 2)])),
             (m2, BTreeSet::from([(0, 0, 1), (0, 0, 2)])),
         ]);
-        {
-            let checked = &original;
-            assert_eq!(checked.seed, 909);
-            assert_eq!(checked.rng_counter, 0);
-            assert_eq!(checked.next_schedule_id, 0);
-            assert!(checked.scheduled.is_empty());
-            assert!(checked.schedule_index.is_empty());
-            assert_eq!(checked.soldiers.generation, vec![0; 6]);
-            assert_eq!(checked.soldiers.alive, vec![true; 6]);
-            assert!(checked.soldiers.free.is_empty());
-            assert_eq!(checked.soldiers.live, 6);
-            assert_eq!(checked.casualty, expected_initial_casualty);
-            assert_eq!(checked.wound_ids_by_patient, expected_initial_ownership);
-            assert_eq!(
-                checked.bleeding_rate_by_patient,
-                BTreeMap::from([(p4, 2), (p5, 2)])
-            );
-            assert_eq!(checked.treatment_ids_by_entity, expected_initial_history);
-            assert_eq!(
-                checked.treatment_due,
-                BTreeMap::from([(22, BTreeSet::from([TreatmentId(2)]))])
-            );
-            assert_eq!(
-                checked.due_by_treatment,
-                BTreeMap::from([(TreatmentId(2), 22)])
-            );
-            assert_eq!(checked.living_due, expected_initial_living_due);
-            assert_eq!(checked.due_by_entity, expected_initial_due_by_entity);
-            assert_eq!(
-                checked.medic_index,
-                BTreeMap::from([((0, 0), BTreeSet::from([m0, m1, m2]))])
-            );
-            assert_eq!(checked.available_medics, expected_initial_available);
-            assert_eq!(
-                checked.availability_by_medic,
-                expected_initial_availability_reverse
-            );
-            assert_eq!(
-                checked.cell_members,
-                BTreeMap::from([(0, BTreeSet::from([m0, m1, m2, p3, p4, p5]))])
-            );
-            assert!(checked.hot_cells.is_empty());
-            assert_eq!(
-                checked.resource_totals(),
-                ResourceTotals {
-                    ammunition: 0,
-                    stockpile_supplies: 0,
-                    carried_food: 12,
-                    carried_water: 12,
-                    carried_medical: 15,
-                    sourced_food: 12,
-                    sourced_water: 12,
-                    consumed_food: 0,
-                    consumed_water: 0,
-                    lost_food: 0,
-                    lost_water: 0,
-                    sourced_medical: 18,
-                    consumed_medical: 3,
-                    lost_medical: 0
-                }
-            );
-        }
+        let initial_fixture = CheckpointFixture {
+            name: "initial clock 12",
+            clock: 12,
+            generation: vec![0, 0, 0, 0, 0, 0],
+            alive: vec![true, true, true, true, true, true],
+            data: vec![
+                literal_spec(Role::Medic, 5),
+                literal_spec(Role::Medic, 5),
+                literal_spec(Role::Medic, 5),
+                SoldierSpec {
+                    health: 950,
+                    ..literal_spec(Role::Rifle, 0)
+                },
+                SoldierSpec {
+                    health: 950,
+                    ..literal_spec(Role::Rifle, 0)
+                },
+                SoldierSpec {
+                    health: 950,
+                    ..literal_spec(Role::Rifle, 0)
+                },
+            ],
+            living: vec![
+                LivingState {
+                    hunger: 0,
+                    thirst: 0,
+                    fatigue: 0,
+                    sleep_debt: 0,
+                    morale: 1000,
+                    health: 1000,
+                    activity: Activity::Idle,
+                    life: LifeState::Alive,
+                    materialized_at: 0,
+                },
+                LivingState {
+                    hunger: 10,
+                    thirst: 20,
+                    fatigue: 10,
+                    sleep_debt: 10,
+                    morale: 1000,
+                    health: 1000,
+                    activity: Activity::Idle,
+                    life: LifeState::Alive,
+                    materialized_at: 10,
+                },
+                LivingState {
+                    hunger: 0,
+                    thirst: 0,
+                    fatigue: 0,
+                    sleep_debt: 0,
+                    morale: 1000,
+                    health: 1000,
+                    activity: Activity::Idle,
+                    life: LifeState::Alive,
+                    materialized_at: 0,
+                },
+                LivingState {
+                    hunger: 10,
+                    thirst: 20,
+                    fatigue: 10,
+                    sleep_debt: 10,
+                    morale: 1000,
+                    health: 950,
+                    activity: Activity::Idle,
+                    life: LifeState::Alive,
+                    materialized_at: 10,
+                },
+                LivingState {
+                    hunger: 0,
+                    thirst: 0,
+                    fatigue: 0,
+                    sleep_debt: 0,
+                    morale: 1000,
+                    health: 950,
+                    activity: Activity::Idle,
+                    life: LifeState::Alive,
+                    materialized_at: 0,
+                },
+                LivingState {
+                    hunger: 0,
+                    thirst: 0,
+                    fatigue: 0,
+                    sleep_debt: 0,
+                    morale: 1000,
+                    health: 950,
+                    activity: Activity::Idle,
+                    life: LifeState::Alive,
+                    materialized_at: 0,
+                },
+            ],
+            free: vec![],
+            live: 6,
+            casualty: expected_initial_casualty,
+            wounds: expected_wounds0,
+            treatments: expected_treatments0,
+            next_wound_id: 3,
+            next_treatment_id: 3,
+            wound_ownership: expected_initial_ownership,
+            bleeding: BTreeMap::from([(p4, 2), (p5, 2)]),
+            treatment_history: expected_initial_history,
+            active: expected_active0,
+            treatment_due: BTreeMap::from([(22, BTreeSet::from([TreatmentId(2)]))]),
+            due_by_treatment: BTreeMap::from([(TreatmentId(2), 22)]),
+            living_due: expected_initial_living_due,
+            due_by_entity: expected_initial_due_by_entity,
+            medic_index: BTreeMap::from([((0, 0), BTreeSet::from([m0, m1, m2]))]),
+            available_medics: expected_initial_available,
+            availability_by_medic: expected_initial_availability_reverse,
+            cell_members: BTreeMap::from([(0, BTreeSet::from([m0, m1, m2, p3, p4, p5]))]),
+            hot_cells: BTreeMap::new(),
+            totals: ResourceTotals {
+                ammunition: 0,
+                stockpile_supplies: 0,
+                carried_food: 12,
+                carried_water: 12,
+                carried_medical: 15,
+                sourced_food: 12,
+                sourced_water: 12,
+                consumed_food: 0,
+                consumed_water: 0,
+                lost_food: 0,
+                lost_water: 0,
+                sourced_medical: 18,
+                consumed_medical: 3,
+                lost_medical: 0,
+            },
+        };
+        initial_fixture.assert_world(&original);
         let initial_bytes = original.snapshot();
         let initial_digest = original.state_digest();
         let restored = World::from_snapshot(&initial_bytes).unwrap();
-        assert_canonical_checkpoint(
-            "initial restore",
-            &restored,
-            12,
-            3,
-            3,
-            &expected_wounds0,
-            &expected_treatments0,
-            &expected_active0,
-            3,
-            0,
-        );
-        assert_eq!(
-            restored.casualty[&p3],
-            CasualtyState {
-                blood: 4_980,
-                shock: 102,
-                shock_remainder: 0,
-                incapacitated: false,
-                recovering: true,
-                recovery_next_at: Some(15),
-                materialized_at: 10
-            }
-        );
+
+        initial_fixture.assert_world(&restored);
         assert_eq!(restored.snapshot(), initial_bytes);
         assert_eq!(restored.state_digest(), initial_digest);
-        assert_eq!(restored.casualty, expected_initial_casualty);
-        assert_eq!(restored.wound_ids_by_patient, expected_initial_ownership);
-        assert_eq!(restored.treatment_ids_by_entity, expected_initial_history);
-        assert_eq!(restored.living_due, expected_initial_living_due);
-        assert_eq!(restored.due_by_entity, expected_initial_due_by_entity);
-        assert_eq!(restored.available_medics, expected_initial_available);
-        assert_eq!(
-            restored.availability_by_medic,
-            expected_initial_availability_reverse
-        );
 
         fn run_suffix(mut world: World, label: &str) -> (World, Vec<TimedEvent>) {
             let m0 = EntityId::from_parts(0, 0);
@@ -17364,6 +17396,357 @@ mod private_invariants {
                 .treatments
                 .values()
                 .all(|treatment| treatment.medic != p5 && treatment.patient != p5));
+            let replacement = EntityId::from_parts(5, 1);
+            let cleanup_fixture = CheckpointFixture {
+                name: "post-cleanup clock 12",
+                clock: 12,
+                generation: vec![0, 0, 0, 0, 0, 1],
+                alive: vec![true, true, true, true, true, true],
+                data: vec![
+                    literal_spec(Role::Medic, 4),
+                    literal_spec(Role::Medic, 3),
+                    literal_spec(Role::Medic, 5),
+                    SoldierSpec {
+                        health: 950,
+                        ..literal_spec(Role::Rifle, 0)
+                    },
+                    SoldierSpec {
+                        health: 940,
+                        ..literal_spec(Role::Rifle, 0)
+                    },
+                    SoldierSpec {
+                        health: 990,
+                        ..literal_spec(Role::Rifle, 0)
+                    },
+                ],
+                living: vec![
+                    LivingState {
+                        hunger: 0,
+                        thirst: 0,
+                        fatigue: 0,
+                        sleep_debt: 0,
+                        morale: 1000,
+                        health: 1000,
+                        activity: Activity::Idle,
+                        life: LifeState::Alive,
+                        materialized_at: 0,
+                    },
+                    LivingState {
+                        hunger: 10,
+                        thirst: 20,
+                        fatigue: 10,
+                        sleep_debt: 10,
+                        morale: 1000,
+                        health: 1000,
+                        activity: Activity::Idle,
+                        life: LifeState::Alive,
+                        materialized_at: 10,
+                    },
+                    LivingState {
+                        hunger: 0,
+                        thirst: 0,
+                        fatigue: 0,
+                        sleep_debt: 0,
+                        morale: 1000,
+                        health: 1000,
+                        activity: Activity::Idle,
+                        life: LifeState::Alive,
+                        materialized_at: 0,
+                    },
+                    LivingState {
+                        hunger: 10,
+                        thirst: 20,
+                        fatigue: 10,
+                        sleep_debt: 10,
+                        morale: 1000,
+                        health: 950,
+                        activity: Activity::Idle,
+                        life: LifeState::Alive,
+                        materialized_at: 10,
+                    },
+                    LivingState {
+                        hunger: 12,
+                        thirst: 24,
+                        fatigue: 12,
+                        sleep_debt: 12,
+                        morale: 1000,
+                        health: 940,
+                        activity: Activity::Idle,
+                        life: LifeState::Alive,
+                        materialized_at: 12,
+                    },
+                    LivingState {
+                        hunger: 0,
+                        thirst: 0,
+                        fatigue: 0,
+                        sleep_debt: 0,
+                        morale: 1000,
+                        health: 990,
+                        activity: Activity::Idle,
+                        life: LifeState::Alive,
+                        materialized_at: 12,
+                    },
+                ],
+                free: vec![],
+                live: 6,
+                casualty: BTreeMap::from([
+                    (
+                        EntityId::from_parts(3, 0),
+                        CasualtyState {
+                            blood: 4980,
+                            shock: 102,
+                            shock_remainder: 0,
+                            incapacitated: false,
+                            recovering: true,
+                            recovery_next_at: Some(15),
+                            materialized_at: 10,
+                        },
+                    ),
+                    (
+                        p4,
+                        CasualtyState {
+                            blood: 4976,
+                            shock: 112,
+                            shock_remainder: 4,
+                            incapacitated: false,
+                            recovering: false,
+                            recovery_next_at: None,
+                            materialized_at: 12,
+                        },
+                    ),
+                    (
+                        replacement,
+                        CasualtyState {
+                            blood: 5000,
+                            shock: 10,
+                            shock_remainder: 0,
+                            incapacitated: false,
+                            recovering: false,
+                            recovery_next_at: None,
+                            materialized_at: 12,
+                        },
+                    ),
+                ]),
+                wounds: BTreeMap::from([
+                    (
+                        WoundId(0),
+                        Wound {
+                            id: WoundId(0),
+                            patient: EntityId::from_parts(3, 0),
+                            created_at: 0,
+                            spec: WoundSpec {
+                                trauma: 50,
+                                bleeding_per_second: 2,
+                                shock: 100,
+                            },
+                            controlled: true,
+                            healed: false,
+                        },
+                    ),
+                    (
+                        WoundId(1),
+                        Wound {
+                            id: WoundId(1),
+                            patient: p4,
+                            created_at: 0,
+                            spec: WoundSpec {
+                                trauma: 50,
+                                bleeding_per_second: 2,
+                                shock: 100,
+                            },
+                            controlled: false,
+                            healed: false,
+                        },
+                    ),
+                    (
+                        WoundId(3),
+                        Wound {
+                            id: WoundId(3),
+                            patient: p4,
+                            created_at: 12,
+                            spec: future,
+                            controlled: false,
+                            healed: false,
+                        },
+                    ),
+                    (
+                        WoundId(5),
+                        Wound {
+                            id: WoundId(5),
+                            patient: replacement,
+                            created_at: 12,
+                            spec: future,
+                            controlled: false,
+                            healed: false,
+                        },
+                    ),
+                ]),
+                treatments: BTreeMap::from([
+                    (
+                        TreatmentId(0),
+                        Treatment {
+                            id: TreatmentId(0),
+                            medic: m1,
+                            patient: EntityId::from_parts(3, 0),
+                            wound: Some(WoundId(0)),
+                            kind: TreatmentKind::Hemostatic,
+                            started_at: 0,
+                            completes_at: 10,
+                            consumed: 1,
+                            status: TreatmentStatus::Completed { at: 10 },
+                        },
+                    ),
+                    (
+                        TreatmentId(1),
+                        Treatment {
+                            id: TreatmentId(1),
+                            medic: EntityId::from_parts(2, 0),
+                            patient: p4,
+                            wound: Some(WoundId(1)),
+                            kind: TreatmentKind::Hemostatic,
+                            started_at: 0,
+                            completes_at: 10,
+                            consumed: 1,
+                            status: TreatmentStatus::Interrupted {
+                                at: 0,
+                                reason: InterruptionReason::Explicit,
+                            },
+                        },
+                    ),
+                    (
+                        TreatmentId(3),
+                        Treatment {
+                            id: TreatmentId(3),
+                            medic: m1,
+                            patient: p4,
+                            wound: Some(WoundId(3)),
+                            kind: TreatmentKind::Hemostatic,
+                            started_at: 12,
+                            completes_at: 22,
+                            consumed: 1,
+                            status: TreatmentStatus::Interrupted {
+                                at: 12,
+                                reason: InterruptionReason::Explicit,
+                            },
+                        },
+                    ),
+                    (
+                        TreatmentId(4),
+                        Treatment {
+                            id: TreatmentId(4),
+                            medic: m1,
+                            patient: p4,
+                            wound: Some(WoundId(3)),
+                            kind: TreatmentKind::Hemostatic,
+                            started_at: 12,
+                            completes_at: 22,
+                            consumed: 1,
+                            status: TreatmentStatus::Active,
+                        },
+                    ),
+                    (
+                        TreatmentId(5),
+                        Treatment {
+                            id: TreatmentId(5),
+                            medic: m0,
+                            patient: replacement,
+                            wound: Some(WoundId(5)),
+                            kind: TreatmentKind::Hemostatic,
+                            started_at: 12,
+                            completes_at: 22,
+                            consumed: 1,
+                            status: TreatmentStatus::Active,
+                        },
+                    ),
+                ]),
+                next_wound_id: 6,
+                next_treatment_id: 6,
+                wound_ownership: BTreeMap::from([
+                    (EntityId::from_parts(3, 0), BTreeSet::from([WoundId(0)])),
+                    (p4, BTreeSet::from([WoundId(1), WoundId(3)])),
+                    (replacement, BTreeSet::from([WoundId(5)])),
+                ]),
+                bleeding: BTreeMap::from([(p4, 3), (replacement, 1)]),
+                treatment_history: BTreeMap::from([
+                    (m0, BTreeSet::from([TreatmentId(5)])),
+                    (
+                        m1,
+                        BTreeSet::from([TreatmentId(0), TreatmentId(3), TreatmentId(4)]),
+                    ),
+                    (EntityId::from_parts(2, 0), BTreeSet::from([TreatmentId(1)])),
+                    (EntityId::from_parts(3, 0), BTreeSet::from([TreatmentId(0)])),
+                    (
+                        p4,
+                        BTreeSet::from([TreatmentId(1), TreatmentId(3), TreatmentId(4)]),
+                    ),
+                    (replacement, BTreeSet::from([TreatmentId(5)])),
+                ]),
+                active: BTreeMap::from([
+                    (m0, TreatmentId(5)),
+                    (m1, TreatmentId(4)),
+                    (p4, TreatmentId(4)),
+                    (replacement, TreatmentId(5)),
+                ]),
+                treatment_due: BTreeMap::from([(
+                    22,
+                    BTreeSet::from([TreatmentId(4), TreatmentId(5)]),
+                )]),
+                due_by_treatment: BTreeMap::from([(TreatmentId(4), 22), (TreatmentId(5), 22)]),
+                living_due: BTreeMap::from([
+                    (15, BTreeSet::from([EntityId::from_parts(3, 0)])),
+                    (50, BTreeSet::from([m0, m1, EntityId::from_parts(2, 0), p4])),
+                    (62, BTreeSet::from([replacement])),
+                ]),
+                due_by_entity: HashMap::from([
+                    (m0, 50),
+                    (m1, 50),
+                    (EntityId::from_parts(2, 0), 50),
+                    (EntityId::from_parts(3, 0), 15),
+                    (p4, 50),
+                    (replacement, 62),
+                ]),
+                medic_index: BTreeMap::from([(
+                    (0, 0),
+                    BTreeSet::from([m0, m1, EntityId::from_parts(2, 0)]),
+                )]),
+                available_medics: BTreeMap::from([
+                    ((0, 0, 1), BTreeSet::from([EntityId::from_parts(2, 0)])),
+                    ((0, 0, 2), BTreeSet::from([EntityId::from_parts(2, 0)])),
+                ]),
+                availability_by_medic: BTreeMap::from([(
+                    EntityId::from_parts(2, 0),
+                    BTreeSet::from([(0, 0, 1), (0, 0, 2)]),
+                )]),
+                cell_members: BTreeMap::from([(
+                    0,
+                    BTreeSet::from([
+                        m0,
+                        m1,
+                        EntityId::from_parts(2, 0),
+                        EntityId::from_parts(3, 0),
+                        p4,
+                        replacement,
+                    ]),
+                )]),
+                hot_cells: BTreeMap::new(),
+                totals: ResourceTotals {
+                    ammunition: 0,
+                    stockpile_supplies: 0,
+                    carried_food: 12,
+                    carried_water: 12,
+                    carried_medical: 12,
+                    sourced_food: 14,
+                    sourced_water: 14,
+                    consumed_food: 0,
+                    consumed_water: 0,
+                    lost_food: 2,
+                    lost_water: 2,
+                    sourced_medical: 18,
+                    consumed_medical: 6,
+                    lost_medical: 0,
+                },
+            };
+            cleanup_fixture.assert_world(&world);
             let later = world.snapshot();
             let later_digest = world.state_digest();
             let mut later_restore = World::from_snapshot(&later).unwrap();
@@ -17377,20 +17760,7 @@ mod private_invariants {
                 later_digest,
                 "{label}: later checkpoint digest"
             );
-            assert_eq!(later_restore.next_wound_id, 6);
-            assert_eq!(later_restore.next_treatment_id, 6);
-            assert_eq!(later_restore.active_by_entity, world.active_by_entity);
-            assert_eq!(later_restore.treatment_due, world.treatment_due);
-            assert_eq!(later_restore.due_by_treatment, world.due_by_treatment);
-            assert_eq!(
-                later_restore.wound_ids_by_patient,
-                world.wound_ids_by_patient
-            );
-            assert_eq!(
-                later_restore.bleeding_rate_by_patient,
-                world.bleeding_rate_by_patient
-            );
-
+            cleanup_fixture.assert_world(&later_restore);
             let advanced = world.apply(Command::AdvanceTo { target: 22 });
             let expected = vec![
                 TimedEvent {
@@ -17466,15 +17836,362 @@ mod private_invariants {
             assert_eq!(later_restore.snapshot(), world.snapshot());
             assert_eq!(later_restore.state_digest(), world.state_digest());
 
+            let completion_fixture = CheckpointFixture {
+                name: "post-completion clock 22",
+                clock: 22,
+                generation: vec![0, 0, 0, 0, 0, 1],
+                alive: vec![true, true, true, true, true, true],
+                data: vec![
+                    literal_spec(Role::Medic, 4),
+                    literal_spec(Role::Medic, 3),
+                    literal_spec(Role::Medic, 5),
+                    literal_spec(Role::Rifle, 0),
+                    SoldierSpec {
+                        health: 940,
+                        ..literal_spec(Role::Rifle, 0)
+                    },
+                    SoldierSpec {
+                        health: 990,
+                        ..literal_spec(Role::Rifle, 0)
+                    },
+                ],
+                living: vec![
+                    LivingState {
+                        hunger: 22,
+                        thirst: 44,
+                        fatigue: 22,
+                        sleep_debt: 22,
+                        morale: 1000,
+                        health: 1000,
+                        activity: Activity::Idle,
+                        life: LifeState::Alive,
+                        materialized_at: 22,
+                    },
+                    LivingState {
+                        hunger: 22,
+                        thirst: 44,
+                        fatigue: 22,
+                        sleep_debt: 22,
+                        morale: 1000,
+                        health: 1000,
+                        activity: Activity::Idle,
+                        life: LifeState::Alive,
+                        materialized_at: 22,
+                    },
+                    LivingState {
+                        hunger: 0,
+                        thirst: 0,
+                        fatigue: 0,
+                        sleep_debt: 0,
+                        morale: 1000,
+                        health: 1000,
+                        activity: Activity::Idle,
+                        life: LifeState::Alive,
+                        materialized_at: 0,
+                    },
+                    LivingState {
+                        hunger: 20,
+                        thirst: 40,
+                        fatigue: 20,
+                        sleep_debt: 20,
+                        morale: 1000,
+                        health: 1000,
+                        activity: Activity::Idle,
+                        life: LifeState::Alive,
+                        materialized_at: 20,
+                    },
+                    LivingState {
+                        hunger: 22,
+                        thirst: 44,
+                        fatigue: 22,
+                        sleep_debt: 22,
+                        morale: 1000,
+                        health: 940,
+                        activity: Activity::Idle,
+                        life: LifeState::Alive,
+                        materialized_at: 22,
+                    },
+                    LivingState {
+                        hunger: 10,
+                        thirst: 20,
+                        fatigue: 10,
+                        sleep_debt: 10,
+                        morale: 1000,
+                        health: 990,
+                        activity: Activity::Idle,
+                        life: LifeState::Alive,
+                        materialized_at: 22,
+                    },
+                ],
+                free: vec![],
+                live: 6,
+                casualty: BTreeMap::from([
+                    (
+                        EntityId::from_parts(3, 0),
+                        CasualtyState {
+                            blood: 5000,
+                            shock: 2,
+                            shock_remainder: 0,
+                            incapacitated: false,
+                            recovering: true,
+                            recovery_next_at: Some(25),
+                            materialized_at: 20,
+                        },
+                    ),
+                    (
+                        p4,
+                        CasualtyState {
+                            blood: 4946,
+                            shock: 115,
+                            shock_remainder: 4,
+                            incapacitated: false,
+                            recovering: false,
+                            recovery_next_at: None,
+                            materialized_at: 22,
+                        },
+                    ),
+                    (
+                        replacement,
+                        CasualtyState {
+                            blood: 4990,
+                            shock: 11,
+                            shock_remainder: 0,
+                            incapacitated: false,
+                            recovering: true,
+                            recovery_next_at: Some(27),
+                            materialized_at: 22,
+                        },
+                    ),
+                ]),
+                wounds: BTreeMap::from([
+                    (
+                        WoundId(0),
+                        Wound {
+                            id: WoundId(0),
+                            patient: EntityId::from_parts(3, 0),
+                            created_at: 0,
+                            spec: WoundSpec {
+                                trauma: 50,
+                                bleeding_per_second: 2,
+                                shock: 100,
+                            },
+                            controlled: true,
+                            healed: false,
+                        },
+                    ),
+                    (
+                        WoundId(1),
+                        Wound {
+                            id: WoundId(1),
+                            patient: p4,
+                            created_at: 0,
+                            spec: WoundSpec {
+                                trauma: 50,
+                                bleeding_per_second: 2,
+                                shock: 100,
+                            },
+                            controlled: false,
+                            healed: false,
+                        },
+                    ),
+                    (
+                        WoundId(3),
+                        Wound {
+                            id: WoundId(3),
+                            patient: p4,
+                            created_at: 12,
+                            spec: future,
+                            controlled: true,
+                            healed: false,
+                        },
+                    ),
+                    (
+                        WoundId(5),
+                        Wound {
+                            id: WoundId(5),
+                            patient: replacement,
+                            created_at: 12,
+                            spec: future,
+                            controlled: true,
+                            healed: false,
+                        },
+                    ),
+                ]),
+                treatments: BTreeMap::from([
+                    (
+                        TreatmentId(0),
+                        Treatment {
+                            id: TreatmentId(0),
+                            medic: m1,
+                            patient: EntityId::from_parts(3, 0),
+                            wound: Some(WoundId(0)),
+                            kind: TreatmentKind::Hemostatic,
+                            started_at: 0,
+                            completes_at: 10,
+                            consumed: 1,
+                            status: TreatmentStatus::Completed { at: 10 },
+                        },
+                    ),
+                    (
+                        TreatmentId(1),
+                        Treatment {
+                            id: TreatmentId(1),
+                            medic: EntityId::from_parts(2, 0),
+                            patient: p4,
+                            wound: Some(WoundId(1)),
+                            kind: TreatmentKind::Hemostatic,
+                            started_at: 0,
+                            completes_at: 10,
+                            consumed: 1,
+                            status: TreatmentStatus::Interrupted {
+                                at: 0,
+                                reason: InterruptionReason::Explicit,
+                            },
+                        },
+                    ),
+                    (
+                        TreatmentId(3),
+                        Treatment {
+                            id: TreatmentId(3),
+                            medic: m1,
+                            patient: p4,
+                            wound: Some(WoundId(3)),
+                            kind: TreatmentKind::Hemostatic,
+                            started_at: 12,
+                            completes_at: 22,
+                            consumed: 1,
+                            status: TreatmentStatus::Interrupted {
+                                at: 12,
+                                reason: InterruptionReason::Explicit,
+                            },
+                        },
+                    ),
+                    (
+                        TreatmentId(4),
+                        Treatment {
+                            id: TreatmentId(4),
+                            medic: m1,
+                            patient: p4,
+                            wound: Some(WoundId(3)),
+                            kind: TreatmentKind::Hemostatic,
+                            started_at: 12,
+                            completes_at: 22,
+                            consumed: 1,
+                            status: TreatmentStatus::Completed { at: 22 },
+                        },
+                    ),
+                    (
+                        TreatmentId(5),
+                        Treatment {
+                            id: TreatmentId(5),
+                            medic: m0,
+                            patient: replacement,
+                            wound: Some(WoundId(5)),
+                            kind: TreatmentKind::Hemostatic,
+                            started_at: 12,
+                            completes_at: 22,
+                            consumed: 1,
+                            status: TreatmentStatus::Completed { at: 22 },
+                        },
+                    ),
+                ]),
+                next_wound_id: 6,
+                next_treatment_id: 6,
+                wound_ownership: BTreeMap::from([
+                    (EntityId::from_parts(3, 0), BTreeSet::from([WoundId(0)])),
+                    (p4, BTreeSet::from([WoundId(1), WoundId(3)])),
+                    (replacement, BTreeSet::from([WoundId(5)])),
+                ]),
+                bleeding: BTreeMap::from([(p4, 2)]),
+                treatment_history: BTreeMap::from([
+                    (m0, BTreeSet::from([TreatmentId(5)])),
+                    (
+                        m1,
+                        BTreeSet::from([TreatmentId(0), TreatmentId(3), TreatmentId(4)]),
+                    ),
+                    (EntityId::from_parts(2, 0), BTreeSet::from([TreatmentId(1)])),
+                    (EntityId::from_parts(3, 0), BTreeSet::from([TreatmentId(0)])),
+                    (
+                        p4,
+                        BTreeSet::from([TreatmentId(1), TreatmentId(3), TreatmentId(4)]),
+                    ),
+                    (replacement, BTreeSet::from([TreatmentId(5)])),
+                ]),
+                active: BTreeMap::new(),
+                treatment_due: BTreeMap::new(),
+                due_by_treatment: BTreeMap::new(),
+                living_due: BTreeMap::from([
+                    (25, BTreeSet::from([EntityId::from_parts(3, 0)])),
+                    (27, BTreeSet::from([replacement])),
+                    (50, BTreeSet::from([m0, m1, EntityId::from_parts(2, 0), p4])),
+                ]),
+                due_by_entity: HashMap::from([
+                    (m0, 50),
+                    (m1, 50),
+                    (EntityId::from_parts(2, 0), 50),
+                    (EntityId::from_parts(3, 0), 25),
+                    (p4, 50),
+                    (replacement, 27),
+                ]),
+                medic_index: BTreeMap::from([(
+                    (0, 0),
+                    BTreeSet::from([m0, m1, EntityId::from_parts(2, 0)]),
+                )]),
+                available_medics: BTreeMap::from([
+                    (
+                        (0, 0, 1),
+                        BTreeSet::from([m0, m1, EntityId::from_parts(2, 0)]),
+                    ),
+                    (
+                        (0, 0, 2),
+                        BTreeSet::from([m0, m1, EntityId::from_parts(2, 0)]),
+                    ),
+                ]),
+                availability_by_medic: BTreeMap::from([
+                    (m0, BTreeSet::from([(0, 0, 1), (0, 0, 2)])),
+                    (m1, BTreeSet::from([(0, 0, 1), (0, 0, 2)])),
+                    (
+                        EntityId::from_parts(2, 0),
+                        BTreeSet::from([(0, 0, 1), (0, 0, 2)]),
+                    ),
+                ]),
+                cell_members: BTreeMap::from([(
+                    0,
+                    BTreeSet::from([
+                        m0,
+                        m1,
+                        EntityId::from_parts(2, 0),
+                        EntityId::from_parts(3, 0),
+                        p4,
+                        replacement,
+                    ]),
+                )]),
+                hot_cells: BTreeMap::new(),
+                totals: ResourceTotals {
+                    ammunition: 0,
+                    stockpile_supplies: 0,
+                    carried_food: 12,
+                    carried_water: 12,
+                    carried_medical: 12,
+                    sourced_food: 14,
+                    sourced_water: 14,
+                    consumed_food: 0,
+                    consumed_water: 0,
+                    lost_food: 2,
+                    lost_water: 2,
+                    sourced_medical: 18,
+                    consumed_medical: 6,
+                    lost_medical: 0,
+                },
+            };
+            completion_fixture.assert_world(&world);
+            completion_fixture.assert_world(&later_restore);
             let completion_bytes = world.snapshot();
             let completion_digest = world.state_digest();
             let mut completion_restore = World::from_snapshot(&completion_bytes).unwrap();
             assert_eq!(completion_restore.snapshot(), completion_bytes);
             assert_eq!(completion_restore.state_digest(), completion_digest);
-            assert_eq!(completion_restore.next_wound_id, 6);
-            assert_eq!(completion_restore.next_treatment_id, 6);
-            assert_eq!(completion_restore.consumed_medical, 6);
-            assert_eq!(completion_restore.lost_medical, 0);
+            completion_fixture.assert_world(&completion_restore);
 
             let final_advance = world.apply(Command::AdvanceTo { target: 60 });
             let expected_final_advance = ApplyOutcome {
@@ -17610,9 +18327,398 @@ mod private_invariants {
                 blocked: None,
             };
             assert_eq!(final_advance, expected_final_advance);
+            let final_fixture = CheckpointFixture {
+                name: "final clock 60",
+                clock: 60,
+                generation: vec![0, 0, 0, 0, 0, 1],
+                alive: vec![true, true, true, true, true, true],
+                data: vec![
+                    SoldierSpec {
+                        inventory: Inventory {
+                            food: 2,
+                            water: 1,
+                            medical: 4,
+                        },
+                        ..literal_spec(Role::Medic, 4)
+                    },
+                    SoldierSpec {
+                        inventory: Inventory {
+                            food: 2,
+                            water: 1,
+                            medical: 3,
+                        },
+                        ..literal_spec(Role::Medic, 3)
+                    },
+                    SoldierSpec {
+                        inventory: Inventory {
+                            food: 2,
+                            water: 1,
+                            medical: 5,
+                        },
+                        ..literal_spec(Role::Medic, 5)
+                    },
+                    SoldierSpec {
+                        inventory: Inventory {
+                            food: 2,
+                            water: 1,
+                            medical: 0,
+                        },
+                        ..literal_spec(Role::Rifle, 0)
+                    },
+                    SoldierSpec {
+                        health: 940,
+                        inventory: Inventory {
+                            food: 2,
+                            water: 1,
+                            medical: 0,
+                        },
+                        ..literal_spec(Role::Rifle, 0)
+                    },
+                    literal_spec(Role::Rifle, 0),
+                ],
+                living: vec![
+                    LivingState {
+                        hunger: 50,
+                        thirst: 0,
+                        fatigue: 50,
+                        sleep_debt: 50,
+                        morale: 1000,
+                        health: 1000,
+                        activity: Activity::Idle,
+                        life: LifeState::Alive,
+                        materialized_at: 50,
+                    },
+                    LivingState {
+                        hunger: 50,
+                        thirst: 0,
+                        fatigue: 50,
+                        sleep_debt: 50,
+                        morale: 1000,
+                        health: 1000,
+                        activity: Activity::Idle,
+                        life: LifeState::Alive,
+                        materialized_at: 50,
+                    },
+                    LivingState {
+                        hunger: 50,
+                        thirst: 0,
+                        fatigue: 50,
+                        sleep_debt: 50,
+                        morale: 1000,
+                        health: 1000,
+                        activity: Activity::Idle,
+                        life: LifeState::Alive,
+                        materialized_at: 50,
+                    },
+                    LivingState {
+                        hunger: 50,
+                        thirst: 0,
+                        fatigue: 50,
+                        sleep_debt: 50,
+                        morale: 1000,
+                        health: 1000,
+                        activity: Activity::Idle,
+                        life: LifeState::Alive,
+                        materialized_at: 50,
+                    },
+                    LivingState {
+                        hunger: 50,
+                        thirst: 0,
+                        fatigue: 50,
+                        sleep_debt: 50,
+                        morale: 1000,
+                        health: 940,
+                        activity: Activity::Idle,
+                        life: LifeState::Alive,
+                        materialized_at: 50,
+                    },
+                    LivingState {
+                        hunger: 15,
+                        thirst: 30,
+                        fatigue: 15,
+                        sleep_debt: 15,
+                        morale: 1000,
+                        health: 1000,
+                        activity: Activity::Idle,
+                        life: LifeState::Alive,
+                        materialized_at: 27,
+                    },
+                ],
+                free: vec![],
+                live: 6,
+                casualty: BTreeMap::from([
+                    (
+                        EntityId::from_parts(3, 0),
+                        CasualtyState {
+                            blood: 5000,
+                            shock: 0,
+                            shock_remainder: 0,
+                            incapacitated: false,
+                            recovering: false,
+                            recovery_next_at: None,
+                            materialized_at: 50,
+                        },
+                    ),
+                    (
+                        p4,
+                        CasualtyState {
+                            blood: 4890,
+                            shock: 121,
+                            shock_remainder: 0,
+                            incapacitated: false,
+                            recovering: false,
+                            recovery_next_at: None,
+                            materialized_at: 50,
+                        },
+                    ),
+                    (
+                        replacement,
+                        CasualtyState {
+                            blood: 5000,
+                            shock: 0,
+                            shock_remainder: 0,
+                            incapacitated: false,
+                            recovering: false,
+                            recovery_next_at: None,
+                            materialized_at: 27,
+                        },
+                    ),
+                ]),
+                wounds: BTreeMap::from([
+                    (
+                        WoundId(0),
+                        Wound {
+                            id: WoundId(0),
+                            patient: EntityId::from_parts(3, 0),
+                            created_at: 0,
+                            spec: WoundSpec {
+                                trauma: 50,
+                                bleeding_per_second: 2,
+                                shock: 100,
+                            },
+                            controlled: true,
+                            healed: true,
+                        },
+                    ),
+                    (
+                        WoundId(1),
+                        Wound {
+                            id: WoundId(1),
+                            patient: p4,
+                            created_at: 0,
+                            spec: WoundSpec {
+                                trauma: 50,
+                                bleeding_per_second: 2,
+                                shock: 100,
+                            },
+                            controlled: false,
+                            healed: false,
+                        },
+                    ),
+                    (
+                        WoundId(3),
+                        Wound {
+                            id: WoundId(3),
+                            patient: p4,
+                            created_at: 12,
+                            spec: future,
+                            controlled: true,
+                            healed: false,
+                        },
+                    ),
+                    (
+                        WoundId(5),
+                        Wound {
+                            id: WoundId(5),
+                            patient: replacement,
+                            created_at: 12,
+                            spec: future,
+                            controlled: true,
+                            healed: true,
+                        },
+                    ),
+                ]),
+                treatments: BTreeMap::from([
+                    (
+                        TreatmentId(0),
+                        Treatment {
+                            id: TreatmentId(0),
+                            medic: m1,
+                            patient: EntityId::from_parts(3, 0),
+                            wound: Some(WoundId(0)),
+                            kind: TreatmentKind::Hemostatic,
+                            started_at: 0,
+                            completes_at: 10,
+                            consumed: 1,
+                            status: TreatmentStatus::Completed { at: 10 },
+                        },
+                    ),
+                    (
+                        TreatmentId(1),
+                        Treatment {
+                            id: TreatmentId(1),
+                            medic: EntityId::from_parts(2, 0),
+                            patient: p4,
+                            wound: Some(WoundId(1)),
+                            kind: TreatmentKind::Hemostatic,
+                            started_at: 0,
+                            completes_at: 10,
+                            consumed: 1,
+                            status: TreatmentStatus::Interrupted {
+                                at: 0,
+                                reason: InterruptionReason::Explicit,
+                            },
+                        },
+                    ),
+                    (
+                        TreatmentId(3),
+                        Treatment {
+                            id: TreatmentId(3),
+                            medic: m1,
+                            patient: p4,
+                            wound: Some(WoundId(3)),
+                            kind: TreatmentKind::Hemostatic,
+                            started_at: 12,
+                            completes_at: 22,
+                            consumed: 1,
+                            status: TreatmentStatus::Interrupted {
+                                at: 12,
+                                reason: InterruptionReason::Explicit,
+                            },
+                        },
+                    ),
+                    (
+                        TreatmentId(4),
+                        Treatment {
+                            id: TreatmentId(4),
+                            medic: m1,
+                            patient: p4,
+                            wound: Some(WoundId(3)),
+                            kind: TreatmentKind::Hemostatic,
+                            started_at: 12,
+                            completes_at: 22,
+                            consumed: 1,
+                            status: TreatmentStatus::Completed { at: 22 },
+                        },
+                    ),
+                    (
+                        TreatmentId(5),
+                        Treatment {
+                            id: TreatmentId(5),
+                            medic: m0,
+                            patient: replacement,
+                            wound: Some(WoundId(5)),
+                            kind: TreatmentKind::Hemostatic,
+                            started_at: 12,
+                            completes_at: 22,
+                            consumed: 1,
+                            status: TreatmentStatus::Completed { at: 22 },
+                        },
+                    ),
+                ]),
+                next_wound_id: 6,
+                next_treatment_id: 6,
+                wound_ownership: BTreeMap::from([
+                    (EntityId::from_parts(3, 0), BTreeSet::from([WoundId(0)])),
+                    (p4, BTreeSet::from([WoundId(1), WoundId(3)])),
+                    (replacement, BTreeSet::from([WoundId(5)])),
+                ]),
+                bleeding: BTreeMap::from([(p4, 2)]),
+                treatment_history: BTreeMap::from([
+                    (m0, BTreeSet::from([TreatmentId(5)])),
+                    (
+                        m1,
+                        BTreeSet::from([TreatmentId(0), TreatmentId(3), TreatmentId(4)]),
+                    ),
+                    (EntityId::from_parts(2, 0), BTreeSet::from([TreatmentId(1)])),
+                    (EntityId::from_parts(3, 0), BTreeSet::from([TreatmentId(0)])),
+                    (
+                        p4,
+                        BTreeSet::from([TreatmentId(1), TreatmentId(3), TreatmentId(4)]),
+                    ),
+                    (replacement, BTreeSet::from([TreatmentId(5)])),
+                ]),
+                active: BTreeMap::new(),
+                treatment_due: BTreeMap::new(),
+                due_by_treatment: BTreeMap::new(),
+                living_due: BTreeMap::from([
+                    (62, BTreeSet::from([replacement])),
+                    (
+                        100,
+                        BTreeSet::from([
+                            m0,
+                            m1,
+                            EntityId::from_parts(2, 0),
+                            EntityId::from_parts(3, 0),
+                            p4,
+                        ]),
+                    ),
+                ]),
+                due_by_entity: HashMap::from([
+                    (m0, 100),
+                    (m1, 100),
+                    (EntityId::from_parts(2, 0), 100),
+                    (EntityId::from_parts(3, 0), 100),
+                    (p4, 100),
+                    (replacement, 62),
+                ]),
+                medic_index: BTreeMap::from([(
+                    (0, 0),
+                    BTreeSet::from([m0, m1, EntityId::from_parts(2, 0)]),
+                )]),
+                available_medics: BTreeMap::from([
+                    (
+                        (0, 0, 1),
+                        BTreeSet::from([m0, m1, EntityId::from_parts(2, 0)]),
+                    ),
+                    (
+                        (0, 0, 2),
+                        BTreeSet::from([m0, m1, EntityId::from_parts(2, 0)]),
+                    ),
+                ]),
+                availability_by_medic: BTreeMap::from([
+                    (m0, BTreeSet::from([(0, 0, 1), (0, 0, 2)])),
+                    (m1, BTreeSet::from([(0, 0, 1), (0, 0, 2)])),
+                    (
+                        EntityId::from_parts(2, 0),
+                        BTreeSet::from([(0, 0, 1), (0, 0, 2)]),
+                    ),
+                ]),
+                cell_members: BTreeMap::from([(
+                    0,
+                    BTreeSet::from([
+                        m0,
+                        m1,
+                        EntityId::from_parts(2, 0),
+                        EntityId::from_parts(3, 0),
+                        p4,
+                        replacement,
+                    ]),
+                )]),
+                hot_cells: BTreeMap::new(),
+                totals: ResourceTotals {
+                    ammunition: 0,
+                    stockpile_supplies: 0,
+                    carried_food: 12,
+                    carried_water: 7,
+                    carried_medical: 12,
+                    sourced_food: 14,
+                    sourced_water: 14,
+                    consumed_food: 0,
+                    consumed_water: 5,
+                    lost_food: 2,
+                    lost_water: 2,
+                    sourced_medical: 18,
+                    consumed_medical: 6,
+                    lost_medical: 0,
+                },
+            };
             let resumed_final = later_restore.apply(Command::AdvanceTo { target: 60 });
             let completion_resumed_final =
                 completion_restore.apply(Command::AdvanceTo { target: 60 });
+            final_fixture.assert_world(&world);
+            final_fixture.assert_world(&later_restore);
+            final_fixture.assert_world(&completion_restore);
             assert_eq!(
                 resumed_final, final_advance,
                 "{label}: cleanup restore final suffix"
@@ -17644,9 +18750,315 @@ mod private_invariants {
             )
         }
 
+        let expected_suffix_history = vec![
+            TimedEvent {
+                at: 12,
+                event: Event::WoundInflicted {
+                    id: WoundId(3),
+                    patient: EntityId(4),
+                    wound: WoundSpec {
+                        trauma: 10,
+                        bleeding_per_second: 1,
+                        shock: 10,
+                    },
+                },
+            },
+            TimedEvent {
+                at: 12,
+                event: Event::TreatmentStarted {
+                    id: TreatmentId(3),
+                    medic: EntityId(1),
+                    patient: EntityId(4),
+                    wound: Some(WoundId(3)),
+                    kind: TreatmentKind::Hemostatic,
+                    completes_at: 22,
+                    consumed: 1,
+                },
+            },
+            TimedEvent {
+                at: 12,
+                event: Event::TreatmentInterrupted {
+                    id: TreatmentId(3),
+                    reason: InterruptionReason::Explicit,
+                },
+            },
+            TimedEvent {
+                at: 12,
+                event: Event::TreatmentStarted {
+                    id: TreatmentId(4),
+                    medic: EntityId(1),
+                    patient: EntityId(4),
+                    wound: Some(WoundId(3)),
+                    kind: TreatmentKind::Hemostatic,
+                    completes_at: 22,
+                    consumed: 1,
+                },
+            },
+            TimedEvent {
+                at: 12,
+                event: Event::WoundInflicted {
+                    id: WoundId(4),
+                    patient: EntityId(5),
+                    wound: WoundSpec {
+                        trauma: 1000,
+                        bleeding_per_second: 0,
+                        shock: 0,
+                    },
+                },
+            },
+            TimedEvent {
+                at: 12,
+                event: Event::SoldierDied {
+                    id: EntityId(5),
+                    cause: DeathCause::ImmediateTrauma,
+                    health_before: 950,
+                },
+            },
+            TimedEvent {
+                at: 12,
+                event: Event::TreatmentInterrupted {
+                    id: TreatmentId(2),
+                    reason: InterruptionReason::PatientDied,
+                },
+            },
+            TimedEvent {
+                at: 12,
+                event: Event::SoldierRemoved {
+                    id: EntityId(5),
+                    loadout: Loadout {
+                        ammunition: 0,
+                        food: 2,
+                        water: 2,
+                        medical: 0,
+                    },
+                },
+            },
+            TimedEvent {
+                at: 12,
+                event: Event::SoldierSpawned {
+                    id: EntityId(4294967301),
+                    loadout: Loadout {
+                        ammunition: 0,
+                        food: 2,
+                        water: 2,
+                        medical: 0,
+                    },
+                },
+            },
+            TimedEvent {
+                at: 12,
+                event: Event::WoundInflicted {
+                    id: WoundId(5),
+                    patient: EntityId(4294967301),
+                    wound: WoundSpec {
+                        trauma: 10,
+                        bleeding_per_second: 1,
+                        shock: 10,
+                    },
+                },
+            },
+            TimedEvent {
+                at: 12,
+                event: Event::TreatmentStarted {
+                    id: TreatmentId(5),
+                    medic: EntityId(0),
+                    patient: EntityId(4294967301),
+                    wound: Some(WoundId(5)),
+                    kind: TreatmentKind::Hemostatic,
+                    completes_at: 22,
+                    consumed: 1,
+                },
+            },
+            TimedEvent {
+                at: 15,
+                event: Event::RecoveryTicked {
+                    id: EntityId(3),
+                    blood_before: 4980,
+                    blood_after: 5000,
+                    shock_before: 102,
+                    shock_after: 52,
+                    health_before: 950,
+                    health_after: 975,
+                },
+            },
+            TimedEvent {
+                at: 20,
+                event: Event::RecoveryTicked {
+                    id: EntityId(3),
+                    blood_before: 5000,
+                    blood_after: 5000,
+                    shock_before: 52,
+                    shock_after: 2,
+                    health_before: 975,
+                    health_after: 1000,
+                },
+            },
+            TimedEvent {
+                at: 22,
+                event: Event::TreatmentCompleted {
+                    id: TreatmentId(4),
+                    medic: EntityId(1),
+                    patient: EntityId(4),
+                    kind: TreatmentKind::Hemostatic,
+                },
+            },
+            TimedEvent {
+                at: 22,
+                event: Event::TreatmentCompleted {
+                    id: TreatmentId(5),
+                    medic: EntityId(0),
+                    patient: EntityId(4294967301),
+                    kind: TreatmentKind::Hemostatic,
+                },
+            },
+            TimedEvent {
+                at: 22,
+                event: Event::RecoveryChanged {
+                    id: EntityId(4294967301),
+                    before: false,
+                    after: true,
+                    next_at: Some(27),
+                },
+            },
+            TimedEvent {
+                at: 22,
+                event: Event::TimeAdvanced {
+                    from: 12,
+                    to: 22,
+                    hot_cells_stepped: 0,
+                    fixed_steps_per_hot_cell: 0,
+                },
+            },
+            TimedEvent {
+                at: 25,
+                event: Event::RecoveryTicked {
+                    id: EntityId(3),
+                    blood_before: 5000,
+                    blood_after: 5000,
+                    shock_before: 2,
+                    shock_after: 0,
+                    health_before: 1000,
+                    health_after: 1000,
+                },
+            },
+            TimedEvent {
+                at: 25,
+                event: Event::WoundHealed {
+                    id: WoundId(0),
+                    patient: EntityId(3),
+                },
+            },
+            TimedEvent {
+                at: 25,
+                event: Event::RecoveryChanged {
+                    id: EntityId(3),
+                    before: true,
+                    after: false,
+                    next_at: None,
+                },
+            },
+            TimedEvent {
+                at: 27,
+                event: Event::RecoveryTicked {
+                    id: EntityId(4294967301),
+                    blood_before: 4990,
+                    blood_after: 5000,
+                    shock_before: 11,
+                    shock_after: 0,
+                    health_before: 990,
+                    health_after: 1000,
+                },
+            },
+            TimedEvent {
+                at: 27,
+                event: Event::WoundHealed {
+                    id: WoundId(5),
+                    patient: EntityId(4294967301),
+                },
+            },
+            TimedEvent {
+                at: 27,
+                event: Event::RecoveryChanged {
+                    id: EntityId(4294967301),
+                    before: true,
+                    after: false,
+                    next_at: None,
+                },
+            },
+            TimedEvent {
+                at: 50,
+                event: Event::RationConsumed {
+                    id: EntityId(0),
+                    food: 0,
+                    water: 1,
+                    hunger_before: 50,
+                    hunger_after: 50,
+                    thirst_before: 100,
+                    thirst_after: 0,
+                },
+            },
+            TimedEvent {
+                at: 50,
+                event: Event::RationConsumed {
+                    id: EntityId(1),
+                    food: 0,
+                    water: 1,
+                    hunger_before: 50,
+                    hunger_after: 50,
+                    thirst_before: 100,
+                    thirst_after: 0,
+                },
+            },
+            TimedEvent {
+                at: 50,
+                event: Event::RationConsumed {
+                    id: EntityId(2),
+                    food: 0,
+                    water: 1,
+                    hunger_before: 50,
+                    hunger_after: 50,
+                    thirst_before: 100,
+                    thirst_after: 0,
+                },
+            },
+            TimedEvent {
+                at: 50,
+                event: Event::RationConsumed {
+                    id: EntityId(3),
+                    food: 0,
+                    water: 1,
+                    hunger_before: 50,
+                    hunger_after: 50,
+                    thirst_before: 100,
+                    thirst_after: 0,
+                },
+            },
+            TimedEvent {
+                at: 50,
+                event: Event::RationConsumed {
+                    id: EntityId(4),
+                    food: 0,
+                    water: 1,
+                    hunger_before: 50,
+                    hunger_after: 50,
+                    thirst_before: 100,
+                    thirst_after: 0,
+                },
+            },
+            TimedEvent {
+                at: 60,
+                event: Event::TimeAdvanced {
+                    from: 22,
+                    to: 60,
+                    hot_cells_stepped: 0,
+                    fixed_steps_per_hot_cell: 0,
+                },
+            },
+        ];
         let (final_original, history_original) = run_suffix(original, "original");
         let (final_restored, history_restored) = run_suffix(restored, "restored");
-        assert_eq!(history_original, history_restored);
+        assert_eq!(history_original, expected_suffix_history);
+        assert_eq!(history_restored, expected_suffix_history);
         assert_eq!(final_original.snapshot(), final_restored.snapshot());
         assert_eq!(final_original.state_digest(), final_restored.state_digest());
         assert_eq!(final_original.next_wound_id, 6);
