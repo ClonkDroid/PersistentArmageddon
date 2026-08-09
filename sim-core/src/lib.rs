@@ -16506,6 +16506,11 @@ mod private_invariants {
         struct CheckpointFixture {
             name: &'static str,
             clock: u64,
+            seed: u64,
+            rng_counter: u64,
+            next_schedule_id: u64,
+            scheduled: BTreeMap<u64, BTreeMap<u64, ScheduledCommand>>,
+            schedule_index: HashMap<u64, u64>,
             generation: Vec<u32>,
             alive: Vec<bool>,
             data: Vec<SoldierSpec>,
@@ -16537,11 +16542,17 @@ mod private_invariants {
             fn assert_world(&self, world: &World) {
                 let label = self.name;
                 assert_eq!(world.clock, self.clock, "{label}: clock");
-                assert_eq!(world.seed, 909, "{label}: seed");
-                assert_eq!(world.rng_counter, 0, "{label}: rng");
-                assert_eq!(world.next_schedule_id, 0, "{label}: schedule allocator");
-                assert!(world.scheduled.is_empty(), "{label}: scheduled");
-                assert!(world.schedule_index.is_empty(), "{label}: schedule reverse");
+                assert_eq!(world.seed, self.seed, "{label}: seed");
+                assert_eq!(world.rng_counter, self.rng_counter, "{label}: rng");
+                assert_eq!(
+                    world.next_schedule_id, self.next_schedule_id,
+                    "{label}: schedule allocator"
+                );
+                assert_eq!(world.scheduled, self.scheduled, "{label}: scheduled");
+                assert_eq!(
+                    world.schedule_index, self.schedule_index,
+                    "{label}: schedule reverse"
+                );
                 assert_eq!(
                     world.soldiers.generation, self.generation,
                     "{label}: generation"
@@ -16993,6 +17004,11 @@ mod private_invariants {
         let initial_fixture = CheckpointFixture {
             name: "initial clock 12",
             clock: 12,
+            seed: 909,
+            rng_counter: 0,
+            next_schedule_id: 0,
+            scheduled: BTreeMap::new(),
+            schedule_index: HashMap::new(),
             generation: vec![0, 0, 0, 0, 0, 0],
             alive: vec![true, true, true, true, true, true],
             data: vec![
@@ -17126,7 +17142,11 @@ mod private_invariants {
         assert_eq!(restored.snapshot(), initial_bytes);
         assert_eq!(restored.state_digest(), initial_digest);
 
-        fn run_suffix(mut world: World, label: &str) -> (World, Vec<TimedEvent>) {
+        fn run_suffix(
+            mut world: World,
+            label: &str,
+            expected_suffix_history: &[TimedEvent],
+        ) -> (World, Vec<TimedEvent>) {
             let m0 = EntityId::from_parts(0, 0);
             let m1 = EntityId::from_parts(1, 0);
             let p4 = EntityId::from_parts(4, 0);
@@ -17400,6 +17420,11 @@ mod private_invariants {
             let cleanup_fixture = CheckpointFixture {
                 name: "post-cleanup clock 12",
                 clock: 12,
+                seed: 909,
+                rng_counter: 0,
+                next_schedule_id: 0,
+                scheduled: BTreeMap::new(),
+                schedule_index: HashMap::new(),
                 generation: vec![0, 0, 0, 0, 0, 1],
                 alive: vec![true, true, true, true, true, true],
                 data: vec![
@@ -17750,6 +17775,7 @@ mod private_invariants {
             let later = world.snapshot();
             let later_digest = world.state_digest();
             let mut later_restore = World::from_snapshot(&later).unwrap();
+            cleanup_fixture.assert_world(&later_restore);
             assert_eq!(
                 later_restore.snapshot(),
                 later,
@@ -17760,85 +17786,94 @@ mod private_invariants {
                 later_digest,
                 "{label}: later checkpoint digest"
             );
-            cleanup_fixture.assert_world(&later_restore);
             let advanced = world.apply(Command::AdvanceTo { target: 22 });
-            let expected = vec![
-                TimedEvent {
-                    at: 15,
-                    event: Event::RecoveryTicked {
-                        id: EntityId::from_parts(3, 0),
-                        blood_before: 4_980,
-                        blood_after: 5_000,
-                        shock_before: 102,
-                        shock_after: 52,
-                        health_before: 950,
-                        health_after: 975,
+            let expected_advanced = ApplyOutcome {
+                clock: 22,
+                events: vec![
+                    TimedEvent {
+                        at: 15,
+                        event: Event::RecoveryTicked {
+                            id: EntityId::from_parts(3, 0),
+                            blood_before: 4_980,
+                            blood_after: 5_000,
+                            shock_before: 102,
+                            shock_after: 52,
+                            health_before: 950,
+                            health_after: 975,
+                        },
                     },
-                },
-                TimedEvent {
-                    at: 20,
-                    event: Event::RecoveryTicked {
-                        id: EntityId::from_parts(3, 0),
-                        blood_before: 5_000,
-                        blood_after: 5_000,
-                        shock_before: 52,
-                        shock_after: 2,
-                        health_before: 975,
-                        health_after: 1_000,
+                    TimedEvent {
+                        at: 20,
+                        event: Event::RecoveryTicked {
+                            id: EntityId::from_parts(3, 0),
+                            blood_before: 5_000,
+                            blood_after: 5_000,
+                            shock_before: 52,
+                            shock_after: 2,
+                            health_before: 975,
+                            health_after: 1_000,
+                        },
                     },
-                },
-                TimedEvent {
-                    at: 22,
-                    event: Event::TreatmentCompleted {
-                        id: TreatmentId(4),
-                        medic: m1,
-                        patient: p4,
-                        kind: TreatmentKind::Hemostatic,
+                    TimedEvent {
+                        at: 22,
+                        event: Event::TreatmentCompleted {
+                            id: TreatmentId(4),
+                            medic: m1,
+                            patient: p4,
+                            kind: TreatmentKind::Hemostatic,
+                        },
                     },
-                },
-                TimedEvent {
-                    at: 22,
-                    event: Event::TreatmentCompleted {
-                        id: TreatmentId(5),
-                        medic: m0,
-                        patient: replacement,
-                        kind: TreatmentKind::Hemostatic,
+                    TimedEvent {
+                        at: 22,
+                        event: Event::TreatmentCompleted {
+                            id: TreatmentId(5),
+                            medic: m0,
+                            patient: replacement,
+                            kind: TreatmentKind::Hemostatic,
+                        },
                     },
-                },
-                TimedEvent {
-                    at: 22,
-                    event: Event::RecoveryChanged {
-                        id: replacement,
-                        before: false,
-                        after: true,
-                        next_at: Some(27),
+                    TimedEvent {
+                        at: 22,
+                        event: Event::RecoveryChanged {
+                            id: replacement,
+                            before: false,
+                            after: true,
+                            next_at: Some(27),
+                        },
                     },
-                },
-                TimedEvent {
-                    at: 22,
-                    event: Event::TimeAdvanced {
-                        from: 12,
-                        to: 22,
-                        hot_cells_stepped: 0,
-                        fixed_steps_per_hot_cell: 0,
+                    TimedEvent {
+                        at: 22,
+                        event: Event::TimeAdvanced {
+                            from: 12,
+                            to: 22,
+                            hot_cells_stepped: 0,
+                            fixed_steps_per_hot_cell: 0,
+                        },
                     },
-                },
-            ];
-            assert_eq!(advanced.events, expected, "{label}: completion boundary");
+                ],
+                error: None,
+                blocked: None,
+            };
+            assert_eq!(
+                advanced, expected_advanced,
+                "{label}: source completion boundary"
+            );
             let resumed_advanced = later_restore.apply(Command::AdvanceTo { target: 22 });
             assert_eq!(
-                resumed_advanced, advanced,
-                "{label}: cleanup checkpoint suffix"
+                resumed_advanced, expected_advanced,
+                "{label}: cleanup restore completion boundary"
             );
-            assert_eq!(advanced.clock, 22);
-            assert_eq!(advanced.error, None);
-            assert_eq!(advanced.blocked, None);
             assert_eq!(later_restore.snapshot(), world.snapshot());
             assert_eq!(later_restore.state_digest(), world.state_digest());
 
             let completion_fixture = CheckpointFixture {
                 name: "post-completion clock 22",
                 clock: 22,
+                seed: 909,
+                rng_counter: 0,
+                next_schedule_id: 0,
+                scheduled: BTreeMap::new(),
+                schedule_index: HashMap::new(),
                 generation: vec![0, 0, 0, 0, 0, 1],
                 alive: vec![true, true, true, true, true, true],
                 data: vec![
@@ -18189,9 +18224,9 @@ mod private_invariants {
             let completion_bytes = world.snapshot();
             let completion_digest = world.state_digest();
             let mut completion_restore = World::from_snapshot(&completion_bytes).unwrap();
+            completion_fixture.assert_world(&completion_restore);
             assert_eq!(completion_restore.snapshot(), completion_bytes);
             assert_eq!(completion_restore.state_digest(), completion_digest);
-            completion_fixture.assert_world(&completion_restore);
 
             let final_advance = world.apply(Command::AdvanceTo { target: 60 });
             let expected_final_advance = ApplyOutcome {
@@ -18330,6 +18365,11 @@ mod private_invariants {
             let final_fixture = CheckpointFixture {
                 name: "final clock 60",
                 clock: 60,
+                seed: 909,
+                rng_counter: 0,
+                next_schedule_id: 0,
+                scheduled: BTreeMap::new(),
+                schedule_index: HashMap::new(),
                 generation: vec![0, 0, 0, 0, 0, 1],
                 alive: vec![true, true, true, true, true, true],
                 data: vec![
@@ -18720,34 +18760,60 @@ mod private_invariants {
             final_fixture.assert_world(&later_restore);
             final_fixture.assert_world(&completion_restore);
             assert_eq!(
-                resumed_final, final_advance,
-                "{label}: cleanup restore final suffix"
+                resumed_final, expected_final_advance,
+                "{label}: cleanup restore literal final suffix"
             );
             assert_eq!(
-                completion_resumed_final, final_advance,
-                "{label}: completion restore final suffix"
+                completion_resumed_final, expected_final_advance,
+                "{label}: completion restore literal final suffix"
             );
             assert_eq!(later_restore.snapshot(), world.snapshot());
             assert_eq!(completion_restore.snapshot(), world.snapshot());
             assert_eq!(later_restore.state_digest(), world.state_digest());
             assert_eq!(completion_restore.state_digest(), world.state_digest());
-            (
-                world,
-                [
-                    w3.events,
-                    request.events,
-                    explicit.events,
-                    restart.events,
-                    fatal.events,
-                    removed.events,
-                    spawned.events,
-                    post_reuse_wound.events,
-                    post_reuse_request.events,
-                    advanced.events,
-                    final_advance.events,
-                ]
-                .concat(),
-            )
+            let pre_cleanup_history = [
+                w3.events,
+                request.events,
+                explicit.events,
+                restart.events,
+                fatal.events,
+                removed.events,
+                spawned.events,
+                post_reuse_wound.events,
+                post_reuse_request.events,
+            ]
+            .concat();
+            let source_history = [
+                pre_cleanup_history.clone(),
+                advanced.events.clone(),
+                final_advance.events,
+            ]
+            .concat();
+            let cleanup_restore_history = [
+                pre_cleanup_history.clone(),
+                resumed_advanced.events,
+                resumed_final.events,
+            ]
+            .concat();
+            let completion_restore_history = [
+                pre_cleanup_history,
+                advanced.events,
+                completion_resumed_final.events,
+            ]
+            .concat();
+            assert_eq!(
+                source_history, expected_suffix_history,
+                "{label}: source history"
+            );
+            assert_eq!(
+                cleanup_restore_history, expected_suffix_history,
+                "{label}: cleanup restore history"
+            );
+            assert_eq!(
+                completion_restore_history, expected_suffix_history,
+                "{label}: completion restore history"
+            );
+            (world, source_history)
         }
 
         let expected_suffix_history = vec![
@@ -19055,8 +19121,10 @@ mod private_invariants {
                 },
             },
         ];
-        let (final_original, history_original) = run_suffix(original, "original");
-        let (final_restored, history_restored) = run_suffix(restored, "restored");
+        let (final_original, history_original) =
+            run_suffix(original, "original", &expected_suffix_history);
+        let (final_restored, history_restored) =
+            run_suffix(restored, "restored", &expected_suffix_history);
         assert_eq!(history_original, expected_suffix_history);
         assert_eq!(history_restored, expected_suffix_history);
         assert_eq!(final_original.snapshot(), final_restored.snapshot());
