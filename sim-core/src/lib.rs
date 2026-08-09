@@ -16456,6 +16456,898 @@ mod private_invariants {
     }
 
     #[test]
+    fn gate_c1_mixed_world_continuation_is_literal_and_deterministic() {
+        fn literal_spec(role: Role, medical: u32) -> SoldierSpec {
+            SoldierSpec {
+                faction: 0,
+                position: Position {
+                    x_mm: 0,
+                    y_mm: 0,
+                    cell: 0,
+                },
+                squad: None,
+                role,
+                rank: 0,
+                health: 1000,
+                ammunition: 0,
+                inventory: Inventory {
+                    food: 2,
+                    water: 2,
+                    medical,
+                },
+            }
+        }
+
+        fn spawn_literal(world: &mut World, id: EntityId, role: Role, medical: u32) {
+            let outcome = world.apply(Command::SpawnSoldier {
+                spec: literal_spec(role, medical),
+            });
+            assert_eq!(outcome.clock, 0);
+            assert_eq!(outcome.error, None);
+            assert_eq!(outcome.blocked, None);
+            assert_eq!(
+                outcome.events,
+                vec![TimedEvent {
+                    at: 0,
+                    event: Event::SoldierSpawned {
+                        id,
+                        loadout: Loadout {
+                            ammunition: 0,
+                            food: 2,
+                            water: 2,
+                            medical,
+                        },
+                    },
+                }]
+            );
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn assert_canonical_checkpoint(
+            label: &str,
+            world: &World,
+            expected_clock: u64,
+            expected_next_wound: u64,
+            expected_next_treatment: u64,
+            expected_wounds: &BTreeMap<WoundId, Wound>,
+            expected_treatments: &BTreeMap<TreatmentId, Treatment>,
+            expected_active: &BTreeMap<EntityId, TreatmentId>,
+            expected_consumed: u128,
+            expected_lost: u128,
+        ) {
+            assert_eq!(world.clock, expected_clock, "{label}: clock");
+            assert_eq!(
+                world.next_wound_id, expected_next_wound,
+                "{label}: wound id"
+            );
+            assert_eq!(
+                world.next_treatment_id, expected_next_treatment,
+                "{label}: treatment id"
+            );
+            assert_eq!(world.wounds, *expected_wounds, "{label}: wounds");
+            assert_eq!(
+                world.treatments, *expected_treatments,
+                "{label}: treatments"
+            );
+            assert_eq!(world.active_by_entity, *expected_active, "{label}: active");
+            assert_eq!(
+                world.consumed_medical, expected_consumed,
+                "{label}: consumed"
+            );
+            assert_eq!(world.lost_medical, expected_lost, "{label}: lost");
+            assert_eq!(world.sourced_medical, 18, "{label}: source");
+            let totals = world.resource_totals();
+            assert_eq!(totals.sourced_food, 12, "{label}: food source");
+            assert_eq!(totals.sourced_water, 12, "{label}: water source");
+            assert_eq!(totals.consumed_food, 0, "{label}: food consumed");
+            assert_eq!(totals.consumed_water, 0, "{label}: water consumed");
+            assert_eq!(totals.lost_food, 0, "{label}: food lost");
+            assert_eq!(totals.lost_water, 0, "{label}: water lost");
+            assert_eq!(
+                totals
+                    .carried_medical
+                    .checked_add(totals.consumed_medical)
+                    .and_then(|v| v.checked_add(totals.lost_medical)),
+                Some(totals.sourced_medical),
+                "{label}: medical conservation"
+            );
+            assert_eq!(
+                totals
+                    .carried_food
+                    .checked_add(totals.consumed_food)
+                    .and_then(|v| v.checked_add(totals.lost_food)),
+                Some(totals.sourced_food),
+                "{label}: food conservation"
+            );
+            assert_eq!(
+                totals
+                    .carried_water
+                    .checked_add(totals.consumed_water)
+                    .and_then(|v| v.checked_add(totals.lost_water)),
+                Some(totals.sourced_water),
+                "{label}: water conservation"
+            );
+            let expected_history = expected_treatments.values().fold(
+                BTreeMap::<EntityId, BTreeSet<TreatmentId>>::new(),
+                |mut map, treatment| {
+                    map.entry(treatment.medic).or_default().insert(treatment.id);
+                    map.entry(treatment.patient)
+                        .or_default()
+                        .insert(treatment.id);
+                    map
+                },
+            );
+            assert_eq!(
+                world.treatment_ids_by_entity, expected_history,
+                "{label}: history"
+            );
+            let expected_membership = expected_wounds.values().fold(
+                BTreeMap::<EntityId, BTreeSet<WoundId>>::new(),
+                |mut map, wound| {
+                    map.entry(wound.patient).or_default().insert(wound.id);
+                    map
+                },
+            );
+            assert_eq!(
+                world.wound_ids_by_patient, expected_membership,
+                "{label}: ownership"
+            );
+            let expected_bleeding = expected_wounds.values().fold(
+                BTreeMap::<EntityId, u64>::new(),
+                |mut map, wound| {
+                    if !wound.controlled && !wound.healed && wound.spec.bleeding_per_second != 0 {
+                        *map.entry(wound.patient).or_default() +=
+                            u64::from(wound.spec.bleeding_per_second);
+                    }
+                    map
+                },
+            );
+            assert_eq!(
+                world.bleeding_rate_by_patient, expected_bleeding,
+                "{label}: bleeding"
+            );
+            let expected_due = expected_treatments
+                .values()
+                .filter(|t| t.status == TreatmentStatus::Active)
+                .fold(
+                    BTreeMap::<u64, BTreeSet<TreatmentId>>::new(),
+                    |mut map, t| {
+                        map.entry(t.completes_at).or_default().insert(t.id);
+                        map
+                    },
+                );
+            let expected_reverse = expected_treatments
+                .values()
+                .filter(|t| t.status == TreatmentStatus::Active)
+                .map(|t| (t.id, t.completes_at))
+                .collect::<BTreeMap<_, _>>();
+            assert_eq!(world.treatment_due, expected_due, "{label}: treatment due");
+            assert_eq!(
+                world.due_by_treatment, expected_reverse,
+                "{label}: reverse due"
+            );
+        }
+
+        let mut original = World::new(909);
+        let m0 = EntityId::from_parts(0, 0);
+        let m1 = EntityId::from_parts(1, 0);
+        let m2 = EntityId::from_parts(2, 0);
+        let p3 = EntityId::from_parts(3, 0);
+        let p4 = EntityId::from_parts(4, 0);
+        let p5 = EntityId::from_parts(5, 0);
+        for (id, role, medical) in [
+            (m0, Role::Medic, 6),
+            (m1, Role::Medic, 6),
+            (m2, Role::Medic, 6),
+            (p3, Role::Rifle, 0),
+            (p4, Role::Rifle, 0),
+            (p5, Role::Rifle, 0),
+        ] {
+            spawn_literal(&mut original, id, role, medical);
+        }
+        let base_wound = WoundSpec {
+            trauma: 50,
+            bleeding_per_second: 2,
+            shock: 100,
+        };
+        for (patient, id) in [(p3, WoundId(0)), (p4, WoundId(1)), (p5, WoundId(2))] {
+            let outcome = original.apply(Command::InflictWound {
+                patient,
+                wound: base_wound,
+            });
+            assert_eq!(outcome.clock, 0);
+            assert_eq!(outcome.error, None);
+            assert_eq!(outcome.blocked, None);
+            assert_eq!(
+                outcome.events,
+                vec![TimedEvent {
+                    at: 0,
+                    event: Event::WoundInflicted {
+                        id,
+                        patient,
+                        wound: base_wound,
+                    },
+                }]
+            );
+        }
+        let start0 = original.apply(Command::StartTreatment {
+            medic: m1,
+            patient: p3,
+            wound: Some(WoundId(0)),
+            kind: TreatmentKind::Hemostatic,
+        });
+        assert_eq!(
+            start0,
+            ApplyOutcome {
+                clock: 0,
+                events: vec![TimedEvent {
+                    at: 0,
+                    event: Event::TreatmentStarted {
+                        id: TreatmentId(0),
+                        medic: m1,
+                        patient: p3,
+                        wound: Some(WoundId(0)),
+                        kind: TreatmentKind::Hemostatic,
+                        completes_at: 10,
+                        consumed: HEMOSTATIC_COST,
+                    },
+                }],
+                error: None,
+                blocked: None,
+            }
+        );
+        let start1 = original.apply(Command::StartTreatment {
+            medic: m2,
+            patient: p4,
+            wound: Some(WoundId(1)),
+            kind: TreatmentKind::Hemostatic,
+        });
+        assert_eq!(
+            start1.events,
+            vec![TimedEvent {
+                at: 0,
+                event: Event::TreatmentStarted {
+                    id: TreatmentId(1),
+                    medic: m2,
+                    patient: p4,
+                    wound: Some(WoundId(1)),
+                    kind: TreatmentKind::Hemostatic,
+                    completes_at: 10,
+                    consumed: HEMOSTATIC_COST,
+                },
+            }]
+        );
+        assert_eq!(
+            (start1.clock, start1.error, start1.blocked),
+            (0, None, None)
+        );
+        let interrupted1 = original.apply(Command::InterruptTreatment { id: TreatmentId(1) });
+        assert_eq!(
+            interrupted1,
+            ApplyOutcome {
+                clock: 0,
+                events: vec![TimedEvent {
+                    at: 0,
+                    event: Event::TreatmentInterrupted {
+                        id: TreatmentId(1),
+                        reason: InterruptionReason::Explicit,
+                    },
+                }],
+                error: None,
+                blocked: None,
+            }
+        );
+        let completed0 = original.apply(Command::AdvanceTo { target: 10 });
+        assert_eq!(
+            completed0.events,
+            vec![
+                TimedEvent {
+                    at: 10,
+                    event: Event::TreatmentCompleted {
+                        id: TreatmentId(0),
+                        medic: m1,
+                        patient: p3,
+                        kind: TreatmentKind::Hemostatic,
+                    },
+                },
+                TimedEvent {
+                    at: 10,
+                    event: Event::RecoveryChanged {
+                        id: p3,
+                        before: false,
+                        after: true,
+                        next_at: Some(15),
+                    },
+                },
+                TimedEvent {
+                    at: 10,
+                    event: Event::TimeAdvanced {
+                        from: 0,
+                        to: 10,
+                        hot_cells_stepped: 0,
+                        fixed_steps_per_hot_cell: 0,
+                    },
+                },
+            ]
+        );
+        assert_eq!(
+            (completed0.clock, completed0.error, completed0.blocked),
+            (10, None, None)
+        );
+        let to12 = original.apply(Command::AdvanceTo { target: 12 });
+        assert_eq!(
+            to12,
+            ApplyOutcome {
+                clock: 12,
+                events: vec![TimedEvent {
+                    at: 12,
+                    event: Event::TimeAdvanced {
+                        from: 10,
+                        to: 12,
+                        hot_cells_stepped: 0,
+                        fixed_steps_per_hot_cell: 0,
+                    },
+                }],
+                error: None,
+                blocked: None,
+            }
+        );
+        let start2 = original.apply(Command::StartTreatment {
+            medic: m0,
+            patient: p5,
+            wound: Some(WoundId(2)),
+            kind: TreatmentKind::Hemostatic,
+        });
+        assert_eq!(
+            start2.events,
+            vec![TimedEvent {
+                at: 12,
+                event: Event::TreatmentStarted {
+                    id: TreatmentId(2),
+                    medic: m0,
+                    patient: p5,
+                    wound: Some(WoundId(2)),
+                    kind: TreatmentKind::Hemostatic,
+                    completes_at: 22,
+                    consumed: HEMOSTATIC_COST,
+                },
+            }]
+        );
+        assert_eq!(
+            (start2.clock, start2.error, start2.blocked),
+            (12, None, None)
+        );
+
+        let expected_wounds0 = BTreeMap::from([
+            (
+                WoundId(0),
+                Wound {
+                    id: WoundId(0),
+                    patient: p3,
+                    created_at: 0,
+                    spec: base_wound,
+                    controlled: true,
+                    healed: false,
+                },
+            ),
+            (
+                WoundId(1),
+                Wound {
+                    id: WoundId(1),
+                    patient: p4,
+                    created_at: 0,
+                    spec: base_wound,
+                    controlled: false,
+                    healed: false,
+                },
+            ),
+            (
+                WoundId(2),
+                Wound {
+                    id: WoundId(2),
+                    patient: p5,
+                    created_at: 0,
+                    spec: base_wound,
+                    controlled: false,
+                    healed: false,
+                },
+            ),
+        ]);
+        let expected_treatments0 = BTreeMap::from([
+            (
+                TreatmentId(0),
+                Treatment {
+                    id: TreatmentId(0),
+                    medic: m1,
+                    patient: p3,
+                    wound: Some(WoundId(0)),
+                    kind: TreatmentKind::Hemostatic,
+                    started_at: 0,
+                    completes_at: 10,
+                    consumed: 1,
+                    status: TreatmentStatus::Completed { at: 10 },
+                },
+            ),
+            (
+                TreatmentId(1),
+                Treatment {
+                    id: TreatmentId(1),
+                    medic: m2,
+                    patient: p4,
+                    wound: Some(WoundId(1)),
+                    kind: TreatmentKind::Hemostatic,
+                    started_at: 0,
+                    completes_at: 10,
+                    consumed: 1,
+                    status: TreatmentStatus::Interrupted {
+                        at: 0,
+                        reason: InterruptionReason::Explicit,
+                    },
+                },
+            ),
+            (
+                TreatmentId(2),
+                Treatment {
+                    id: TreatmentId(2),
+                    medic: m0,
+                    patient: p5,
+                    wound: Some(WoundId(2)),
+                    kind: TreatmentKind::Hemostatic,
+                    started_at: 12,
+                    completes_at: 22,
+                    consumed: 1,
+                    status: TreatmentStatus::Active,
+                },
+            ),
+        ]);
+        let expected_active0 = BTreeMap::from([(m0, TreatmentId(2)), (p5, TreatmentId(2))]);
+        assert_canonical_checkpoint(
+            "initial original",
+            &original,
+            12,
+            3,
+            3,
+            &expected_wounds0,
+            &expected_treatments0,
+            &expected_active0,
+            3,
+            0,
+        );
+        assert_eq!(
+            original.casualty[&p3],
+            CasualtyState {
+                blood: 4_980,
+                shock: 102,
+                shock_remainder: 0,
+                incapacitated: false,
+                recovering: true,
+                recovery_next_at: Some(15),
+                materialized_at: 10
+            }
+        );
+        let initial_bytes = original.snapshot();
+        let initial_digest = original.state_digest();
+        let restored = World::from_snapshot(&initial_bytes).unwrap();
+        assert_canonical_checkpoint(
+            "initial restore",
+            &restored,
+            12,
+            3,
+            3,
+            &expected_wounds0,
+            &expected_treatments0,
+            &expected_active0,
+            3,
+            0,
+        );
+        assert_eq!(
+            restored.casualty[&p3],
+            CasualtyState {
+                blood: 4_980,
+                shock: 102,
+                shock_remainder: 0,
+                incapacitated: false,
+                recovering: true,
+                recovery_next_at: Some(15),
+                materialized_at: 10
+            }
+        );
+        assert_eq!(restored.snapshot(), initial_bytes);
+        assert_eq!(restored.state_digest(), initial_digest);
+
+        fn run_suffix(mut world: World, label: &str) -> (World, Vec<TimedEvent>) {
+            let m0 = EntityId::from_parts(0, 0);
+            let m1 = EntityId::from_parts(1, 0);
+            let p4 = EntityId::from_parts(4, 0);
+            let p5 = EntityId::from_parts(5, 0);
+            let future = WoundSpec {
+                trauma: 10,
+                bleeding_per_second: 1,
+                shock: 10,
+            };
+            let w3 = world.apply(Command::InflictWound {
+                patient: p4,
+                wound: future,
+            });
+            assert_eq!(
+                w3.events,
+                vec![TimedEvent {
+                    at: 12,
+                    event: Event::WoundInflicted {
+                        id: WoundId(3),
+                        patient: p4,
+                        wound: future
+                    }
+                }],
+                "{label}: future wound"
+            );
+            assert_eq!((w3.clock, w3.error, w3.blocked), (12, None, None));
+            let request = world.apply(Command::RequestTreatment {
+                patient: p4,
+                wound: Some(WoundId(3)),
+                kind: TreatmentKind::Hemostatic,
+            });
+            assert_eq!(
+                request.events,
+                vec![TimedEvent {
+                    at: 12,
+                    event: Event::TreatmentStarted {
+                        id: TreatmentId(3),
+                        medic: m1,
+                        patient: p4,
+                        wound: Some(WoundId(3)),
+                        kind: TreatmentKind::Hemostatic,
+                        completes_at: 22,
+                        consumed: 1
+                    }
+                }],
+                "{label}: selected lowest eligible"
+            );
+            assert_eq!(
+                (request.clock, request.error, request.blocked),
+                (12, None, None)
+            );
+            let explicit = world.apply(Command::InterruptTreatment { id: TreatmentId(3) });
+            assert_eq!(
+                explicit,
+                ApplyOutcome {
+                    clock: 12,
+                    events: vec![TimedEvent {
+                        at: 12,
+                        event: Event::TreatmentInterrupted {
+                            id: TreatmentId(3),
+                            reason: InterruptionReason::Explicit
+                        }
+                    }],
+                    error: None,
+                    blocked: None
+                },
+                "{label}: explicit interruption"
+            );
+            let restart = world.apply(Command::RequestTreatment {
+                patient: p4,
+                wound: Some(WoundId(3)),
+                kind: TreatmentKind::Hemostatic,
+            });
+            assert_eq!(
+                restart.events,
+                vec![TimedEvent {
+                    at: 12,
+                    event: Event::TreatmentStarted {
+                        id: TreatmentId(4),
+                        medic: m1,
+                        patient: p4,
+                        wound: Some(WoundId(3)),
+                        kind: TreatmentKind::Hemostatic,
+                        completes_at: 22,
+                        consumed: 1
+                    }
+                }],
+                "{label}: restart"
+            );
+            assert_eq!(
+                (restart.clock, restart.error, restart.blocked),
+                (12, None, None)
+            );
+            let fatal_spec = WoundSpec {
+                trauma: 1000,
+                bleeding_per_second: 0,
+                shock: 0,
+            };
+            let fatal = world.apply(Command::InflictWound {
+                patient: p5,
+                wound: fatal_spec,
+            });
+            assert_eq!(
+                fatal.events,
+                vec![
+                    TimedEvent {
+                        at: 12,
+                        event: Event::WoundInflicted {
+                            id: WoundId(4),
+                            patient: p5,
+                            wound: fatal_spec
+                        }
+                    },
+                    TimedEvent {
+                        at: 12,
+                        event: Event::SoldierDied {
+                            id: p5,
+                            cause: DeathCause::ImmediateTrauma,
+                            health_before: 950
+                        }
+                    },
+                    TimedEvent {
+                        at: 12,
+                        event: Event::TreatmentInterrupted {
+                            id: TreatmentId(2),
+                            reason: InterruptionReason::PatientDied
+                        }
+                    },
+                ],
+                "{label}: automatic death interruption"
+            );
+            assert_eq!((fatal.clock, fatal.error, fatal.blocked), (12, None, None));
+            let removed = world.apply(Command::DespawnSoldier { id: p5 });
+            assert_eq!(
+                removed.events,
+                vec![TimedEvent {
+                    at: 12,
+                    event: Event::SoldierRemoved {
+                        id: p5,
+                        loadout: Loadout {
+                            ammunition: 0,
+                            food: 2,
+                            water: 2,
+                            medical: 0
+                        }
+                    }
+                }],
+                "{label}: removal"
+            );
+            assert_eq!(
+                (removed.clock, removed.error, removed.blocked),
+                (12, None, None)
+            );
+            let replacement = EntityId::from_parts(5, 1);
+            let spawned = world.apply(Command::SpawnSoldier {
+                spec: literal_spec(Role::Rifle, 0),
+            });
+            assert_eq!(
+                spawned.events,
+                vec![TimedEvent {
+                    at: 12,
+                    event: Event::SoldierSpawned {
+                        id: replacement,
+                        loadout: Loadout {
+                            ammunition: 0,
+                            food: 2,
+                            water: 2,
+                            medical: 0
+                        }
+                    }
+                }],
+                "{label}: generation reuse"
+            );
+            assert_eq!(
+                (spawned.clock, spawned.error, spawned.blocked),
+                (12, None, None)
+            );
+            let stale_bytes = world.snapshot();
+            let stale_digest = world.state_digest();
+            let stale = world.apply(Command::InflictWound {
+                patient: p5,
+                wound: future,
+            });
+            assert_eq!(stale.events, Vec::<TimedEvent>::new());
+            assert_eq!(stale.error, Some(SimError::InvalidEntity));
+            assert_eq!(stale.blocked, None);
+            assert_eq!(world.snapshot(), stale_bytes);
+            assert_eq!(world.state_digest(), stale_digest);
+            let post_reuse_wound = world.apply(Command::InflictWound {
+                patient: replacement,
+                wound: future,
+            });
+            assert_eq!(
+                post_reuse_wound.events,
+                vec![TimedEvent {
+                    at: 12,
+                    event: Event::WoundInflicted {
+                        id: WoundId(5),
+                        patient: replacement,
+                        wound: future
+                    }
+                }]
+            );
+            let post_reuse_request = world.apply(Command::RequestTreatment {
+                patient: replacement,
+                wound: Some(WoundId(5)),
+                kind: TreatmentKind::Hemostatic,
+            });
+            assert_eq!(
+                post_reuse_request.events,
+                vec![TimedEvent {
+                    at: 12,
+                    event: Event::TreatmentStarted {
+                        id: TreatmentId(5),
+                        medic: m0,
+                        patient: replacement,
+                        wound: Some(WoundId(5)),
+                        kind: TreatmentKind::Hemostatic,
+                        completes_at: 22,
+                        consumed: 1
+                    }
+                }]
+            );
+            assert_eq!(world.next_wound_id, 6);
+            assert_eq!(world.next_treatment_id, 6);
+            assert_eq!(world.consumed_medical, 6);
+            assert_eq!(world.lost_medical, 0);
+            let later = world.snapshot();
+            let later_digest = world.state_digest();
+            let mut later_restore = World::from_snapshot(&later).unwrap();
+            assert_eq!(
+                later_restore.snapshot(),
+                later,
+                "{label}: later checkpoint bytes"
+            );
+            assert_eq!(
+                later_restore.state_digest(),
+                later_digest,
+                "{label}: later checkpoint digest"
+            );
+            assert_eq!(later_restore.next_wound_id, 6);
+            assert_eq!(later_restore.next_treatment_id, 6);
+            assert_eq!(later_restore.active_by_entity, world.active_by_entity);
+            assert_eq!(later_restore.treatment_due, world.treatment_due);
+            assert_eq!(later_restore.due_by_treatment, world.due_by_treatment);
+            assert_eq!(
+                later_restore.wound_ids_by_patient,
+                world.wound_ids_by_patient
+            );
+            assert_eq!(
+                later_restore.bleeding_rate_by_patient,
+                world.bleeding_rate_by_patient
+            );
+
+            let advanced = world.apply(Command::AdvanceTo { target: 22 });
+            let expected = vec![
+                TimedEvent {
+                    at: 15,
+                    event: Event::RecoveryTicked {
+                        id: EntityId::from_parts(3, 0),
+                        blood_before: 4_980,
+                        blood_after: 5_000,
+                        shock_before: 102,
+                        shock_after: 52,
+                        health_before: 950,
+                        health_after: 975,
+                    },
+                },
+                TimedEvent {
+                    at: 20,
+                    event: Event::RecoveryTicked {
+                        id: EntityId::from_parts(3, 0),
+                        blood_before: 5_000,
+                        blood_after: 5_000,
+                        shock_before: 52,
+                        shock_after: 2,
+                        health_before: 975,
+                        health_after: 1_000,
+                    },
+                },
+                TimedEvent {
+                    at: 22,
+                    event: Event::TreatmentCompleted {
+                        id: TreatmentId(4),
+                        medic: m1,
+                        patient: p4,
+                        kind: TreatmentKind::Hemostatic,
+                    },
+                },
+                TimedEvent {
+                    at: 22,
+                    event: Event::TreatmentCompleted {
+                        id: TreatmentId(5),
+                        medic: m0,
+                        patient: replacement,
+                        kind: TreatmentKind::Hemostatic,
+                    },
+                },
+                TimedEvent {
+                    at: 22,
+                    event: Event::RecoveryChanged {
+                        id: replacement,
+                        before: false,
+                        after: true,
+                        next_at: Some(27),
+                    },
+                },
+                TimedEvent {
+                    at: 22,
+                    event: Event::TimeAdvanced {
+                        from: 12,
+                        to: 22,
+                        hot_cells_stepped: 0,
+                        fixed_steps_per_hot_cell: 0,
+                    },
+                },
+            ];
+            assert_eq!(advanced.events, expected, "{label}: completion boundary");
+            let resumed_advanced = later_restore.apply(Command::AdvanceTo { target: 22 });
+            assert_eq!(
+                resumed_advanced, advanced,
+                "{label}: cleanup checkpoint suffix"
+            );
+            assert_eq!(advanced.clock, 22);
+            assert_eq!(advanced.error, None);
+            assert_eq!(advanced.blocked, None);
+            assert_eq!(later_restore.snapshot(), world.snapshot());
+            assert_eq!(later_restore.state_digest(), world.state_digest());
+
+            let completion_bytes = world.snapshot();
+            let completion_digest = world.state_digest();
+            let mut completion_restore = World::from_snapshot(&completion_bytes).unwrap();
+            assert_eq!(completion_restore.snapshot(), completion_bytes);
+            assert_eq!(completion_restore.state_digest(), completion_digest);
+            assert_eq!(completion_restore.next_wound_id, 6);
+            assert_eq!(completion_restore.next_treatment_id, 6);
+            assert_eq!(completion_restore.consumed_medical, 6);
+            assert_eq!(completion_restore.lost_medical, 0);
+
+            let final_advance = world.apply(Command::AdvanceTo { target: 60 });
+            assert_eq!(final_advance.clock, 60);
+            assert_eq!(final_advance.error, None);
+            assert_eq!(final_advance.blocked, None);
+            let resumed_final = later_restore.apply(Command::AdvanceTo { target: 60 });
+            let completion_resumed_final =
+                completion_restore.apply(Command::AdvanceTo { target: 60 });
+            assert_eq!(
+                resumed_final, final_advance,
+                "{label}: cleanup restore final suffix"
+            );
+            assert_eq!(
+                completion_resumed_final, final_advance,
+                "{label}: completion restore final suffix"
+            );
+            assert_eq!(later_restore.snapshot(), world.snapshot());
+            assert_eq!(completion_restore.snapshot(), world.snapshot());
+            assert_eq!(later_restore.state_digest(), world.state_digest());
+            assert_eq!(completion_restore.state_digest(), world.state_digest());
+            (
+                world,
+                [
+                    w3.events,
+                    request.events,
+                    explicit.events,
+                    restart.events,
+                    fatal.events,
+                    removed.events,
+                    spawned.events,
+                    post_reuse_wound.events,
+                    post_reuse_request.events,
+                    advanced.events,
+                    final_advance.events,
+                ]
+                .concat(),
+            )
+        }
+
+        let (final_original, history_original) = run_suffix(original, "original");
+        let (final_restored, history_restored) = run_suffix(restored, "restored");
+        assert_eq!(history_original, history_restored);
+        assert_eq!(final_original.snapshot(), final_restored.snapshot());
+        assert_eq!(final_original.state_digest(), final_restored.state_digest());
+        assert_eq!(final_original.next_wound_id, 6);
+        assert_eq!(final_original.next_treatment_id, 6);
+        assert_eq!(final_original.consumed_medical, 6);
+        assert_eq!(final_original.lost_medical, 0);
+        assert_eq!(final_original.soldiers.generation[5], 1);
+        assert!(final_original.soldiers.valid(EntityId::from_parts(5, 1)));
+        assert!(!final_original.soldiers.valid(EntityId::from_parts(5, 0)));
+    }
+
+    #[test]
     fn gate_c1_all_six_death_causes_preserve_medical_history() {
         #[derive(Clone)]
         struct ExpectedDeath {
