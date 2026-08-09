@@ -919,9 +919,10 @@ fn memory_kib() -> (u64, u64) {
 mod tests {
     use super::*;
     use sim_core::{
-        CasualtyState, EntityId, InterruptionReason, Inventory, ResourceTotals, Role, Treatment,
-        TreatmentStatus, Wound, BLOOD_MAX, HEMOSTATIC_COST, HEMOSTATIC_DURATION,
-        SHOCK_TREATMENT_COST, SHOCK_TREATMENT_DURATION,
+        Activity, CasualtyState, EntityId, InterruptionReason, Inventory, LifeState, LivingState,
+        Needs, Position, ResourceTotals, Role, Soldier, Treatment, TreatmentStatus, Wound,
+        BLOOD_MAX, HEMOSTATIC_COST, HEMOSTATIC_DURATION, SHOCK_TREATMENT_COST,
+        SHOCK_TREATMENT_DURATION,
     };
     use std::net::Shutdown;
     use std::thread;
@@ -1101,60 +1102,72 @@ mod tests {
 
     #[test]
     fn gate_c2_legacy_real_http_compatibility_and_wrong_typed_extras() {
+        struct LegacySuccess {
+            name: &'static str,
+            body: &'static str,
+            response: Value,
+            clock: u64,
+            stock: Option<Stock>,
+            totals: ResourceTotals,
+            digest: u64,
+        }
         let legacy = [
-            (
-                "null-heavy create_stockpile",
-                r#"{"version":1,"command":"create_stockpile","id":7,"ammunition":9,"supplies":3,"target":null,"from":null,"to":null,"cell":null,"hot":null,"at":null,"activity":null,"patient":null,"medic":null,"wound":null,"trauma":null,"bleeding_per_second":null,"shock":null,"kind":null,"treatment":null}"#,
-                json!({"version":1,"clock":0,"events":[{"at":0,"event":{"type":"stockpile_created","id":7,"initial":{"ammunition":9,"supplies":3}}}],"terminal_error":null,"blocked":null,"digest":"c333945e80f9b8d1"}),
-                Some(Stock {
+            LegacySuccess {
+                name: "null-heavy create_stockpile",
+                body: r#"{"version":1,"command":"create_stockpile","id":7,"ammunition":9,"supplies":3,"target":null,"from":null,"to":null,"cell":null,"hot":null,"at":null,"activity":null,"patient":null,"medic":null,"wound":null,"trauma":null,"bleeding_per_second":null,"shock":null,"kind":null,"treatment":null}"#,
+                response: json!({"version":1,"clock":0,"events":[{"at":0,"event":{"type":"stockpile_created","id":7,"initial":{"ammunition":9,"supplies":3}}}],"terminal_error":null,"blocked":null,"digest":"c333945e80f9b8d1"}),
+                clock: 0,
+                stock: Some(Stock {
                     ammunition: 9,
                     supplies: 3,
                 }),
-            ),
-            (
-                "null-heavy advance_to",
-                r#"{"version":1,"command":"advance_to","target":1,"id":null,"from":null,"to":null,"ammunition":null,"supplies":null,"cell":null,"hot":null,"at":null,"activity":null,"patient":null,"medic":null,"wound":null,"trauma":null,"bleeding_per_second":null,"shock":null,"kind":null,"treatment":null}"#,
-                json!({"version":1,"clock":1,"events":[{"at":1,"event":{"type":"time_advanced","from":0,"to":1,"hot_cells_stepped":0,"fixed_steps_per_hot_cell":0}}],"terminal_error":null,"blocked":null,"digest":"4215b2950c54e5bc"}),
-                None,
-            ),
+                totals: ResourceTotals {
+                    ammunition: 9,
+                    stockpile_supplies: 3,
+                    carried_food: 0,
+                    carried_water: 0,
+                    carried_medical: 0,
+                    sourced_food: 0,
+                    sourced_water: 0,
+                    consumed_food: 0,
+                    consumed_water: 0,
+                    lost_food: 0,
+                    lost_water: 0,
+                    sourced_medical: 0,
+                    consumed_medical: 0,
+                    lost_medical: 0,
+                },
+                digest: 0xc333_945e_80f9_b8d1,
+            },
+            LegacySuccess {
+                name: "null-heavy advance_to",
+                body: r#"{"version":1,"command":"advance_to","target":1,"id":null,"from":null,"to":null,"ammunition":null,"supplies":null,"cell":null,"hot":null,"at":null,"activity":null,"patient":null,"medic":null,"wound":null,"trauma":null,"bleeding_per_second":null,"shock":null,"kind":null,"treatment":null}"#,
+                response: json!({"version":1,"clock":1,"events":[{"at":1,"event":{"type":"time_advanced","from":0,"to":1,"hot_cells_stepped":0,"fixed_steps_per_hot_cell":0}}],"terminal_error":null,"blocked":null,"digest":"4215b2950c54e5bc"}),
+                clock: 1,
+                stock: None,
+                totals: literal_resource_totals(0, 0, 0),
+                digest: 0x4215_b295_0c54_e5bc,
+            },
         ];
-        for (name, body, expected, stock) in legacy {
+        for fixture in legacy {
             let initial = World::new(31);
-            assert_eq!(initial.clock(), 0, "{name}");
-            assert_eq!(initial.soldier_count(), 0, "{name}");
+            assert_eq!(initial.clock(), 0, "{}", fixture.name);
+            assert_eq!(initial.soldier_count(), 0, "{}", fixture.name);
             assert_eq!(
                 initial.resource_totals(),
                 ResourceTotals::default(),
-                "{name}"
+                "{}",
+                fixture.name
             );
-            assert_eq!(initial.stockpile(7), None, "{name}");
-            let (response, world) = exchange(req(body), false, initial);
-            assert_eq!(status(&response), "HTTP/1.1 200 OK", "{name}");
-            assert_eq!(json_body(&response), expected, "{name}");
-            let expected_clock = if name == "null-heavy advance_to" {
-                1
-            } else {
-                0
-            };
-            let expected_resources = if stock.is_some() {
-                ResourceTotals {
-                    ammunition: 9,
-                    stockpile_supplies: 3,
-                    ..ResourceTotals::default()
-                }
-            } else {
-                ResourceTotals::default()
-            };
-            assert_eq!(world.clock(), expected_clock, "{name}");
-            assert_eq!(world.soldier_count(), 0, "{name}");
-            assert_eq!(world.stockpile(7), stock, "{name}");
-            assert_eq!(world.resource_totals(), expected_resources, "{name}");
-            let expected_digest = if stock.is_some() {
-                0xc333_945e_80f9_b8d1
-            } else {
-                0x4215_b295_0c54_e5bc
-            };
-            canonical_restore(&world, expected_digest);
+            assert_eq!(initial.stockpile(7), None, "{}", fixture.name);
+            let (response, world) = exchange(req(fixture.body), false, initial);
+            assert_eq!(status(&response), "HTTP/1.1 200 OK", "{}", fixture.name);
+            assert_eq!(json_body(&response), fixture.response, "{}", fixture.name);
+            assert_eq!(world.clock(), fixture.clock, "{}", fixture.name);
+            assert_eq!(world.soldier_count(), 0, "{}", fixture.name);
+            assert_eq!(world.stockpile(7), fixture.stock, "{}", fixture.name);
+            assert_eq!(world.resource_totals(), fixture.totals, "{}", fixture.name);
+            canonical_restore(&world, fixture.digest);
         }
 
         let wrong_typed_extras = [
@@ -1455,6 +1468,312 @@ mod tests {
         );
     }
 
+    fn literal_resource_totals(
+        carried_medical: u128,
+        sourced_medical: u128,
+        consumed_medical: u128,
+    ) -> ResourceTotals {
+        ResourceTotals {
+            ammunition: 0,
+            stockpile_supplies: 0,
+            carried_food: 0,
+            carried_water: 0,
+            carried_medical,
+            sourced_food: 0,
+            sourced_water: 0,
+            consumed_food: 0,
+            consumed_water: 0,
+            lost_food: 0,
+            lost_water: 0,
+            sourced_medical,
+            consumed_medical,
+            lost_medical: 0,
+        }
+    }
+
+    #[derive(Clone)]
+    struct PublicMedicalFixture {
+        name: &'static str,
+        clock: u64,
+        soldiers: Vec<Soldier>,
+        absent_soldiers: Vec<EntityId>,
+        wounds: Vec<Wound>,
+        absent_wounds: Vec<WoundId>,
+        casualties: Vec<(EntityId, Option<CasualtyState>)>,
+        treatments: Vec<Treatment>,
+        absent_treatments: Vec<TreatmentId>,
+        totals: ResourceTotals,
+        digest: u64,
+    }
+
+    impl PublicMedicalFixture {
+        fn assert_world(&self, world: &World) {
+            assert_eq!(world.clock(), self.clock, "{} clock", self.name);
+            assert_eq!(
+                world.soldier_count(),
+                self.soldiers.len(),
+                "{} count",
+                self.name
+            );
+            for expected in &self.soldiers {
+                assert_eq!(
+                    world.soldier(expected.id),
+                    Some(*expected),
+                    "{} soldier {:?}",
+                    self.name,
+                    expected.id
+                );
+            }
+            for id in &self.absent_soldiers {
+                assert_eq!(
+                    world.soldier(*id),
+                    None,
+                    "{} absent soldier {id:?}",
+                    self.name
+                );
+            }
+            for expected in &self.wounds {
+                assert_eq!(
+                    world.wound(expected.id),
+                    Some(*expected),
+                    "{} wound {:?}",
+                    self.name,
+                    expected.id
+                );
+            }
+            let mut by_patient = BTreeMap::<EntityId, Vec<Wound>>::new();
+            for wound in &self.wounds {
+                by_patient.entry(wound.patient).or_default().push(*wound);
+            }
+            for (patient, expected) in by_patient {
+                assert_eq!(
+                    world.wounds_of(patient),
+                    expected,
+                    "{} wounds_of {patient:?}",
+                    self.name
+                );
+            }
+            for id in &self.absent_wounds {
+                assert_eq!(world.wound(*id), None, "{} absent wound {id:?}", self.name);
+            }
+            for (id, expected) in &self.casualties {
+                assert_eq!(
+                    world.casualty_state(*id),
+                    *expected,
+                    "{} casualty {id:?}",
+                    self.name
+                );
+            }
+            for expected in &self.treatments {
+                assert_eq!(
+                    world.treatment(expected.id),
+                    Some(*expected),
+                    "{} treatment {:?}",
+                    self.name,
+                    expected.id
+                );
+            }
+            for id in &self.absent_treatments {
+                assert_eq!(
+                    world.treatment(*id),
+                    None,
+                    "{} absent treatment {id:?}",
+                    self.name
+                );
+            }
+            assert_eq!(
+                world.resource_totals(),
+                self.totals,
+                "{} resources",
+                self.name
+            );
+            assert_eq!(world.state_digest(), self.digest, "{} digest", self.name);
+        }
+    }
+
+    fn literal_living(clock: u64, health: u16) -> LivingState {
+        LivingState {
+            hunger: u32::try_from(clock).unwrap(),
+            thirst: u32::try_from(clock * 2).unwrap(),
+            fatigue: u32::try_from(clock).unwrap(),
+            sleep_debt: u32::try_from(clock).unwrap(),
+            morale: 1000,
+            health,
+            activity: Activity::Idle,
+            life: LifeState::Alive,
+            materialized_at: clock,
+        }
+    }
+
+    fn literal_soldier(id: EntityId, role: Role, medical: u32, health: u16, clock: u64) -> Soldier {
+        Soldier {
+            id,
+            faction: 0,
+            position: Position {
+                x_mm: 0,
+                y_mm: 0,
+                cell: 0,
+            },
+            squad: None,
+            role,
+            rank: 0,
+            health,
+            needs: Needs {
+                fatigue: u32::try_from(clock).unwrap(),
+                hunger: u32::try_from(clock).unwrap(),
+                thirst: u32::try_from(clock * 2).unwrap(),
+                sleep_debt: u32::try_from(clock).unwrap(),
+            },
+            ammunition: 0,
+            inventory: Inventory {
+                food: 0,
+                water: 0,
+                medical,
+            },
+            living: literal_living(clock, health),
+        }
+    }
+
+    fn verified_restore(world: &World, fixture: &PublicMedicalFixture) -> World {
+        fixture.assert_world(world);
+        let bytes = world.snapshot();
+        let restored = World::from_snapshot(&bytes).unwrap();
+        fixture.assert_world(&restored);
+        assert_eq!(restored.snapshot(), bytes, "{} bytes", fixture.name);
+        assert_eq!(
+            restored.state_digest(),
+            world.state_digest(),
+            "{} parity",
+            fixture.name
+        );
+        restored
+    }
+
+    fn interrupted_fixture(
+        name: &'static str,
+        clock: u64,
+        medic_medical: u32,
+        treatment: Option<TreatmentStatus>,
+        digest: u64,
+    ) -> PublicMedicalFixture {
+        let medic = EntityId::from_parts(0, 0);
+        let patient = EntityId::from_parts(1, 0);
+        let casualty = if clock == 0 {
+            CasualtyState {
+                blood: 5000,
+                shock: 30,
+                shock_remainder: 0,
+                incapacitated: false,
+                recovering: false,
+                recovery_next_at: None,
+                materialized_at: 0,
+            }
+        } else {
+            CasualtyState {
+                blood: 4600,
+                shock: 70,
+                shock_remainder: 0,
+                incapacitated: false,
+                recovering: false,
+                recovery_next_at: None,
+                materialized_at: clock,
+            }
+        };
+        PublicMedicalFixture {
+            name,
+            clock,
+            soldiers: vec![
+                literal_soldier(medic, Role::Medic, medic_medical, 1000, clock),
+                literal_soldier(patient, Role::Rifle, 0, 990, clock),
+            ],
+            absent_soldiers: vec![EntityId::from_parts(2, 0), EntityId::from_parts(0, 1)],
+            wounds: vec![Wound {
+                id: WoundId(0),
+                patient,
+                created_at: 0,
+                spec: WoundSpec {
+                    trauma: 10,
+                    bleeding_per_second: 20,
+                    shock: 30,
+                },
+                controlled: false,
+                healed: false,
+            }],
+            absent_wounds: vec![WoundId(1), WoundId(99)],
+            casualties: vec![(medic, None), (patient, Some(casualty))],
+            treatments: treatment
+                .into_iter()
+                .map(|status| Treatment {
+                    id: TreatmentId(0),
+                    medic,
+                    patient,
+                    wound: Some(WoundId(0)),
+                    kind: TreatmentKind::Hemostatic,
+                    started_at: 0,
+                    completes_at: 10,
+                    consumed: 1,
+                    status,
+                })
+                .collect(),
+            absent_treatments: vec![TreatmentId(1), TreatmentId(99)],
+            totals: literal_resource_totals(
+                u128::from(medic_medical),
+                5,
+                u128::from(5 - medic_medical),
+            ),
+            digest,
+        }
+    }
+
+    fn healing_fixture(
+        name: &'static str,
+        clock: u64,
+        patient_health: u16,
+        medical: (CasualtyState, bool, bool, TreatmentStatus),
+        digest: u64,
+    ) -> PublicMedicalFixture {
+        let (casualty, controlled, healed, status) = medical;
+        let medic = EntityId::from_parts(0, 0);
+        let patient = EntityId::from_parts(1, 0);
+        PublicMedicalFixture {
+            name,
+            clock,
+            soldiers: vec![
+                literal_soldier(medic, Role::Medic, 2, 1000, clock),
+                literal_soldier(patient, Role::Rifle, 0, patient_health, clock),
+            ],
+            absent_soldiers: vec![EntityId::from_parts(2, 0), EntityId::from_parts(0, 1)],
+            wounds: vec![Wound {
+                id: WoundId(0),
+                patient,
+                created_at: 0,
+                spec: WoundSpec {
+                    trauma: 10,
+                    bleeding_per_second: 20,
+                    shock: 30,
+                },
+                controlled,
+                healed,
+            }],
+            absent_wounds: vec![WoundId(1), WoundId(99)],
+            casualties: vec![(medic, None), (patient, Some(casualty))],
+            treatments: vec![Treatment {
+                id: TreatmentId(0),
+                medic,
+                patient,
+                wound: Some(WoundId(0)),
+                kind: TreatmentKind::Hemostatic,
+                started_at: 0,
+                completes_at: 10,
+                consumed: 1,
+                status,
+            }],
+            absent_treatments: vec![TreatmentId(1), TreatmentId(99)],
+            totals: literal_resource_totals(2, 3, 1),
+            digest,
+        }
+    }
+
     fn canonical_restore(world: &World, expected_digest: u64) {
         assert_eq!(world.state_digest(), expected_digest);
         let bytes = world.snapshot();
@@ -1466,9 +1785,10 @@ mod tests {
     #[test]
     fn gate_c2_f3_wound_hemostatic_interruption_and_late_advance() {
         let mut world = World::new(11);
-        let medic = spawn(&mut world, Role::Medic, 5);
-        let patient = spawn(&mut world, Role::Rifle, 0);
-        assert_eq!((medic.raw(), patient.raw()), (0, 1));
+        let medic = EntityId::from_parts(0, 0);
+        let patient = EntityId::from_parts(1, 0);
+        spawn_literal(&mut world, medic, Role::Medic, 5);
+        spawn_literal(&mut world, patient, Role::Rifle, 0);
         let wound_body = r#"{"version":1,"command":"inflict_wound","patient":1,"trauma":10,"bleeding_per_second":20,"shock":30}"#;
         let (response, after_wound) = exchange(req(wound_body), false, world);
         assert_eq!(status(&response), "HTTP/1.1 200 OK");
@@ -1505,7 +1825,39 @@ mod tests {
             })
         );
         assert_medical_totals(&after_wound, 5, 0);
-        canonical_restore(&after_wound, 0x1a64_4c80_0f5d_fd57);
+        let wound_fixture =
+            interrupted_fixture("direct post-wound", 0, 5, None, 0x1a64_4c80_0f5d_fd57);
+        let after_wound = verified_restore(&after_wound, &wound_fixture);
+        let mut wound_allocator_probe = World::from_snapshot(&after_wound.snapshot()).unwrap();
+        assert_eq!(
+            wound_allocator_probe.apply(Command::InflictWound {
+                patient,
+                wound: WoundSpec {
+                    trauma: 1,
+                    bleeding_per_second: 0,
+                    shock: 0
+                }
+            }),
+            sim_core::ApplyOutcome {
+                clock: 0,
+                events: vec![TimedEvent {
+                    at: 0,
+                    event: Event::WoundInflicted {
+                        id: WoundId(1),
+                        patient,
+                        wound: WoundSpec {
+                            trauma: 1,
+                            bleeding_per_second: 0,
+                            shock: 0
+                        }
+                    }
+                }],
+                error: None,
+                blocked: None
+            }
+        );
+        assert_eq!(wound_allocator_probe.wound(WoundId(2)), None);
+        assert_eq!(wound_allocator_probe.wounds_of(patient).len(), 2);
         let start_body = r#"{"version":1,"command":"start_treatment","medic":0,"patient":1,"wound":0,"kind":"hemostatic"}"#;
         let (response, active) = exchange(req(start_body), false, after_wound);
         assert_eq!(status(&response), "HTTP/1.1 200 OK");
@@ -1530,7 +1882,56 @@ mod tests {
             })
         );
         assert_medical_totals(&active, 4, 1);
-        canonical_restore(&active, 0xd3b2_b246_54f6_f170);
+        let active_fixture = interrupted_fixture(
+            "direct active",
+            0,
+            4,
+            Some(TreatmentStatus::Active),
+            0xd3b2_b246_54f6_f170,
+        );
+        let active = verified_restore(&active, &active_fixture);
+        let mut busy_probe = World::from_snapshot(&active.snapshot()).unwrap();
+        let endpoint = EntityId::from_parts(2, 0);
+        spawn_literal(&mut busy_probe, endpoint, Role::Rifle, 0);
+        assert_eq!(
+            busy_probe
+                .apply(Command::InflictWound {
+                    patient: endpoint,
+                    wound: WoundSpec {
+                        trauma: 1,
+                        bleeding_per_second: 1,
+                        shock: 1
+                    }
+                })
+                .events,
+            vec![TimedEvent {
+                at: 0,
+                event: Event::WoundInflicted {
+                    id: WoundId(1),
+                    patient: endpoint,
+                    wound: WoundSpec {
+                        trauma: 1,
+                        bleeding_per_second: 1,
+                        shock: 1
+                    }
+                }
+            }]
+        );
+        let busy_before = busy_probe.snapshot();
+        assert_eq!(
+            busy_probe.apply(Command::RequestTreatment {
+                patient: endpoint,
+                wound: Some(WoundId(1)),
+                kind: TreatmentKind::Hemostatic
+            }),
+            sim_core::ApplyOutcome {
+                clock: 0,
+                events: vec![],
+                error: Some(SimError::NoEligibleMedic),
+                blocked: None
+            }
+        );
+        assert_eq!(busy_probe.snapshot(), busy_before);
         let interrupt = r#"{"version":1,"command":"interrupt_treatment","treatment":0}"#;
         let (response, interrupted) = exchange(req(interrupt), false, active);
         assert_eq!(status(&response), "HTTP/1.1 200 OK");
@@ -1556,7 +1957,45 @@ mod tests {
             })
         );
         assert_medical_totals(&interrupted, 4, 1);
-        canonical_restore(&interrupted, 0xaa8a_d8b6_9e55_cfe2);
+        let interrupted_fixture_value = interrupted_fixture(
+            "direct interrupted",
+            0,
+            4,
+            Some(TreatmentStatus::Interrupted {
+                at: 0,
+                reason: InterruptionReason::Explicit,
+            }),
+            0xaa8a_d8b6_9e55_cfe2,
+        );
+        let interrupted = verified_restore(&interrupted, &interrupted_fixture_value);
+        let mut release_probe = World::from_snapshot(&interrupted.snapshot()).unwrap();
+        assert_eq!(
+            release_probe.apply(Command::StartTreatment {
+                medic,
+                patient,
+                wound: Some(WoundId(0)),
+                kind: TreatmentKind::Hemostatic
+            }),
+            sim_core::ApplyOutcome {
+                clock: 0,
+                events: vec![TimedEvent {
+                    at: 0,
+                    event: Event::TreatmentStarted {
+                        id: TreatmentId(1),
+                        medic,
+                        patient,
+                        wound: Some(WoundId(0)),
+                        kind: TreatmentKind::Hemostatic,
+                        completes_at: 10,
+                        consumed: 1
+                    }
+                }],
+                error: None,
+                blocked: None
+            }
+        );
+        assert_eq!(release_probe.treatment(TreatmentId(2)), None);
+        assert_eq!(release_probe.soldier(medic).unwrap().inventory.medical, 3);
         let before = interrupted.snapshot();
         let digest = interrupted.state_digest();
         let malformed =
@@ -1569,6 +2008,7 @@ mod tests {
         );
         assert_eq!(unchanged.snapshot(), before);
         assert_eq!(unchanged.state_digest(), digest);
+        interrupted_fixture_value.assert_world(&unchanged);
         let advance = r#"{"version":1,"command":"advance_to","target":20}"#;
         let (response, advanced) = exchange(req(advance), false, unchanged);
         assert_eq!(status(&response), "HTTP/1.1 200 OK");
@@ -1588,7 +2028,17 @@ mod tests {
         );
         assert!(!advanced.wound(WoundId(0)).unwrap().controlled);
         assert_medical_totals(&advanced, 4, 1);
-        canonical_restore(&advanced, 0x035c_8d0e_76da_8786);
+        let advanced_fixture = interrupted_fixture(
+            "direct clock 20",
+            20,
+            4,
+            Some(TreatmentStatus::Interrupted {
+                at: 0,
+                reason: InterruptionReason::Explicit,
+            }),
+            0x035c_8d0e_76da_8786,
+        );
+        verified_restore(&advanced, &advanced_fixture);
     }
 
     #[test]
@@ -1694,7 +2144,177 @@ mod tests {
                 materialized_at: 0
             })
         );
-        canonical_restore(&active, 0xd29a_c157_757f_3347);
+        let shock_fixture = PublicMedicalFixture {
+            name: "requested Shock active",
+            clock: 0,
+            soldiers: vec![
+                literal_soldier(m0, Role::Medic, 2, 1000, 0),
+                literal_soldier(m1, Role::Medic, 4, 1000, 0),
+                literal_soldier(patient, Role::Rifle, 0, 1000, 0),
+            ],
+            absent_soldiers: vec![EntityId::from_parts(3, 0), EntityId::from_parts(0, 1)],
+            wounds: vec![Wound {
+                id: WoundId(0),
+                patient,
+                created_at: 0,
+                spec: WoundSpec {
+                    trauma: 0,
+                    bleeding_per_second: 0,
+                    shock: 400,
+                },
+                controlled: false,
+                healed: false,
+            }],
+            absent_wounds: vec![WoundId(1), WoundId(99)],
+            casualties: vec![
+                (m0, None),
+                (m1, None),
+                (
+                    patient,
+                    Some(CasualtyState {
+                        blood: 5000,
+                        shock: 400,
+                        shock_remainder: 0,
+                        incapacitated: false,
+                        recovering: false,
+                        recovery_next_at: None,
+                        materialized_at: 0,
+                    }),
+                ),
+            ],
+            treatments: vec![Treatment {
+                id: TreatmentId(0),
+                medic: m0,
+                patient,
+                wound: None,
+                kind: TreatmentKind::Shock,
+                started_at: 0,
+                completes_at: 15,
+                consumed: 2,
+                status: TreatmentStatus::Active,
+            }],
+            absent_treatments: vec![TreatmentId(1), TreatmentId(99)],
+            totals: literal_resource_totals(6, 8, 2),
+            digest: 0xd29a_c157_757f_3347,
+        };
+        let active = verified_restore(&active, &shock_fixture);
+
+        let mut selection_probe = World::from_snapshot(&active.snapshot()).unwrap();
+        let patient2 = EntityId::from_parts(3, 0);
+        spawn_literal(&mut selection_probe, patient2, Role::Rifle, 0);
+        assert_eq!(
+            selection_probe
+                .apply(Command::InflictWound {
+                    patient: patient2,
+                    wound: WoundSpec {
+                        trauma: 0,
+                        bleeding_per_second: 0,
+                        shock: 400
+                    }
+                })
+                .events,
+            vec![TimedEvent {
+                at: 0,
+                event: Event::WoundInflicted {
+                    id: WoundId(1),
+                    patient: patient2,
+                    wound: WoundSpec {
+                        trauma: 0,
+                        bleeding_per_second: 0,
+                        shock: 400
+                    }
+                }
+            }]
+        );
+        assert_eq!(
+            selection_probe.apply(Command::RequestTreatment {
+                patient: patient2,
+                wound: None,
+                kind: TreatmentKind::Shock
+            }),
+            sim_core::ApplyOutcome {
+                clock: 0,
+                events: vec![TimedEvent {
+                    at: 0,
+                    event: Event::TreatmentStarted {
+                        id: TreatmentId(1),
+                        medic: m1,
+                        patient: patient2,
+                        wound: None,
+                        kind: TreatmentKind::Shock,
+                        completes_at: 15,
+                        consumed: 2
+                    }
+                }],
+                error: None,
+                blocked: None
+            }
+        );
+        assert_eq!(selection_probe.treatment(TreatmentId(2)), None);
+        assert_eq!(selection_probe.soldier(m0).unwrap().inventory.medical, 2);
+        assert_eq!(selection_probe.soldier(m1).unwrap().inventory.medical, 2);
+
+        let mut due_probe = World::from_snapshot(&active.snapshot()).unwrap();
+        assert_eq!(
+            due_probe.apply(Command::AdvanceTo { target: 14 }),
+            sim_core::ApplyOutcome {
+                clock: 14,
+                events: vec![TimedEvent {
+                    at: 14,
+                    event: Event::TimeAdvanced {
+                        from: 0,
+                        to: 14,
+                        hot_cells_stepped: 0,
+                        fixed_steps_per_hot_cell: 0
+                    }
+                }],
+                error: None,
+                blocked: None
+            }
+        );
+        assert_eq!(
+            due_probe.treatment(TreatmentId(0)).unwrap().status,
+            TreatmentStatus::Active
+        );
+        let completion = due_probe.apply(Command::AdvanceTo { target: 15 });
+        assert_eq!(completion.clock, 15);
+        assert_eq!(completion.error, None);
+        assert_eq!(completion.blocked, None);
+        assert_eq!(
+            completion.events,
+            vec![
+                TimedEvent {
+                    at: 15,
+                    event: Event::TreatmentCompleted {
+                        id: TreatmentId(0),
+                        medic: m0,
+                        patient,
+                        kind: TreatmentKind::Shock
+                    }
+                },
+                TimedEvent {
+                    at: 15,
+                    event: Event::TimeAdvanced {
+                        from: 14,
+                        to: 15,
+                        hot_cells_stepped: 0,
+                        fixed_steps_per_hot_cell: 0
+                    }
+                }
+            ]
+        );
+        assert_eq!(
+            due_probe.casualty_state(patient),
+            Some(CasualtyState {
+                blood: 5000,
+                shock: 100,
+                shock_remainder: 0,
+                incapacitated: false,
+                recovering: false,
+                recovery_next_at: None,
+                materialized_at: 15
+            })
+        );
     }
 
     #[test]
@@ -1760,7 +2380,27 @@ mod tests {
             })
         );
         assert_medical_totals(&active, 2, 1);
-        canonical_restore(&active, 0xfe25_5699_6b16_d7b6);
+        let active_fixture = healing_fixture(
+            "healing active",
+            0,
+            990,
+            (
+                CasualtyState {
+                    blood: 5000,
+                    shock: 30,
+                    shock_remainder: 0,
+                    incapacitated: false,
+                    recovering: false,
+                    recovery_next_at: None,
+                    materialized_at: 0,
+                },
+                false,
+                false,
+                TreatmentStatus::Active,
+            ),
+            0xfe25_5699_6b16_d7b6,
+        );
+        let active = verified_restore(&active, &active_fixture);
 
         let (response, before) = exchange(
             req(r#"{"version":1,"command":"advance_to","target":9}"#),
@@ -1790,7 +2430,27 @@ mod tests {
             })
         );
         assert_medical_totals(&before, 2, 1);
-        canonical_restore(&before, 0x9937_4e12_7a15_569d);
+        let before_fixture = healing_fixture(
+            "healing boundary minus one",
+            9,
+            990,
+            (
+                CasualtyState {
+                    blood: 4820,
+                    shock: 48,
+                    shock_remainder: 0,
+                    incapacitated: false,
+                    recovering: false,
+                    recovery_next_at: None,
+                    materialized_at: 9,
+                },
+                false,
+                false,
+                TreatmentStatus::Active,
+            ),
+            0x9937_4e12_7a15_569d,
+        );
+        let before = verified_restore(&before, &before_fixture);
 
         let (response, completed) = exchange(
             req(r#"{"version":1,"command":"advance_to","target":10}"#),
@@ -1835,7 +2495,90 @@ mod tests {
         );
         assert_eq!(completed.soldier(patient).unwrap().health, 990);
         assert_medical_totals(&completed, 2, 1);
-        canonical_restore(&completed, 0xf10d_c636_c78b_e1da);
+        let completed_fixture = healing_fixture(
+            "healing completed",
+            10,
+            990,
+            (
+                CasualtyState {
+                    blood: 4800,
+                    shock: 50,
+                    shock_remainder: 0,
+                    incapacitated: false,
+                    recovering: true,
+                    recovery_next_at: Some(15),
+                    materialized_at: 10,
+                },
+                true,
+                false,
+                TreatmentStatus::Completed { at: 10 },
+            ),
+            0xf10d_c636_c78b_e1da,
+        );
+        let completed = verified_restore(&completed, &completed_fixture);
+        let mut completed_release_probe = World::from_snapshot(&completed.snapshot()).unwrap();
+        let future_wound = WoundSpec {
+            trauma: 1,
+            bleeding_per_second: 1,
+            shock: 1,
+        };
+        assert_eq!(
+            completed_release_probe.apply(Command::InflictWound {
+                patient,
+                wound: future_wound
+            }),
+            sim_core::ApplyOutcome {
+                clock: 10,
+                events: vec![
+                    TimedEvent {
+                        at: 10,
+                        event: Event::WoundInflicted {
+                            id: WoundId(1),
+                            patient,
+                            wound: future_wound
+                        }
+                    },
+                    TimedEvent {
+                        at: 10,
+                        event: Event::RecoveryChanged {
+                            id: patient,
+                            before: true,
+                            after: false,
+                            next_at: None
+                        }
+                    }
+                ],
+                error: None,
+                blocked: None
+            }
+        );
+        assert_eq!(
+            completed_release_probe.apply(Command::StartTreatment {
+                medic,
+                patient,
+                wound: Some(WoundId(1)),
+                kind: TreatmentKind::Hemostatic
+            }),
+            sim_core::ApplyOutcome {
+                clock: 10,
+                events: vec![TimedEvent {
+                    at: 10,
+                    event: Event::TreatmentStarted {
+                        id: TreatmentId(1),
+                        medic,
+                        patient,
+                        wound: Some(WoundId(1)),
+                        kind: TreatmentKind::Hemostatic,
+                        completes_at: 20,
+                        consumed: 1
+                    }
+                }],
+                error: None,
+                blocked: None
+            }
+        );
+        assert_eq!(completed_release_probe.wound(WoundId(2)), None);
+        assert_eq!(completed_release_probe.treatment(TreatmentId(2)), None);
 
         let (response, tick) = exchange(
             req(r#"{"version":1,"command":"advance_to","target":15}"#),
@@ -1861,7 +2604,27 @@ mod tests {
         );
         assert_eq!(tick.soldier(patient).unwrap().health, 1000);
         assert_medical_totals(&tick, 2, 1);
-        canonical_restore(&tick, 0x29e9_214b_52e8_e3e4);
+        let tick_fixture = healing_fixture(
+            "healing tick",
+            15,
+            1000,
+            (
+                CasualtyState {
+                    blood: 4900,
+                    shock: 0,
+                    shock_remainder: 0,
+                    incapacitated: false,
+                    recovering: true,
+                    recovery_next_at: Some(20),
+                    materialized_at: 15,
+                },
+                true,
+                false,
+                TreatmentStatus::Completed { at: 10 },
+            ),
+            0x29e9_214b_52e8_e3e4,
+        );
+        let tick = verified_restore(&tick, &tick_fixture);
 
         let (response, healed) = exchange(
             req(r#"{"version":1,"command":"advance_to","target":20}"#),
@@ -1906,7 +2669,74 @@ mod tests {
         );
         assert_eq!(healed.soldier(patient).unwrap().health, 1000);
         assert_medical_totals(&healed, 2, 1);
-        canonical_restore(&healed, 0xbce6_a737_b43e_2693);
+        let healed_fixture = healing_fixture(
+            "healing terminal",
+            20,
+            1000,
+            (
+                CasualtyState {
+                    blood: 5000,
+                    shock: 0,
+                    shock_remainder: 0,
+                    incapacitated: false,
+                    recovering: false,
+                    recovery_next_at: None,
+                    materialized_at: 20,
+                },
+                true,
+                true,
+                TreatmentStatus::Completed { at: 10 },
+            ),
+            0xbce6_a737_b43e_2693,
+        );
+        let healed = verified_restore(&healed, &healed_fixture);
+        let mut final_release_probe = World::from_snapshot(&healed.snapshot()).unwrap();
+        assert_eq!(
+            final_release_probe.apply(Command::InflictWound {
+                patient,
+                wound: future_wound
+            }),
+            sim_core::ApplyOutcome {
+                clock: 20,
+                events: vec![TimedEvent {
+                    at: 20,
+                    event: Event::WoundInflicted {
+                        id: WoundId(1),
+                        patient,
+                        wound: future_wound
+                    }
+                }],
+                error: None,
+                blocked: None
+            }
+        );
+        assert_eq!(
+            final_release_probe.apply(Command::StartTreatment {
+                medic,
+                patient,
+                wound: Some(WoundId(1)),
+                kind: TreatmentKind::Hemostatic
+            }),
+            sim_core::ApplyOutcome {
+                clock: 20,
+                events: vec![TimedEvent {
+                    at: 20,
+                    event: Event::TreatmentStarted {
+                        id: TreatmentId(1),
+                        medic,
+                        patient,
+                        wound: Some(WoundId(1)),
+                        kind: TreatmentKind::Hemostatic,
+                        completes_at: 30,
+                        consumed: 1
+                    }
+                }],
+                error: None,
+                blocked: None
+            }
+        );
+        assert_eq!(final_release_probe.wound(WoundId(2)), None);
+        assert_eq!(final_release_probe.treatment(TreatmentId(2)), None);
     }
 
     #[test]
