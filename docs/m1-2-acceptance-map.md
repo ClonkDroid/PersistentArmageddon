@@ -48,3 +48,16 @@ Historical tests in `sim-core/tests/medical.rs` remain supplemental regression c
 Gate C1 is accepted on the complete evidence above. Gate B scenario 13 remains supplemental and does not substitute for tranche 2A-R9.
 
 Protocol Gate C2, benchmark expansion/full manual workload, production review, readiness, overall M1.2 completion, M1.3, merge, and species/faction physiology, doctrine, morale, routing, Painboyz, mob cohesion, and Waaagh behavior remain explicitly pending.
+
+## Gate C2 — strict M1.2 server protocol
+
+**Gate C2 is accepted.** The server bridge now preserves duplicate JSON keys until they can be rejected, requires exact command-specific key sets and scalar types, and uses explicit stable enum mappings. This gate changes only `sim-server` protocol behavior and tests; casualty scheduling, resource rules, snapshots, core constants, and production `sim-core` behavior are unchanged.
+
+| Gate C2 cluster | Concrete evidence |
+| --- | --- |
+| Exact medical command shapes and literal core commands | `gate_c2_exact_medical_command_shapes_parse_to_literal_commands` hand-authors every Hemostatic/Shock direct/request shape plus wound and interruption commands; `gate_c2_strict_parser_rejects_malformed_shapes_ranges_and_duplicates` pins missing, null, duplicate, type, range, kind, combination, unknown-field, and trailing-input rejection. |
+| Real HTTP application and authoritative accounting | `gate_c2_real_http_medical_success_and_atomic_rejection` exercises wound allocation, direct Hemostatic start, one-time consumption, explicit interruption, endpoint release, and absence of later completion through `POST /v1/command`. |
+| Complete event, enum, interruption reason, death cause, and medical error naming | `gate_c2_event_enum_reason_cause_and_error_serialization_matrix` uses literal JSON for every medical/recovery event shape, both treatment kinds and wound-option shapes, all six interruption reasons, all six death causes, and every M1.2 error code while retaining `snapshot_invalid`. |
+| Malformed/field-shape/numeric/range rejection and byte-plus-digest atomicity | `gate_c2_http_malformed_matrix_is_byte_and_digest_atomic` runs every row from a fresh fixture and pins exact HTTP status/body, clock, canonical snapshot bytes, and digest; `gate_c2_semantic_rejection_returns_complete_outcome_and_is_atomic` separately pins the complete HTTP-200 semantic-error envelope and unchanged authority. |
+
+Benchmark expansion, the full 2,410,000-soldier medical workload, production review, readiness, overall M1.2 completion, merge, M1.3, and species/faction physiology, doctrine, morale, routing, Painboyz, mob cohesion, and Waaagh behavior remain explicitly pending. PR #5 remains draft.

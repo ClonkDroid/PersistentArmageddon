@@ -1,10 +1,14 @@
-use serde::Deserialize;
+use serde::de::{self, MapAccess, Visitor};
+use serde::{Deserialize, Deserializer};
 use serde_json::{json, Value};
 use sim_core::{
-    Activity, BlockedCommand, Command, DeathCause, Event, ScheduledCommand, SimError, SoldierSpec,
-    Stock, TimedEvent, TreatmentId, TreatmentKind, World, WoundId, WoundSpec,
+    Activity, BlockedCommand, Command, DeathCause, Event, InterruptionReason, ScheduledCommand,
+    SimError, SoldierSpec, Stock, TimedEvent, TreatmentId, TreatmentKind, World, WoundId,
+    WoundSpec,
 };
+use std::collections::BTreeMap;
 use std::env;
+use std::fmt;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::thread;
@@ -342,114 +346,194 @@ fn bad() -> (&'static str, &'static str, Vec<u8>) {
     )
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct Wire {
-    version: u32,
-    command: String,
-    target: Option<u64>,
-    id: Option<u64>,
-    from: Option<u32>,
-    to: Option<u32>,
-    ammunition: Option<u64>,
-    supplies: Option<u64>,
-    cell: Option<u32>,
-    hot: Option<bool>,
-    at: Option<u64>,
-    activity: Option<String>,
-    patient: Option<u64>,
-    medic: Option<u64>,
-    wound: Option<u64>,
-    trauma: Option<u16>,
-    bleeding_per_second: Option<u16>,
-    shock: Option<u16>,
-    kind: Option<String>,
-    treatment: Option<u64>,
+    fields: BTreeMap<String, Value>,
+}
+impl<'de> Deserialize<'de> for Wire {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct WireVisitor;
+        impl<'de> Visitor<'de> for WireVisitor {
+            type Value = Wire;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a command object with unique keys")
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Wire, A::Error> {
+                let mut fields = BTreeMap::new();
+                while let Some((key, value)) = map.next_entry::<String, Value>()? {
+                    if !known_wire_field(&key) {
+                        return Err(de::Error::unknown_field(&key, WIRE_FIELDS));
+                    }
+                    if fields.insert(key.clone(), value).is_some() {
+                        return Err(de::Error::custom(format_args!("duplicate field {key}")));
+                    }
+                }
+                Ok(Wire { fields })
+            }
+        }
+        deserializer.deserialize_map(WireVisitor)
+    }
 }
 impl Wire {
-    fn into_command(self) -> Result<Command, ()> {
-        if self.version != 1 {
+    fn into_command(mut self) -> Result<Command, ()> {
+        if take_u64(&mut self.fields, "version")? != 1 {
             return Err(());
         }
-        match self.command.as_str() {
+        let command = take_string(&mut self.fields, "command")?;
+        let strict_medical = matches!(
+            command.as_str(),
+            "inflict_wound" | "start_treatment" | "request_treatment" | "interrupt_treatment"
+        );
+        let parsed = match command.as_str() {
             "advance_to" => Ok(Command::AdvanceTo {
-                target: self.target.ok_or(())?,
+                target: take_u64(&mut self.fields, "target")?,
             }),
             "create_stockpile" => Ok(Command::CreateStockpile {
-                id: u32::try_from(self.id.ok_or(())?).map_err(|_| ())?,
+                id: take_u32(&mut self.fields, "id")?,
                 initial: Stock {
-                    ammunition: self.ammunition.ok_or(())?,
-                    supplies: self.supplies.ok_or(())?,
+                    ammunition: take_u64(&mut self.fields, "ammunition")?,
+                    supplies: take_u64(&mut self.fields, "supplies")?,
                 },
             }),
             "transfer" => Ok(Command::Transfer {
-                from: self.from.ok_or(())?,
-                to: self.to.ok_or(())?,
-                ammunition: self.ammunition.ok_or(())?,
-                supplies: self.supplies.ok_or(())?,
+                from: take_u32(&mut self.fields, "from")?,
+                to: take_u32(&mut self.fields, "to")?,
+                ammunition: take_u64(&mut self.fields, "ammunition")?,
+                supplies: take_u64(&mut self.fields, "supplies")?,
             }),
             "set_region_hot" => Ok(Command::SetRegionHot {
-                cell: self.cell.ok_or(())?,
-                hot: self.hot.ok_or(())?,
+                cell: take_u32(&mut self.fields, "cell")?,
+                hot: take_bool(&mut self.fields, "hot")?,
             }),
             "schedule_hot" => Ok(Command::Schedule {
-                at: self.at.ok_or(())?,
+                at: take_u64(&mut self.fields, "at")?,
                 command: ScheduledCommand::SetRegionHot {
-                    cell: self.cell.ok_or(())?,
-                    hot: self.hot.ok_or(())?,
+                    cell: take_u32(&mut self.fields, "cell")?,
+                    hot: take_bool(&mut self.fields, "hot")?,
                 },
             }),
             "schedule_transfer" => Ok(Command::Schedule {
-                at: self.at.ok_or(())?,
+                at: take_u64(&mut self.fields, "at")?,
                 command: ScheduledCommand::Transfer {
-                    from: self.from.ok_or(())?,
-                    to: self.to.ok_or(())?,
-                    ammunition: self.ammunition.ok_or(())?,
-                    supplies: self.supplies.ok_or(())?,
+                    from: take_u32(&mut self.fields, "from")?,
+                    to: take_u32(&mut self.fields, "to")?,
+                    ammunition: take_u64(&mut self.fields, "ammunition")?,
+                    supplies: take_u64(&mut self.fields, "supplies")?,
                 },
             }),
             "cancel_scheduled" => Ok(Command::CancelScheduled {
-                id: self.id.ok_or(())?,
+                id: take_u64(&mut self.fields, "id")?,
             }),
             "set_activity" => Ok(Command::SetActivity {
-                id: sim_core::EntityId::from_raw(self.id.ok_or(())?),
-                activity: match self.activity.as_deref() {
-                    Some("rest") => Activity::Rest,
-                    Some("idle") => Activity::Idle,
-                    Some("march") => Activity::March,
+                id: sim_core::EntityId::from_raw(take_u64(&mut self.fields, "id")?),
+                activity: match take_string(&mut self.fields, "activity")?.as_str() {
+                    "rest" => Activity::Rest,
+                    "idle" => Activity::Idle,
+                    "march" => Activity::March,
                     _ => return Err(()),
                 },
             }),
             "inflict_wound" => Ok(Command::InflictWound {
-                patient: sim_core::EntityId::from_raw(self.patient.ok_or(())?),
+                patient: sim_core::EntityId::from_raw(take_u64(&mut self.fields, "patient")?),
                 wound: WoundSpec {
-                    trauma: self.trauma.ok_or(())?,
-                    bleeding_per_second: self.bleeding_per_second.ok_or(())?,
-                    shock: self.shock.ok_or(())?,
+                    trauma: take_u16(&mut self.fields, "trauma")?,
+                    bleeding_per_second: take_u16(&mut self.fields, "bleeding_per_second")?,
+                    shock: take_u16(&mut self.fields, "shock")?,
                 },
             }),
-            "start_treatment" => Ok(Command::StartTreatment {
-                medic: sim_core::EntityId::from_raw(self.medic.ok_or(())?),
-                patient: sim_core::EntityId::from_raw(self.patient.ok_or(())?),
-                wound: self.wound.map(WoundId),
-                kind: parse_kind(self.kind.as_deref())?,
-            }),
-            "request_treatment" => Ok(Command::RequestTreatment {
-                patient: sim_core::EntityId::from_raw(self.patient.ok_or(())?),
-                wound: self.wound.map(WoundId),
-                kind: parse_kind(self.kind.as_deref())?,
-            }),
+            "start_treatment" => {
+                let medic = sim_core::EntityId::from_raw(take_u64(&mut self.fields, "medic")?);
+                let patient = sim_core::EntityId::from_raw(take_u64(&mut self.fields, "patient")?);
+                let kind = parse_kind(&take_string(&mut self.fields, "kind")?)?;
+                let wound = treatment_wound(&mut self.fields, kind)?;
+                Ok(Command::StartTreatment {
+                    medic,
+                    patient,
+                    wound,
+                    kind,
+                })
+            }
+            "request_treatment" => {
+                let patient = sim_core::EntityId::from_raw(take_u64(&mut self.fields, "patient")?);
+                let kind = parse_kind(&take_string(&mut self.fields, "kind")?)?;
+                let wound = treatment_wound(&mut self.fields, kind)?;
+                Ok(Command::RequestTreatment {
+                    patient,
+                    wound,
+                    kind,
+                })
+            }
             "interrupt_treatment" => Ok(Command::InterruptTreatment {
-                id: TreatmentId(self.treatment.ok_or(())?),
+                id: TreatmentId(take_u64(&mut self.fields, "treatment")?),
             }),
             _ => Err(()),
-        }
+        }?;
+        (!strict_medical || self.fields.is_empty())
+            .then_some(parsed)
+            .ok_or(())
     }
 }
-fn parse_kind(k: Option<&str>) -> Result<TreatmentKind, ()> {
+const WIRE_FIELDS: &[&str] = &[
+    "version",
+    "command",
+    "target",
+    "id",
+    "from",
+    "to",
+    "ammunition",
+    "supplies",
+    "cell",
+    "hot",
+    "at",
+    "activity",
+    "patient",
+    "medic",
+    "wound",
+    "trauma",
+    "bleeding_per_second",
+    "shock",
+    "kind",
+    "treatment",
+];
+fn known_wire_field(field: &str) -> bool {
+    WIRE_FIELDS.contains(&field)
+}
+fn take_value(fields: &mut BTreeMap<String, Value>, key: &str) -> Result<Value, ()> {
+    fields
+        .remove(key)
+        .filter(|value| !value.is_null())
+        .ok_or(())
+}
+fn take_u64(fields: &mut BTreeMap<String, Value>, key: &str) -> Result<u64, ()> {
+    take_value(fields, key)?.as_u64().ok_or(())
+}
+fn take_u32(fields: &mut BTreeMap<String, Value>, key: &str) -> Result<u32, ()> {
+    u32::try_from(take_u64(fields, key)?).map_err(|_| ())
+}
+fn take_u16(fields: &mut BTreeMap<String, Value>, key: &str) -> Result<u16, ()> {
+    u16::try_from(take_u64(fields, key)?).map_err(|_| ())
+}
+fn take_bool(fields: &mut BTreeMap<String, Value>, key: &str) -> Result<bool, ()> {
+    take_value(fields, key)?.as_bool().ok_or(())
+}
+fn take_string(fields: &mut BTreeMap<String, Value>, key: &str) -> Result<String, ()> {
+    take_value(fields, key)?
+        .as_str()
+        .map(str::to_owned)
+        .ok_or(())
+}
+fn treatment_wound(
+    fields: &mut BTreeMap<String, Value>,
+    kind: TreatmentKind,
+) -> Result<Option<WoundId>, ()> {
+    match kind {
+        TreatmentKind::Hemostatic => Ok(Some(WoundId(take_u64(fields, "wound")?))),
+        TreatmentKind::Shock => (!fields.contains_key("wound")).then_some(None).ok_or(()),
+    }
+}
+fn parse_kind(k: &str) -> Result<TreatmentKind, ()> {
     match k {
-        Some("hemostatic") => Ok(TreatmentKind::Hemostatic),
-        Some("shock") => Ok(TreatmentKind::Shock),
+        "hemostatic" => Ok(TreatmentKind::Hemostatic),
+        "shock" => Ok(TreatmentKind::Shock),
         _ => Err(()),
     }
 }
@@ -605,7 +689,7 @@ fn event_json(x: &TimedEvent) -> Value {
             json!({"type":"treatment_completed","id":id.0,"medic":medic.raw(),"patient":patient.raw(),"kind":treatment_kind(kind)})
         }
         Event::TreatmentInterrupted { id, reason } => {
-            json!({"type":"treatment_interrupted","id":id.0,"reason":format!("{reason:?}").to_lowercase()})
+            json!({"type":"treatment_interrupted","id":id.0,"reason":interruption_reason(reason)})
         }
         Event::RecoveryChanged {
             id,
@@ -636,6 +720,16 @@ fn treatment_kind(k: TreatmentKind) -> &'static str {
     match k {
         TreatmentKind::Hemostatic => "hemostatic",
         TreatmentKind::Shock => "shock",
+    }
+}
+fn interruption_reason(reason: InterruptionReason) -> &'static str {
+    match reason {
+        InterruptionReason::Explicit => "explicit",
+        InterruptionReason::MedicDied => "medic_died",
+        InterruptionReason::PatientDied => "patient_died",
+        InterruptionReason::MedicRemoved => "medic_removed",
+        InterruptionReason::PatientRemoved => "patient_removed",
+        InterruptionReason::Ineligible => "ineligible",
     }
 }
 fn activity_name(a: Activity) -> &'static str {
@@ -793,6 +887,7 @@ fn memory_kib() -> (u64, u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sim_core::{EntityId, InterruptionReason, Inventory, Role};
     use std::net::Shutdown;
     use std::thread;
     fn req(body: &str) -> Vec<u8> {
@@ -849,6 +944,400 @@ mod tests {
     fn json_body(response: &[u8]) -> Value {
         let split = response.windows(4).position(|x| x == b"\r\n\r\n").unwrap();
         serde_json::from_slice(&response[split + 4..]).unwrap()
+    }
+
+    fn parse_wire(body: &str) -> Result<Command, ()> {
+        serde_json::from_str::<Wire>(body)
+            .map_err(|_| ())?
+            .into_command()
+    }
+
+    #[test]
+    fn gate_c2_exact_medical_command_shapes_parse_to_literal_commands() {
+        let cases = [
+            (
+                r#"{"shock":30,"command":"inflict_wound","version":1,"bleeding_per_second":20,"patient":7,"trauma":10}"#,
+                Command::InflictWound {
+                    patient: EntityId::from_raw(7),
+                    wound: WoundSpec {
+                        trauma: 10,
+                        bleeding_per_second: 20,
+                        shock: 30,
+                    },
+                },
+            ),
+            (
+                r#"{"version":1,"command":"start_treatment","medic":2,"patient":7,"wound":4,"kind":"hemostatic"}"#,
+                Command::StartTreatment {
+                    medic: EntityId::from_raw(2),
+                    patient: EntityId::from_raw(7),
+                    wound: Some(WoundId(4)),
+                    kind: TreatmentKind::Hemostatic,
+                },
+            ),
+            (
+                r#"{"kind":"shock","patient":7,"medic":2,"command":"start_treatment","version":1}"#,
+                Command::StartTreatment {
+                    medic: EntityId::from_raw(2),
+                    patient: EntityId::from_raw(7),
+                    wound: None,
+                    kind: TreatmentKind::Shock,
+                },
+            ),
+            (
+                r#"{"version":1,"command":"request_treatment","patient":7,"wound":4,"kind":"hemostatic"}"#,
+                Command::RequestTreatment {
+                    patient: EntityId::from_raw(7),
+                    wound: Some(WoundId(4)),
+                    kind: TreatmentKind::Hemostatic,
+                },
+            ),
+            (
+                r#"{"version":1,"command":"request_treatment","patient":7,"kind":"shock"}"#,
+                Command::RequestTreatment {
+                    patient: EntityId::from_raw(7),
+                    wound: None,
+                    kind: TreatmentKind::Shock,
+                },
+            ),
+            (
+                r#"{"version":1,"command":"interrupt_treatment","treatment":9}"#,
+                Command::InterruptTreatment { id: TreatmentId(9) },
+            ),
+        ];
+        for (literal, expected) in cases {
+            assert_eq!(parse_wire(literal), Ok(expected), "{literal}");
+        }
+    }
+
+    #[test]
+    fn gate_c2_strict_parser_rejects_malformed_shapes_ranges_and_duplicates() {
+        let invalid = [
+            r#"{}"#,
+            r#"{"version":null,"command":"interrupt_treatment","treatment":1}"#,
+            r#"{"version":1,"version":1,"command":"interrupt_treatment","treatment":1}"#,
+            r#"{"version":2,"command":"interrupt_treatment","treatment":1}"#,
+            r#"{"version":1,"command":"Interrupt_Treatment","treatment":1}"#,
+            r#"{"version":1,"command":"interrupt_treatment","treatment":null}"#,
+            r#"{"version":1,"command":"interrupt_treatment","treatment":-1}"#,
+            r#"{"version":1,"command":"interrupt_treatment","treatment":1.0}"#,
+            r#"{"version":1,"command":"interrupt_treatment","treatment":18446744073709551616}"#,
+            r#"{"version":1,"command":"interrupt_treatment","treatment":1,"patient":null}"#,
+            r#"{"version":1,"command":"inflict_wound","patient":1,"trauma":65536,"bleeding_per_second":0,"shock":0}"#,
+            r#"{"version":1,"command":"inflict_wound","patient":1,"trauma":1,"bleeding_per_second":0,"shock":0,"wound":null}"#,
+            r#"{"version":1,"command":"start_treatment","medic":0,"patient":1,"kind":"shock","wound":null}"#,
+            r#"{"version":1,"command":"start_treatment","medic":0,"patient":1,"kind":"hemostatic"}"#,
+            r#"{"version":1,"command":"request_treatment","patient":1,"kind":"HEMOSTATIC","wound":0}"#,
+            r#"{"version":1,"command":"request_treatment","patient":1,"kind":true}"#,
+            r#"{"version":1,"command":"request_treatment","patient":1,"kind":"shock","unknown":0}"#,
+            r#"{"version":1,"command":"request_treatment","patient":1,"kind":"shock"} trailing"#,
+        ];
+        for literal in invalid {
+            assert_eq!(parse_wire(literal), Err(()), "accepted {literal}");
+        }
+    }
+
+    #[test]
+    fn gate_c2_event_enum_reason_cause_and_error_serialization_matrix() {
+        let p = EntityId::from_raw(7);
+        let m = EntityId::from_raw(2);
+        let events = [
+            (
+                Event::WoundInflicted {
+                    id: WoundId(3),
+                    patient: p,
+                    wound: WoundSpec {
+                        trauma: 10,
+                        bleeding_per_second: 20,
+                        shock: 30,
+                    },
+                },
+                json!({"at":41,"event":{"type":"wound_inflicted","id":3,"patient":7,"trauma":10,"bleeding_per_second":20,"shock":30}}),
+            ),
+            (
+                Event::TreatmentStarted {
+                    id: TreatmentId(4),
+                    medic: m,
+                    patient: p,
+                    wound: Some(WoundId(3)),
+                    kind: TreatmentKind::Hemostatic,
+                    completes_at: 51,
+                    consumed: 1,
+                },
+                json!({"at":41,"event":{"type":"treatment_started","id":4,"medic":2,"patient":7,"wound":3,"kind":"hemostatic","completes_at":51,"consumed":1}}),
+            ),
+            (
+                Event::TreatmentStarted {
+                    id: TreatmentId(5),
+                    medic: m,
+                    patient: p,
+                    wound: None,
+                    kind: TreatmentKind::Shock,
+                    completes_at: 56,
+                    consumed: 2,
+                },
+                json!({"at":41,"event":{"type":"treatment_started","id":5,"medic":2,"patient":7,"wound":null,"kind":"shock","completes_at":56,"consumed":2}}),
+            ),
+            (
+                Event::TreatmentCompleted {
+                    id: TreatmentId(4),
+                    medic: m,
+                    patient: p,
+                    kind: TreatmentKind::Hemostatic,
+                },
+                json!({"at":41,"event":{"type":"treatment_completed","id":4,"medic":2,"patient":7,"kind":"hemostatic"}}),
+            ),
+            (
+                Event::TreatmentCompleted {
+                    id: TreatmentId(5),
+                    medic: m,
+                    patient: p,
+                    kind: TreatmentKind::Shock,
+                },
+                json!({"at":41,"event":{"type":"treatment_completed","id":5,"medic":2,"patient":7,"kind":"shock"}}),
+            ),
+            (
+                Event::RecoveryChanged {
+                    id: p,
+                    before: false,
+                    after: true,
+                    next_at: Some(46),
+                },
+                json!({"at":41,"event":{"type":"recovery_changed","id":7,"before":false,"after":true,"next_at":46}}),
+            ),
+            (
+                Event::RecoveryChanged {
+                    id: p,
+                    before: true,
+                    after: false,
+                    next_at: None,
+                },
+                json!({"at":41,"event":{"type":"recovery_changed","id":7,"before":true,"after":false,"next_at":null}}),
+            ),
+            (
+                Event::RecoveryTicked {
+                    id: p,
+                    blood_before: 4000,
+                    blood_after: 4100,
+                    shock_before: 200,
+                    shock_after: 150,
+                    health_before: 700,
+                    health_after: 725,
+                },
+                json!({"at":41,"event":{"type":"recovery_ticked","id":7,"blood_before":4000,"blood_after":4100,"shock_before":200,"shock_after":150,"health_before":700,"health_after":725}}),
+            ),
+            (
+                Event::WoundHealed {
+                    id: WoundId(3),
+                    patient: p,
+                },
+                json!({"at":41,"event":{"type":"wound_healed","id":3,"patient":7}}),
+            ),
+        ];
+        for (event, expected) in events {
+            assert_eq!(event_json(&TimedEvent { at: 41, event }), expected);
+        }
+        for (reason, name) in [
+            (InterruptionReason::Explicit, "explicit"),
+            (InterruptionReason::MedicDied, "medic_died"),
+            (InterruptionReason::PatientDied, "patient_died"),
+            (InterruptionReason::MedicRemoved, "medic_removed"),
+            (InterruptionReason::PatientRemoved, "patient_removed"),
+            (InterruptionReason::Ineligible, "ineligible"),
+        ] {
+            assert_eq!(
+                event_json(&TimedEvent {
+                    at: 9,
+                    event: Event::TreatmentInterrupted {
+                        id: TreatmentId(8),
+                        reason
+                    }
+                }),
+                json!({"at":9,"event":{"type":"treatment_interrupted","id":8,"reason":name}})
+            );
+        }
+        for (cause, name) in [
+            (DeathCause::Dehydration, "dehydration"),
+            (DeathCause::Starvation, "starvation"),
+            (DeathCause::Exhaustion, "exhaustion"),
+            (DeathCause::ImmediateTrauma, "immediate_trauma"),
+            (DeathCause::Hemorrhage, "hemorrhage"),
+            (DeathCause::TraumaticShock, "traumatic_shock"),
+        ] {
+            assert_eq!(
+                event_json(&TimedEvent {
+                    at: 9,
+                    event: Event::SoldierDied {
+                        id: p,
+                        cause,
+                        health_before: 321
+                    }
+                }),
+                json!({"at":9,"event":{"type":"soldier_died","id":7,"cause":name,"health_before":321}})
+            );
+        }
+        let errors = [
+            (SimError::DeadEntity, "dead_entity"),
+            (SimError::InvalidHealth, "invalid_health"),
+            (SimError::InvalidWound, "invalid_wound"),
+            (SimError::InvalidTreatment, "invalid_treatment"),
+            (SimError::NoEligibleMedic, "no_eligible_medic"),
+            (SimError::BusyEntity, "busy_entity"),
+            (SimError::InsufficientMedical, "insufficient_medical"),
+            (SimError::ArithmeticOverflow, "arithmetic_overflow"),
+            (SimError::Snapshot("x"), "snapshot_invalid"),
+        ];
+        for (error, code) in errors {
+            assert_eq!(error_code(&error), code);
+        }
+    }
+
+    fn spawn(world: &mut World, role: Role, medical: u32) -> EntityId {
+        let outcome = world.apply(Command::SpawnSoldier {
+            spec: SoldierSpec {
+                role,
+                inventory: Inventory {
+                    medical,
+                    ..Inventory::default()
+                },
+                ..SoldierSpec::default()
+            },
+        });
+        match outcome.events.as_slice() {
+            [TimedEvent {
+                event: Event::SoldierSpawned { id, .. },
+                ..
+            }] => *id,
+            _ => panic!("unexpected spawn: {outcome:?}"),
+        }
+    }
+
+    #[test]
+    fn gate_c2_real_http_medical_success_and_atomic_rejection() {
+        let mut world = World::new(11);
+        let medic = spawn(&mut world, Role::Medic, 5);
+        let patient = spawn(&mut world, Role::Rifle, 0);
+        assert_eq!((medic.raw(), patient.raw()), (0, 1));
+        let wound_body = r#"{"version":1,"command":"inflict_wound","patient":1,"trauma":10,"bleeding_per_second":20,"shock":30}"#;
+        let (response, after_wound) = exchange(req(wound_body), false, world);
+        assert_eq!(status(&response), "HTTP/1.1 200 OK");
+        assert_eq!(
+            json_body(&response)["events"],
+            json!([{"at":0,"event":{"type":"wound_inflicted","id":0,"patient":1,"trauma":10,"bleeding_per_second":20,"shock":30}}])
+        );
+        assert_eq!(after_wound.wound(WoundId(0)).unwrap().patient, patient);
+        let start_body = r#"{"version":1,"command":"start_treatment","medic":0,"patient":1,"wound":0,"kind":"hemostatic"}"#;
+        let (response, active) = exchange(req(start_body), false, after_wound);
+        assert_eq!(
+            json_body(&response)["events"],
+            json!([{"at":0,"event":{"type":"treatment_started","id":0,"medic":0,"patient":1,"wound":0,"kind":"hemostatic","completes_at":10,"consumed":1}}])
+        );
+        assert_eq!(active.soldier(medic).unwrap().inventory.medical, 4);
+        assert_eq!(active.resource_totals().consumed_medical, 1);
+        let interrupt = r#"{"version":1,"command":"interrupt_treatment","treatment":0}"#;
+        let (response, interrupted) = exchange(req(interrupt), false, active);
+        assert_eq!(
+            json_body(&response)["events"],
+            json!([{"at":0,"event":{"type":"treatment_interrupted","id":0,"reason":"explicit"}}])
+        );
+        let before = interrupted.snapshot();
+        let digest = interrupted.state_digest();
+        let malformed =
+            r#"{"version":1,"command":"interrupt_treatment","treatment":0,"patient":null}"#;
+        let (response, unchanged) = exchange(req(malformed), false, interrupted);
+        assert_eq!(status(&response), "HTTP/1.1 400 Bad Request");
+        assert_eq!(
+            json_body(&response),
+            json!({"error":"malformed_or_unsupported"})
+        );
+        assert_eq!(unchanged.snapshot(), before);
+        assert_eq!(unchanged.state_digest(), digest);
+        let advance = r#"{"version":1,"command":"advance_to","target":20}"#;
+        let (response, _) = exchange(req(advance), false, unchanged);
+        assert!(json_body(&response)["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|event| event["event"]["type"] != "treatment_completed"));
+    }
+
+    #[test]
+    fn gate_c2_http_malformed_matrix_is_byte_and_digest_atomic() {
+        let cases = [
+            (
+                "missing version",
+                r#"{"command":"interrupt_treatment","treatment":0}"#,
+            ),
+            (
+                "null command",
+                r#"{"version":1,"command":null,"treatment":0}"#,
+            ),
+            (
+                "duplicate payload",
+                r#"{"version":1,"command":"interrupt_treatment","treatment":0,"treatment":0}"#,
+            ),
+            (
+                "inapplicable recognized",
+                r#"{"version":1,"command":"interrupt_treatment","treatment":0,"wound":null}"#,
+            ),
+            (
+                "unknown",
+                r#"{"version":1,"command":"interrupt_treatment","treatment":0,"surprise":1}"#,
+            ),
+            (
+                "negative",
+                r#"{"version":1,"command":"interrupt_treatment","treatment":-1}"#,
+            ),
+            (
+                "fractional",
+                r#"{"version":1,"command":"inflict_wound","patient":0,"trauma":1.5,"bleeding_per_second":0,"shock":0}"#,
+            ),
+            (
+                "array",
+                r#"{"version":1,"command":"inflict_wound","patient":[],"trauma":1,"bleeding_per_second":0,"shock":0}"#,
+            ),
+            (
+                "shock wound",
+                r#"{"version":1,"command":"request_treatment","patient":0,"kind":"shock","wound":null}"#,
+            ),
+            (
+                "hemostatic null wound",
+                r#"{"version":1,"command":"request_treatment","patient":0,"kind":"hemostatic","wound":null}"#,
+            ),
+        ];
+        for (name, body) in cases {
+            let world = World::new(77);
+            let before = world.snapshot();
+            let digest = world.state_digest();
+            let (response, world) = exchange(req(body), false, world);
+            assert_eq!(status(&response), "HTTP/1.1 400 Bad Request", "{name}");
+            assert_eq!(
+                json_body(&response),
+                json!({"error":"malformed_or_unsupported"}),
+                "{name}"
+            );
+            assert_eq!(world.clock(), 0, "{name}");
+            assert_eq!(world.snapshot(), before, "{name}");
+            assert_eq!(world.state_digest(), digest, "{name}");
+        }
+    }
+
+    #[test]
+    fn gate_c2_semantic_rejection_returns_complete_outcome_and_is_atomic() {
+        let mut world = World::new(19);
+        let patient = spawn(&mut world, Role::Rifle, 0);
+        assert_eq!(patient.raw(), 0);
+        let before = world.snapshot();
+        let digest = world.state_digest();
+        let body = r#"{"version":1,"command":"inflict_wound","patient":0,"trauma":0,"bleeding_per_second":0,"shock":0}"#;
+        let (response, world) = exchange(req(body), false, world);
+        assert_eq!(status(&response), "HTTP/1.1 200 OK");
+        assert_eq!(
+            json_body(&response),
+            json!({"version":1,"clock":0,"events":[],"terminal_error":"invalid_wound","blocked":null,"digest":format!("{digest:016x}")})
+        );
+        assert_eq!(world.snapshot(), before);
+        assert_eq!(world.state_digest(), digest);
     }
 
     #[test]
