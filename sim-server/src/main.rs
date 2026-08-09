@@ -375,6 +375,7 @@ impl<'de> Deserialize<'de> for Wire {
 }
 impl Wire {
     fn into_command(mut self) -> Result<Command, ()> {
+        validate_legacy_wire_types(&self.fields)?;
         if take_u64(&mut self.fields, "version")? != 1 {
             return Err(());
         }
@@ -471,6 +472,36 @@ impl Wire {
             .then_some(parsed)
             .ok_or(())
     }
+}
+// The pre-Gate-C2 wire type was a typed struct whose optional fields were
+// deserialized before command selection.  Keep that observable behaviour for
+// legacy requests: null remains a valid absent optional value, but every
+// present recognized value must have the historical scalar type even when the
+// selected legacy command does not consume it.  Medical commands additionally
+// enforce their exact key sets below.
+fn validate_legacy_wire_types(fields: &BTreeMap<String, Value>) -> Result<(), ()> {
+    for (key, value) in fields {
+        if value.is_null() {
+            continue;
+        }
+        let valid = match key.as_str() {
+            "version" | "from" | "to" | "cell" => value
+                .as_u64()
+                .is_some_and(|value| u32::try_from(value).is_ok()),
+            "trauma" | "bleeding_per_second" | "shock" => value
+                .as_u64()
+                .is_some_and(|value| u16::try_from(value).is_ok()),
+            "target" | "id" | "ammunition" | "supplies" | "at" | "patient" | "medic" | "wound"
+            | "treatment" => value.as_u64().is_some(),
+            "hot" => value.as_bool().is_some(),
+            "command" | "activity" | "kind" => value.as_str().is_some(),
+            _ => false,
+        };
+        if !valid {
+            return Err(());
+        }
+    }
+    Ok(())
 }
 const WIRE_FIELDS: &[&str] = &[
     "version",
@@ -1034,6 +1065,95 @@ mod tests {
         ];
         for literal in invalid {
             assert_eq!(parse_wire(literal), Err(()), "accepted {literal}");
+        }
+    }
+
+    #[test]
+    fn gate_c2_legacy_real_http_compatibility_and_wrong_typed_extras() {
+        let legacy = [
+            (
+                r#"{"version":1,"command":"create_stockpile","id":7,"ammunition":9,"supplies":3,"target":null,"from":null,"to":null,"cell":null,"hot":null,"at":null,"activity":null,"patient":null,"medic":null,"wound":null,"trauma":null,"bleeding_per_second":null,"shock":null,"kind":null,"treatment":null}"#,
+                json!({"version":1,"clock":0,"events":[{"at":0,"event":{"type":"stockpile_created","id":7,"initial":{"ammunition":9,"supplies":3}}}],"terminal_error":null,"blocked":null,"digest":"c333945e80f9b8d1"}),
+                Some(Stock {
+                    ammunition: 9,
+                    supplies: 3,
+                }),
+            ),
+            (
+                r#"{"version":1,"command":"advance_to","target":1,"id":null,"from":null,"to":null,"ammunition":null,"supplies":null,"cell":null,"hot":null,"at":null,"activity":null,"patient":null,"medic":null,"wound":null,"trauma":null,"bleeding_per_second":null,"shock":null,"kind":null,"treatment":null}"#,
+                json!({"version":1,"clock":1,"events":[{"at":1,"event":{"type":"time_advanced","from":0,"to":1,"hot_cells_stepped":0,"fixed_steps_per_hot_cell":0}}],"terminal_error":null,"blocked":null,"digest":"4215b2950c54e5bc"}),
+                None,
+            ),
+        ];
+        for (body, expected, stock) in legacy {
+            let (response, world) = exchange(req(body), false, World::new(31));
+            assert_eq!(status(&response), "HTTP/1.1 200 OK");
+            assert_eq!(json_body(&response), expected);
+            assert_eq!(world.clock(), expected["clock"].as_u64().unwrap());
+            assert_eq!(world.stockpile(7), stock);
+        }
+
+        let wrong_typed_extras = [
+            (
+                "Boolean",
+                r#"{"version":1,"command":"advance_to","target":1,"hot":"wrong"}"#,
+            ),
+            (
+                "string",
+                r#"{"version":1,"command":"advance_to","target":1,"activity":false}"#,
+            ),
+            (
+                "u16",
+                r#"{"version":1,"command":"advance_to","target":1,"trauma":65536}"#,
+            ),
+            (
+                "u32",
+                r#"{"version":1,"command":"advance_to","target":1,"cell":4294967296}"#,
+            ),
+            (
+                "u64",
+                r#"{"version":1,"command":"advance_to","target":1,"id":[]}"#,
+            ),
+        ];
+        for (name, body) in wrong_typed_extras {
+            let mut world = World::new(37);
+            let created = world.apply(Command::CreateStockpile {
+                id: 9,
+                initial: Stock {
+                    ammunition: 17,
+                    supplies: 6,
+                },
+            });
+            assert_eq!(created.error, None, "{name}");
+            let before = world.snapshot();
+            let digest = world.state_digest();
+            assert_eq!(world.clock(), 0, "{name}");
+            assert_eq!(
+                world.stockpile(9),
+                Some(Stock {
+                    ammunition: 17,
+                    supplies: 6
+                }),
+                "{name}"
+            );
+            let (response, world) = exchange(req(body), false, world);
+            assert_eq!(status(&response), "HTTP/1.1 400 Bad Request", "{name}");
+            assert_eq!(
+                &response[response.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4..],
+                b"{\"error\":\"malformed_or_unsupported\"}",
+                "{name}"
+            );
+            assert_eq!(world.clock(), 0, "{name}");
+            assert_eq!(
+                world.stockpile(9),
+                Some(Stock {
+                    ammunition: 17,
+                    supplies: 6
+                }),
+                "{name}"
+            );
+            assert_eq!(world.snapshot(), before, "{name}");
+            assert_eq!(world.state_digest(), digest, "{name}");
         }
     }
 
