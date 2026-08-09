@@ -977,6 +977,33 @@ mod tests {
         serde_json::from_slice(&response[split + 4..]).unwrap()
     }
 
+    fn raw_body(response: &[u8]) -> &[u8] {
+        let split = response.windows(4).position(|x| x == b"\r\n\r\n").unwrap();
+        &response[split + 4..]
+    }
+
+    fn pinned_http_fixture(seed: u64) -> World {
+        let mut world = World::new(seed);
+        let outcome = world.apply(Command::CreateStockpile {
+            id: 9,
+            initial: Stock {
+                ammunition: 17,
+                supplies: 6,
+            },
+        });
+        assert_eq!(outcome.error, None);
+        assert_eq!(outcome.clock, 0);
+        assert_eq!(world.clock(), 0);
+        assert_eq!(
+            world.stockpile(9),
+            Some(Stock {
+                ammunition: 17,
+                supplies: 6,
+            })
+        );
+        world
+    }
+
     fn parse_wire(body: &str) -> Result<Command, ()> {
         serde_json::from_str::<Wire>(body)
             .map_err(|_| ())?
@@ -1097,36 +1124,39 @@ mod tests {
             (
                 "Boolean",
                 r#"{"version":1,"command":"advance_to","target":1,"hot":"wrong"}"#,
+                37,
+                0x81df_6de6_6513_26f8,
             ),
             (
                 "string",
                 r#"{"version":1,"command":"advance_to","target":1,"activity":false}"#,
+                38,
+                0x861c_8ca5_3f60_578b,
             ),
             (
                 "u16",
                 r#"{"version":1,"command":"advance_to","target":1,"trauma":65536}"#,
+                39,
+                0xaebe_7a08_130a_27da,
             ),
             (
                 "u32",
                 r#"{"version":1,"command":"advance_to","target":1,"cell":4294967296}"#,
+                40,
+                0xd4b7_bd8d_a212_49e5,
             ),
             (
                 "u64",
                 r#"{"version":1,"command":"advance_to","target":1,"id":[]}"#,
+                41,
+                0xfd59_aaf0_75bc_1a34,
             ),
         ];
-        for (name, body) in wrong_typed_extras {
-            let mut world = World::new(37);
-            let created = world.apply(Command::CreateStockpile {
-                id: 9,
-                initial: Stock {
-                    ammunition: 17,
-                    supplies: 6,
-                },
-            });
-            assert_eq!(created.error, None, "{name}");
+        for (name, body, seed, expected_digest) in wrong_typed_extras {
+            let world = pinned_http_fixture(seed);
             let before = world.snapshot();
             let digest = world.state_digest();
+            assert_eq!(digest, expected_digest, "{name}");
             assert_eq!(world.clock(), 0, "{name}");
             assert_eq!(
                 world.stockpile(9),
@@ -1139,7 +1169,7 @@ mod tests {
             let (response, world) = exchange(req(body), false, world);
             assert_eq!(status(&response), "HTTP/1.1 400 Bad Request", "{name}");
             assert_eq!(
-                &response[response.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4..],
+                raw_body(&response),
                 b"{\"error\":\"malformed_or_unsupported\"}",
                 "{name}"
             );
@@ -1154,6 +1184,7 @@ mod tests {
             );
             assert_eq!(world.snapshot(), before, "{name}");
             assert_eq!(world.state_digest(), digest, "{name}");
+            assert_eq!(world.state_digest(), expected_digest, "{name}");
         }
     }
 
@@ -1333,7 +1364,7 @@ mod tests {
     }
 
     #[test]
-    fn gate_c2_real_http_medical_success_and_atomic_rejection() {
+    fn gate_c2_real_http_medical_success_and_continuation() {
         let mut world = World::new(11);
         let medic = spawn(&mut world, Role::Medic, 5);
         let patient = spawn(&mut world, Role::Rifle, 0);
@@ -1342,23 +1373,25 @@ mod tests {
         let (response, after_wound) = exchange(req(wound_body), false, world);
         assert_eq!(status(&response), "HTTP/1.1 200 OK");
         assert_eq!(
-            json_body(&response)["events"],
-            json!([{"at":0,"event":{"type":"wound_inflicted","id":0,"patient":1,"trauma":10,"bleeding_per_second":20,"shock":30}}])
+            json_body(&response),
+            json!({"version":1,"clock":0,"events":[{"at":0,"event":{"type":"wound_inflicted","id":0,"patient":1,"trauma":10,"bleeding_per_second":20,"shock":30}}],"terminal_error":null,"blocked":null,"digest":"1a644c800f5dfd57"})
         );
         assert_eq!(after_wound.wound(WoundId(0)).unwrap().patient, patient);
         let start_body = r#"{"version":1,"command":"start_treatment","medic":0,"patient":1,"wound":0,"kind":"hemostatic"}"#;
         let (response, active) = exchange(req(start_body), false, after_wound);
+        assert_eq!(status(&response), "HTTP/1.1 200 OK");
         assert_eq!(
-            json_body(&response)["events"],
-            json!([{"at":0,"event":{"type":"treatment_started","id":0,"medic":0,"patient":1,"wound":0,"kind":"hemostatic","completes_at":10,"consumed":1}}])
+            json_body(&response),
+            json!({"version":1,"clock":0,"events":[{"at":0,"event":{"type":"treatment_started","id":0,"medic":0,"patient":1,"wound":0,"kind":"hemostatic","completes_at":10,"consumed":1}}],"terminal_error":null,"blocked":null,"digest":"d3b2b24654f6f170"})
         );
         assert_eq!(active.soldier(medic).unwrap().inventory.medical, 4);
         assert_eq!(active.resource_totals().consumed_medical, 1);
         let interrupt = r#"{"version":1,"command":"interrupt_treatment","treatment":0}"#;
         let (response, interrupted) = exchange(req(interrupt), false, active);
+        assert_eq!(status(&response), "HTTP/1.1 200 OK");
         assert_eq!(
-            json_body(&response)["events"],
-            json!([{"at":0,"event":{"type":"treatment_interrupted","id":0,"reason":"explicit"}}])
+            json_body(&response),
+            json!({"version":1,"clock":0,"events":[{"at":0,"event":{"type":"treatment_interrupted","id":0,"reason":"explicit"}}],"terminal_error":null,"blocked":null,"digest":"aa8ad8b69e55cfe2"})
         );
         let before = interrupted.snapshot();
         let digest = interrupted.state_digest();
@@ -1373,12 +1406,15 @@ mod tests {
         assert_eq!(unchanged.snapshot(), before);
         assert_eq!(unchanged.state_digest(), digest);
         let advance = r#"{"version":1,"command":"advance_to","target":20}"#;
-        let (response, _) = exchange(req(advance), false, unchanged);
-        assert!(json_body(&response)["events"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|event| event["event"]["type"] != "treatment_completed"));
+        let (response, advanced) = exchange(req(advance), false, unchanged);
+        assert_eq!(status(&response), "HTTP/1.1 200 OK");
+        assert_eq!(
+            json_body(&response),
+            json!({"version":1,"clock":20,"events":[{"at":20,"event":{"type":"time_advanced","from":0,"to":20,"hot_cells_stepped":0,"fixed_steps_per_hot_cell":0}}],"terminal_error":null,"blocked":null,"digest":"035c8d0e76da8786"})
+        );
+        assert_eq!(advanced.clock(), 20);
+        assert_eq!(advanced.soldier(medic).unwrap().inventory.medical, 4);
+        assert_eq!(advanced.resource_totals().consumed_medical, 1);
     }
 
     #[test]
@@ -1424,11 +1460,161 @@ mod tests {
                 "hemostatic null wound",
                 r#"{"version":1,"command":"request_treatment","patient":0,"kind":"hemostatic","wound":null}"#,
             ),
+            ("missing command", r#"{"version":1,"treatment":0}"#),
+            (
+                "null version",
+                r#"{"version":null,"command":"interrupt_treatment","treatment":0}"#,
+            ),
+            (
+                "wrong version type",
+                r#"{"version":"1","command":"interrupt_treatment","treatment":0}"#,
+            ),
+            (
+                "duplicate version",
+                r#"{"version":1,"version":1,"command":"interrupt_treatment","treatment":0}"#,
+            ),
+            (
+                "wrong command type",
+                r#"{"version":1,"command":false,"treatment":0}"#,
+            ),
+            (
+                "duplicate command",
+                r#"{"version":1,"command":"interrupt_treatment","command":"interrupt_treatment","treatment":0}"#,
+            ),
+            (
+                "unsupported version",
+                r#"{"version":2,"command":"interrupt_treatment","treatment":0}"#,
+            ),
+            (
+                "unknown command",
+                r#"{"version":1,"command":"operate","treatment":0}"#,
+            ),
+            (
+                "case command",
+                r#"{"version":1,"command":"Inflict_Wound","patient":0,"trauma":1,"bleeding_per_second":0,"shock":0}"#,
+            ),
+            (
+                "missing wound patient",
+                r#"{"version":1,"command":"inflict_wound","trauma":1,"bleeding_per_second":0,"shock":0}"#,
+            ),
+            (
+                "null wound patient",
+                r#"{"version":1,"command":"inflict_wound","patient":null,"trauma":1,"bleeding_per_second":0,"shock":0}"#,
+            ),
+            (
+                "missing trauma",
+                r#"{"version":1,"command":"inflict_wound","patient":0,"bleeding_per_second":1,"shock":0}"#,
+            ),
+            (
+                "null trauma",
+                r#"{"version":1,"command":"inflict_wound","patient":0,"trauma":null,"bleeding_per_second":1,"shock":0}"#,
+            ),
+            (
+                "missing bleeding",
+                r#"{"version":1,"command":"inflict_wound","patient":0,"trauma":1,"shock":0}"#,
+            ),
+            (
+                "null bleeding",
+                r#"{"version":1,"command":"inflict_wound","patient":0,"trauma":1,"bleeding_per_second":null,"shock":0}"#,
+            ),
+            (
+                "missing shock",
+                r#"{"version":1,"command":"inflict_wound","patient":0,"trauma":1,"bleeding_per_second":0}"#,
+            ),
+            (
+                "null shock",
+                r#"{"version":1,"command":"inflict_wound","patient":0,"trauma":1,"bleeding_per_second":0,"shock":null}"#,
+            ),
+            (
+                "direct missing medic",
+                r#"{"version":1,"command":"start_treatment","patient":0,"wound":0,"kind":"hemostatic"}"#,
+            ),
+            (
+                "direct null medic",
+                r#"{"version":1,"command":"start_treatment","medic":null,"patient":0,"wound":0,"kind":"hemostatic"}"#,
+            ),
+            (
+                "direct missing patient",
+                r#"{"version":1,"command":"start_treatment","medic":0,"wound":0,"kind":"hemostatic"}"#,
+            ),
+            (
+                "direct null patient",
+                r#"{"version":1,"command":"start_treatment","medic":0,"patient":null,"wound":0,"kind":"hemostatic"}"#,
+            ),
+            (
+                "direct missing kind",
+                r#"{"version":1,"command":"start_treatment","medic":0,"patient":1,"wound":0}"#,
+            ),
+            (
+                "direct null kind",
+                r#"{"version":1,"command":"start_treatment","medic":0,"patient":1,"wound":0,"kind":null}"#,
+            ),
+            (
+                "request missing patient",
+                r#"{"version":1,"command":"request_treatment","kind":"shock"}"#,
+            ),
+            (
+                "request null patient",
+                r#"{"version":1,"command":"request_treatment","patient":null,"kind":"shock"}"#,
+            ),
+            (
+                "unknown kind",
+                r#"{"version":1,"command":"request_treatment","patient":0,"kind":"bandage"}"#,
+            ),
+            (
+                "case kind",
+                r#"{"version":1,"command":"request_treatment","patient":0,"kind":"Shock"}"#,
+            ),
+            (
+                "string numeric",
+                r#"{"version":1,"command":"inflict_wound","patient":"0","trauma":1,"bleeding_per_second":0,"shock":0}"#,
+            ),
+            (
+                "boolean numeric",
+                r#"{"version":1,"command":"inflict_wound","patient":false,"trauma":1,"bleeding_per_second":0,"shock":0}"#,
+            ),
+            (
+                "object numeric",
+                r#"{"version":1,"command":"inflict_wound","patient":{},"trauma":1,"bleeding_per_second":0,"shock":0}"#,
+            ),
+            (
+                "entity overflow",
+                r#"{"version":1,"command":"inflict_wound","patient":18446744073709551616,"trauma":1,"bleeding_per_second":0,"shock":0}"#,
+            ),
+            (
+                "wound overflow",
+                r#"{"version":1,"command":"start_treatment","medic":0,"patient":1,"wound":18446744073709551616,"kind":"hemostatic"}"#,
+            ),
+            (
+                "treatment overflow",
+                r#"{"version":1,"command":"interrupt_treatment","treatment":18446744073709551616}"#,
+            ),
+            (
+                "bleeding u16 overflow",
+                r#"{"version":1,"command":"inflict_wound","patient":0,"trauma":0,"bleeding_per_second":65536,"shock":0}"#,
+            ),
+            (
+                "shock u16 overflow",
+                r#"{"version":1,"command":"inflict_wound","patient":0,"trauma":0,"bleeding_per_second":0,"shock":65536}"#,
+            ),
+            (
+                "duplicate patient",
+                r#"{"version":1,"command":"inflict_wound","patient":0,"patient":0,"trauma":1,"bleeding_per_second":0,"shock":0}"#,
+            ),
+            (
+                "duplicate wound",
+                r#"{"version":1,"command":"start_treatment","medic":0,"patient":1,"wound":0,"wound":0,"kind":"hemostatic"}"#,
+            ),
+            (
+                "malformed json",
+                r#"{"version":1,"command":"interrupt_treatment","treatment":0"#,
+            ),
         ];
         for (name, body) in cases {
-            let world = World::new(77);
+            let world = pinned_http_fixture(77);
             let before = world.snapshot();
             let digest = world.state_digest();
+            assert_eq!(digest, 0x2bd7_8a3a_f7ee_2a90, "{name}");
             let (response, world) = exchange(req(body), false, world);
             assert_eq!(status(&response), "HTTP/1.1 400 Bad Request", "{name}");
             assert_eq!(
@@ -1439,6 +1625,7 @@ mod tests {
             assert_eq!(world.clock(), 0, "{name}");
             assert_eq!(world.snapshot(), before, "{name}");
             assert_eq!(world.state_digest(), digest, "{name}");
+            assert_eq!(world.state_digest(), 0x2bd7_8a3a_f7ee_2a90, "{name}");
         }
     }
 
@@ -1449,12 +1636,13 @@ mod tests {
         assert_eq!(patient.raw(), 0);
         let before = world.snapshot();
         let digest = world.state_digest();
+        assert_eq!(digest, 0x141a_fc1e_bd5c_94da);
         let body = r#"{"version":1,"command":"inflict_wound","patient":0,"trauma":0,"bleeding_per_second":0,"shock":0}"#;
         let (response, world) = exchange(req(body), false, world);
         assert_eq!(status(&response), "HTTP/1.1 200 OK");
         assert_eq!(
             json_body(&response),
-            json!({"version":1,"clock":0,"events":[],"terminal_error":"invalid_wound","blocked":null,"digest":format!("{digest:016x}")})
+            json!({"version":1,"clock":0,"events":[],"terminal_error":"invalid_wound","blocked":null,"digest":"141afc1ebd5c94da"})
         );
         assert_eq!(world.snapshot(), before);
         assert_eq!(world.state_digest(), digest);
