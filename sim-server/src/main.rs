@@ -1108,6 +1108,7 @@ mod tests {
             initial_clock: u64,
             initial_stock: Option<Stock>,
             initial_totals: ResourceTotals,
+            initial_digest: u64,
             body: &'static str,
             response: Value,
             clock: u64,
@@ -1137,6 +1138,7 @@ mod tests {
                     consumed_medical: 0,
                     lost_medical: 0,
                 },
+                initial_digest: 0x0c06_8a8d_648b_9f5d,
                 body: r#"{"version":1,"command":"create_stockpile","id":7,"ammunition":9,"supplies":3,"target":null,"from":null,"to":null,"cell":null,"hot":null,"at":null,"activity":null,"patient":null,"medic":null,"wound":null,"trauma":null,"bleeding_per_second":null,"shock":null,"kind":null,"treatment":null}"#,
                 response: json!({"version":1,"clock":0,"events":[{"at":0,"event":{"type":"stockpile_created","id":7,"initial":{"ammunition":9,"supplies":3}}}],"terminal_error":null,"blocked":null,"digest":"c333945e80f9b8d1"}),
                 clock: 0,
@@ -1183,6 +1185,7 @@ mod tests {
                     consumed_medical: 0,
                     lost_medical: 0,
                 },
+                initial_digest: 0x0c06_8a8d_648b_9f5d,
                 body: r#"{"version":1,"command":"advance_to","target":1,"id":null,"from":null,"to":null,"ammunition":null,"supplies":null,"cell":null,"hot":null,"at":null,"activity":null,"patient":null,"medic":null,"wound":null,"trauma":null,"bleeding_per_second":null,"shock":null,"kind":null,"treatment":null}"#,
                 response: json!({"version":1,"clock":1,"events":[{"at":1,"event":{"type":"time_advanced","from":0,"to":1,"hot_cells_stepped":0,"fixed_steps_per_hot_cell":0}}],"terminal_error":null,"blocked":null,"digest":"4215b2950c54e5bc"}),
                 clock: 1,
@@ -1222,6 +1225,35 @@ mod tests {
                 "{}",
                 fixture.name
             );
+            assert_eq!(
+                initial.state_digest(),
+                fixture.initial_digest,
+                "{}",
+                fixture.name
+            );
+            assert_eq!(
+                initial.soldier(EntityId::from_parts(0, 0)),
+                None,
+                "{}",
+                fixture.name
+            );
+            assert_eq!(initial.wound(WoundId(0)), None, "{}", fixture.name);
+            assert_eq!(
+                initial.wounds_of(EntityId::from_parts(0, 0)),
+                vec![],
+                "{}",
+                fixture.name
+            );
+            assert_eq!(
+                initial.casualty_state(EntityId::from_parts(0, 0)),
+                None,
+                "{}",
+                fixture.name
+            );
+            assert_eq!(initial.treatment(TreatmentId(0)), None, "{}", fixture.name);
+            assert_eq!(initial.squad(7), None, "{}", fixture.name);
+            assert_eq!(initial.hot_cell(7), None, "{}", fixture.name);
+            assert_eq!(initial.hot_cell_count(), 0, "{}", fixture.name);
             let (response, world) = exchange(req(fixture.body), false, initial);
             assert_eq!(status(&response), "HTTP/1.1 200 OK", "{}", fixture.name);
             assert_eq!(json_body(&response), fixture.response, "{}", fixture.name);
@@ -1232,6 +1264,26 @@ mod tests {
             assert_eq!(world.squad(7), None, "{}", fixture.name);
             assert_eq!(world.hot_cell(7), None, "{}", fixture.name);
             assert_eq!(world.hot_cell_count(), 0, "{}", fixture.name);
+            assert_eq!(
+                world.soldier(EntityId::from_parts(0, 0)),
+                None,
+                "{}",
+                fixture.name
+            );
+            assert_eq!(world.wound(WoundId(0)), None, "{}", fixture.name);
+            assert_eq!(
+                world.wounds_of(EntityId::from_parts(0, 0)),
+                vec![],
+                "{}",
+                fixture.name
+            );
+            assert_eq!(
+                world.casualty_state(EntityId::from_parts(0, 0)),
+                None,
+                "{}",
+                fixture.name
+            );
+            assert_eq!(world.treatment(TreatmentId(0)), None, "{}", fixture.name);
             assert_eq!(world.state_digest(), fixture.digest, "{}", fixture.name);
             let bytes = world.snapshot();
             let restored = World::from_snapshot(&bytes).unwrap();
@@ -1247,6 +1299,26 @@ mod tests {
             assert_eq!(restored.squad(7), None, "{}", fixture.name);
             assert_eq!(restored.hot_cell(7), None, "{}", fixture.name);
             assert_eq!(restored.hot_cell_count(), 0, "{}", fixture.name);
+            assert_eq!(
+                restored.soldier(EntityId::from_parts(0, 0)),
+                None,
+                "{}",
+                fixture.name
+            );
+            assert_eq!(restored.wound(WoundId(0)), None, "{}", fixture.name);
+            assert_eq!(
+                restored.wounds_of(EntityId::from_parts(0, 0)),
+                vec![],
+                "{}",
+                fixture.name
+            );
+            assert_eq!(
+                restored.casualty_state(EntityId::from_parts(0, 0)),
+                None,
+                "{}",
+                fixture.name
+            );
+            assert_eq!(restored.treatment(TreatmentId(0)), None, "{}", fixture.name);
             assert_eq!(restored.state_digest(), fixture.digest, "{}", fixture.name);
             assert_eq!(restored.snapshot(), bytes, "{}", fixture.name);
         }
@@ -1537,18 +1609,6 @@ mod tests {
         );
     }
 
-    fn assert_medical_totals(world: &World, carried: u128, consumed: u128) {
-        assert_eq!(
-            world.resource_totals(),
-            ResourceTotals {
-                carried_medical: carried,
-                sourced_medical: carried + consumed,
-                consumed_medical: consumed,
-                ..ResourceTotals::default()
-            }
-        );
-    }
-
     #[derive(Clone)]
     struct PublicMedicalFixture {
         name: &'static str,
@@ -1666,37 +1726,6 @@ mod tests {
         }
     }
 
-    fn fixture_soldier(
-        id: EntityId,
-        role: Role,
-        medical: u32,
-        health: u16,
-        needs: Needs,
-        living: LivingState,
-    ) -> Soldier {
-        Soldier {
-            id,
-            faction: 0,
-            position: Position {
-                x_mm: 0,
-                y_mm: 0,
-                cell: 0,
-            },
-            squad: None,
-            role,
-            rank: 0,
-            health,
-            needs,
-            ammunition: 0,
-            inventory: Inventory {
-                food: 0,
-                water: 0,
-                medical,
-            },
-            living,
-        }
-    }
-
     fn verified_restore(world: &World, fixture: &PublicMedicalFixture) -> World {
         fixture.assert_world(world);
         let bytes = world.snapshot();
@@ -1715,7 +1744,7 @@ mod tests {
     fn direct_setup_fixture() -> PublicMedicalFixture {
         let medic = EntityId::from_parts(0, 0);
         let patient = EntityId::from_parts(1, 0);
-        let living = LivingState {
+        let _living = LivingState {
             hunger: 0,
             thirst: 0,
             fatigue: 0,
@@ -1726,7 +1755,7 @@ mod tests {
             life: LifeState::Alive,
             materialized_at: 0,
         };
-        let needs = Needs {
+        let _needs = Needs {
             fatigue: 0,
             hunger: 0,
             thirst: 0,
@@ -1737,8 +1766,78 @@ mod tests {
             clock: 0,
             soldier_count: 2,
             soldiers: vec![
-                fixture_soldier(medic, Role::Medic, 5, 1000, needs, living),
-                fixture_soldier(patient, Role::Rifle, 0, 1000, needs, living),
+                Soldier {
+                    id: medic,
+                    faction: 0,
+                    position: Position {
+                        x_mm: 0,
+                        y_mm: 0,
+                        cell: 0,
+                    },
+                    squad: None,
+                    role: Role::Medic,
+                    rank: 0,
+                    health: 1000,
+                    needs: Needs {
+                        fatigue: 0,
+                        hunger: 0,
+                        thirst: 0,
+                        sleep_debt: 0,
+                    },
+                    ammunition: 0,
+                    inventory: Inventory {
+                        food: 0,
+                        water: 0,
+                        medical: 5,
+                    },
+                    living: LivingState {
+                        hunger: 0,
+                        thirst: 0,
+                        fatigue: 0,
+                        sleep_debt: 0,
+                        morale: 1000,
+                        health: 1000,
+                        activity: Activity::Idle,
+                        life: LifeState::Alive,
+                        materialized_at: 0,
+                    },
+                },
+                Soldier {
+                    id: patient,
+                    faction: 0,
+                    position: Position {
+                        x_mm: 0,
+                        y_mm: 0,
+                        cell: 0,
+                    },
+                    squad: None,
+                    role: Role::Rifle,
+                    rank: 0,
+                    health: 1000,
+                    needs: Needs {
+                        fatigue: 0,
+                        hunger: 0,
+                        thirst: 0,
+                        sleep_debt: 0,
+                    },
+                    ammunition: 0,
+                    inventory: Inventory {
+                        food: 0,
+                        water: 0,
+                        medical: 0,
+                    },
+                    living: LivingState {
+                        hunger: 0,
+                        thirst: 0,
+                        fatigue: 0,
+                        sleep_debt: 0,
+                        morale: 1000,
+                        health: 1000,
+                        activity: Activity::Idle,
+                        life: LifeState::Alive,
+                        materialized_at: 0,
+                    },
+                },
             ],
             absent_soldiers: vec![EntityId::from_parts(2, 0), EntityId::from_parts(0, 1)],
             wounds: vec![],
@@ -1775,7 +1874,7 @@ mod tests {
         let m0 = EntityId::from_parts(0, 0);
         let m1 = EntityId::from_parts(1, 0);
         let patient = EntityId::from_parts(2, 0);
-        let living = LivingState {
+        let _living = LivingState {
             hunger: 0,
             thirst: 0,
             fatigue: 0,
@@ -1786,7 +1885,7 @@ mod tests {
             life: LifeState::Alive,
             materialized_at: 0,
         };
-        let needs = Needs {
+        let _needs = Needs {
             fatigue: 0,
             hunger: 0,
             thirst: 0,
@@ -1797,9 +1896,114 @@ mod tests {
             clock: 0,
             soldier_count: 3,
             soldiers: vec![
-                fixture_soldier(m0, Role::Medic, 4, 1000, needs, living),
-                fixture_soldier(m1, Role::Medic, 4, 1000, needs, living),
-                fixture_soldier(patient, Role::Rifle, 0, 1000, needs, living),
+                Soldier {
+                    id: m0,
+                    faction: 0,
+                    position: Position {
+                        x_mm: 0,
+                        y_mm: 0,
+                        cell: 0,
+                    },
+                    squad: None,
+                    role: Role::Medic,
+                    rank: 0,
+                    health: 1000,
+                    needs: Needs {
+                        fatigue: 0,
+                        hunger: 0,
+                        thirst: 0,
+                        sleep_debt: 0,
+                    },
+                    ammunition: 0,
+                    inventory: Inventory {
+                        food: 0,
+                        water: 0,
+                        medical: 4,
+                    },
+                    living: LivingState {
+                        hunger: 0,
+                        thirst: 0,
+                        fatigue: 0,
+                        sleep_debt: 0,
+                        morale: 1000,
+                        health: 1000,
+                        activity: Activity::Idle,
+                        life: LifeState::Alive,
+                        materialized_at: 0,
+                    },
+                },
+                Soldier {
+                    id: m1,
+                    faction: 0,
+                    position: Position {
+                        x_mm: 0,
+                        y_mm: 0,
+                        cell: 0,
+                    },
+                    squad: None,
+                    role: Role::Medic,
+                    rank: 0,
+                    health: 1000,
+                    needs: Needs {
+                        fatigue: 0,
+                        hunger: 0,
+                        thirst: 0,
+                        sleep_debt: 0,
+                    },
+                    ammunition: 0,
+                    inventory: Inventory {
+                        food: 0,
+                        water: 0,
+                        medical: 4,
+                    },
+                    living: LivingState {
+                        hunger: 0,
+                        thirst: 0,
+                        fatigue: 0,
+                        sleep_debt: 0,
+                        morale: 1000,
+                        health: 1000,
+                        activity: Activity::Idle,
+                        life: LifeState::Alive,
+                        materialized_at: 0,
+                    },
+                },
+                Soldier {
+                    id: patient,
+                    faction: 0,
+                    position: Position {
+                        x_mm: 0,
+                        y_mm: 0,
+                        cell: 0,
+                    },
+                    squad: None,
+                    role: Role::Rifle,
+                    rank: 0,
+                    health: 1000,
+                    needs: Needs {
+                        fatigue: 0,
+                        hunger: 0,
+                        thirst: 0,
+                        sleep_debt: 0,
+                    },
+                    ammunition: 0,
+                    inventory: Inventory {
+                        food: 0,
+                        water: 0,
+                        medical: 0,
+                    },
+                    living: LivingState {
+                        hunger: 0,
+                        thirst: 0,
+                        fatigue: 0,
+                        sleep_debt: 0,
+                        morale: 1000,
+                        health: 1000,
+                        activity: Activity::Idle,
+                        life: LifeState::Alive,
+                        materialized_at: 0,
+                    },
+                },
             ],
             absent_soldiers: vec![EntityId::from_parts(3, 0), EntityId::from_parts(0, 1)],
             wounds: vec![],
@@ -1835,7 +2039,7 @@ mod tests {
     fn healing_setup_fixture() -> PublicMedicalFixture {
         let medic = EntityId::from_parts(0, 0);
         let patient = EntityId::from_parts(1, 0);
-        let living = LivingState {
+        let _living = LivingState {
             hunger: 0,
             thirst: 0,
             fatigue: 0,
@@ -1846,7 +2050,7 @@ mod tests {
             life: LifeState::Alive,
             materialized_at: 0,
         };
-        let needs = Needs {
+        let _needs = Needs {
             fatigue: 0,
             hunger: 0,
             thirst: 0,
@@ -1857,8 +2061,78 @@ mod tests {
             clock: 0,
             soldier_count: 2,
             soldiers: vec![
-                fixture_soldier(medic, Role::Medic, 3, 1000, needs, living),
-                fixture_soldier(patient, Role::Rifle, 0, 1000, needs, living),
+                Soldier {
+                    id: medic,
+                    faction: 0,
+                    position: Position {
+                        x_mm: 0,
+                        y_mm: 0,
+                        cell: 0,
+                    },
+                    squad: None,
+                    role: Role::Medic,
+                    rank: 0,
+                    health: 1000,
+                    needs: Needs {
+                        fatigue: 0,
+                        hunger: 0,
+                        thirst: 0,
+                        sleep_debt: 0,
+                    },
+                    ammunition: 0,
+                    inventory: Inventory {
+                        food: 0,
+                        water: 0,
+                        medical: 3,
+                    },
+                    living: LivingState {
+                        hunger: 0,
+                        thirst: 0,
+                        fatigue: 0,
+                        sleep_debt: 0,
+                        morale: 1000,
+                        health: 1000,
+                        activity: Activity::Idle,
+                        life: LifeState::Alive,
+                        materialized_at: 0,
+                    },
+                },
+                Soldier {
+                    id: patient,
+                    faction: 0,
+                    position: Position {
+                        x_mm: 0,
+                        y_mm: 0,
+                        cell: 0,
+                    },
+                    squad: None,
+                    role: Role::Rifle,
+                    rank: 0,
+                    health: 1000,
+                    needs: Needs {
+                        fatigue: 0,
+                        hunger: 0,
+                        thirst: 0,
+                        sleep_debt: 0,
+                    },
+                    ammunition: 0,
+                    inventory: Inventory {
+                        food: 0,
+                        water: 0,
+                        medical: 0,
+                    },
+                    living: LivingState {
+                        hunger: 0,
+                        thirst: 0,
+                        fatigue: 0,
+                        sleep_debt: 0,
+                        morale: 1000,
+                        health: 1000,
+                        activity: Activity::Idle,
+                        life: LifeState::Alive,
+                        materialized_at: 0,
+                    },
+                },
             ],
             absent_soldiers: vec![EntityId::from_parts(2, 0), EntityId::from_parts(0, 1)],
             wounds: vec![],
@@ -1894,47 +2168,37 @@ mod tests {
     fn direct_second_wound_probe_fixture() -> PublicMedicalFixture {
         let medic = EntityId::from_parts(0, 0);
         let patient = EntityId::from_parts(1, 0);
-        let wound0 = Wound {
-            id: WoundId(0),
-            patient,
-            created_at: 0,
-            spec: WoundSpec {
-                trauma: 10,
-                bleeding_per_second: 20,
-                shock: 30,
-            },
-            controlled: false,
-            healed: false,
-        };
-        let wound1 = Wound {
-            id: WoundId(1),
-            patient,
-            created_at: 0,
-            spec: WoundSpec {
-                trauma: 1,
-                bleeding_per_second: 0,
-                shock: 0,
-            },
-            controlled: false,
-            healed: false,
-        };
+
         PublicMedicalFixture {
             name: "direct second wound probe",
             clock: 0,
             soldier_count: 2,
             soldiers: vec![
-                fixture_soldier(
-                    medic,
-                    Role::Medic,
-                    5,
-                    1000,
-                    Needs {
+                Soldier {
+                    id: medic,
+                    faction: 0,
+                    position: Position {
+                        x_mm: 0,
+                        y_mm: 0,
+                        cell: 0,
+                    },
+                    squad: None,
+                    role: Role::Medic,
+                    rank: 0,
+                    health: 1000,
+                    needs: Needs {
                         fatigue: 0,
                         hunger: 0,
                         thirst: 0,
                         sleep_debt: 0,
                     },
-                    LivingState {
+                    ammunition: 0,
+                    inventory: Inventory {
+                        food: 0,
+                        water: 0,
+                        medical: 5,
+                    },
+                    living: LivingState {
                         hunger: 0,
                         thirst: 0,
                         fatigue: 0,
@@ -1945,19 +2209,32 @@ mod tests {
                         life: LifeState::Alive,
                         materialized_at: 0,
                     },
-                ),
-                fixture_soldier(
-                    patient,
-                    Role::Rifle,
-                    0,
-                    989,
-                    Needs {
+                },
+                Soldier {
+                    id: patient,
+                    faction: 0,
+                    position: Position {
+                        x_mm: 0,
+                        y_mm: 0,
+                        cell: 0,
+                    },
+                    squad: None,
+                    role: Role::Rifle,
+                    rank: 0,
+                    health: 989,
+                    needs: Needs {
                         fatigue: 0,
                         hunger: 0,
                         thirst: 0,
                         sleep_debt: 0,
                     },
-                    LivingState {
+                    ammunition: 0,
+                    inventory: Inventory {
+                        food: 0,
+                        water: 0,
+                        medical: 0,
+                    },
+                    living: LivingState {
                         hunger: 0,
                         thirst: 0,
                         fatigue: 0,
@@ -1968,11 +2245,67 @@ mod tests {
                         life: LifeState::Alive,
                         materialized_at: 0,
                     },
-                ),
+                },
             ],
             absent_soldiers: vec![EntityId::from_parts(2, 0), EntityId::from_parts(0, 1)],
-            wounds: vec![wound0, wound1],
-            wounds_of: vec![(patient, vec![wound0, wound1]), (medic, vec![])],
+            wounds: vec![
+                Wound {
+                    id: WoundId(0),
+                    patient,
+                    created_at: 0,
+                    spec: WoundSpec {
+                        trauma: 10,
+                        bleeding_per_second: 20,
+                        shock: 30,
+                    },
+                    controlled: false,
+                    healed: false,
+                },
+                Wound {
+                    id: WoundId(1),
+                    patient,
+                    created_at: 0,
+                    spec: WoundSpec {
+                        trauma: 1,
+                        bleeding_per_second: 0,
+                        shock: 0,
+                    },
+                    controlled: false,
+                    healed: false,
+                },
+            ],
+            wounds_of: vec![
+                (
+                    patient,
+                    vec![
+                        Wound {
+                            id: WoundId(0),
+                            patient,
+                            created_at: 0,
+                            spec: WoundSpec {
+                                trauma: 10,
+                                bleeding_per_second: 20,
+                                shock: 30,
+                            },
+                            controlled: false,
+                            healed: false,
+                        },
+                        Wound {
+                            id: WoundId(1),
+                            patient,
+                            created_at: 0,
+                            spec: WoundSpec {
+                                trauma: 1,
+                                bleeding_per_second: 0,
+                                shock: 0,
+                            },
+                            controlled: false,
+                            healed: false,
+                        },
+                    ],
+                ),
+                (medic, vec![]),
+            ],
             absent_wounds: vec![WoundId(2), WoundId(99)],
             casualties: vec![
                 (medic, None),
@@ -2019,47 +2352,37 @@ mod tests {
         let medic = EntityId::from_parts(0, 0);
         let patient = EntityId::from_parts(1, 0);
         let endpoint = EntityId::from_parts(2, 0);
-        let wound0 = Wound {
-            id: WoundId(0),
-            patient,
-            created_at: 0,
-            spec: WoundSpec {
-                trauma: 10,
-                bleeding_per_second: 20,
-                shock: 30,
-            },
-            controlled: false,
-            healed: false,
-        };
-        let wound1 = Wound {
-            id: WoundId(1),
-            patient: endpoint,
-            created_at: 0,
-            spec: WoundSpec {
-                trauma: 1,
-                bleeding_per_second: 1,
-                shock: 1,
-            },
-            controlled: false,
-            healed: false,
-        };
+
         PublicMedicalFixture {
             name: "direct busy probe",
             clock: 0,
             soldier_count: 3,
             soldiers: vec![
-                fixture_soldier(
-                    medic,
-                    Role::Medic,
-                    4,
-                    1000,
-                    Needs {
+                Soldier {
+                    id: medic,
+                    faction: 0,
+                    position: Position {
+                        x_mm: 0,
+                        y_mm: 0,
+                        cell: 0,
+                    },
+                    squad: None,
+                    role: Role::Medic,
+                    rank: 0,
+                    health: 1000,
+                    needs: Needs {
                         fatigue: 0,
                         hunger: 0,
                         thirst: 0,
                         sleep_debt: 0,
                     },
-                    LivingState {
+                    ammunition: 0,
+                    inventory: Inventory {
+                        food: 0,
+                        water: 0,
+                        medical: 4,
+                    },
+                    living: LivingState {
                         hunger: 0,
                         thirst: 0,
                         fatigue: 0,
@@ -2070,19 +2393,32 @@ mod tests {
                         life: LifeState::Alive,
                         materialized_at: 0,
                     },
-                ),
-                fixture_soldier(
-                    patient,
-                    Role::Rifle,
-                    0,
-                    990,
-                    Needs {
+                },
+                Soldier {
+                    id: patient,
+                    faction: 0,
+                    position: Position {
+                        x_mm: 0,
+                        y_mm: 0,
+                        cell: 0,
+                    },
+                    squad: None,
+                    role: Role::Rifle,
+                    rank: 0,
+                    health: 990,
+                    needs: Needs {
                         fatigue: 0,
                         hunger: 0,
                         thirst: 0,
                         sleep_debt: 0,
                     },
-                    LivingState {
+                    ammunition: 0,
+                    inventory: Inventory {
+                        food: 0,
+                        water: 0,
+                        medical: 0,
+                    },
+                    living: LivingState {
                         hunger: 0,
                         thirst: 0,
                         fatigue: 0,
@@ -2093,19 +2429,32 @@ mod tests {
                         life: LifeState::Alive,
                         materialized_at: 0,
                     },
-                ),
-                fixture_soldier(
-                    endpoint,
-                    Role::Rifle,
-                    0,
-                    999,
-                    Needs {
+                },
+                Soldier {
+                    id: endpoint,
+                    faction: 0,
+                    position: Position {
+                        x_mm: 0,
+                        y_mm: 0,
+                        cell: 0,
+                    },
+                    squad: None,
+                    role: Role::Rifle,
+                    rank: 0,
+                    health: 999,
+                    needs: Needs {
                         fatigue: 0,
                         hunger: 0,
                         thirst: 0,
                         sleep_debt: 0,
                     },
-                    LivingState {
+                    ammunition: 0,
+                    inventory: Inventory {
+                        food: 0,
+                        water: 0,
+                        medical: 0,
+                    },
+                    living: LivingState {
                         hunger: 0,
                         thirst: 0,
                         fatigue: 0,
@@ -2116,13 +2465,66 @@ mod tests {
                         life: LifeState::Alive,
                         materialized_at: 0,
                     },
-                ),
+                },
             ],
             absent_soldiers: vec![EntityId::from_parts(3, 0), EntityId::from_parts(0, 1)],
-            wounds: vec![wound0, wound1],
+            wounds: vec![
+                Wound {
+                    id: WoundId(0),
+                    patient,
+                    created_at: 0,
+                    spec: WoundSpec {
+                        trauma: 10,
+                        bleeding_per_second: 20,
+                        shock: 30,
+                    },
+                    controlled: false,
+                    healed: false,
+                },
+                Wound {
+                    id: WoundId(1),
+                    patient: endpoint,
+                    created_at: 0,
+                    spec: WoundSpec {
+                        trauma: 1,
+                        bleeding_per_second: 1,
+                        shock: 1,
+                    },
+                    controlled: false,
+                    healed: false,
+                },
+            ],
             wounds_of: vec![
-                (patient, vec![wound0]),
-                (endpoint, vec![wound1]),
+                (
+                    patient,
+                    vec![Wound {
+                        id: WoundId(0),
+                        patient,
+                        created_at: 0,
+                        spec: WoundSpec {
+                            trauma: 10,
+                            bleeding_per_second: 20,
+                            shock: 30,
+                        },
+                        controlled: false,
+                        healed: false,
+                    }],
+                ),
+                (
+                    endpoint,
+                    vec![Wound {
+                        id: WoundId(1),
+                        patient: endpoint,
+                        created_at: 0,
+                        spec: WoundSpec {
+                            trauma: 1,
+                            bleeding_per_second: 1,
+                            shock: 1,
+                        },
+                        controlled: false,
+                        healed: false,
+                    }],
+                ),
                 (medic, vec![]),
             ],
             absent_wounds: vec![WoundId(2), WoundId(99)],
@@ -2192,35 +2594,37 @@ mod tests {
     fn direct_release_probe_fixture() -> PublicMedicalFixture {
         let medic = EntityId::from_parts(0, 0);
         let patient = EntityId::from_parts(1, 0);
-        let wound = Wound {
-            id: WoundId(0),
-            patient,
-            created_at: 0,
-            spec: WoundSpec {
-                trauma: 10,
-                bleeding_per_second: 20,
-                shock: 30,
-            },
-            controlled: false,
-            healed: false,
-        };
+
         PublicMedicalFixture {
             name: "direct release probe",
             clock: 0,
             soldier_count: 2,
             soldiers: vec![
-                fixture_soldier(
-                    medic,
-                    Role::Medic,
-                    3,
-                    1000,
-                    Needs {
+                Soldier {
+                    id: medic,
+                    faction: 0,
+                    position: Position {
+                        x_mm: 0,
+                        y_mm: 0,
+                        cell: 0,
+                    },
+                    squad: None,
+                    role: Role::Medic,
+                    rank: 0,
+                    health: 1000,
+                    needs: Needs {
                         fatigue: 0,
                         hunger: 0,
                         thirst: 0,
                         sleep_debt: 0,
                     },
-                    LivingState {
+                    ammunition: 0,
+                    inventory: Inventory {
+                        food: 0,
+                        water: 0,
+                        medical: 3,
+                    },
+                    living: LivingState {
                         hunger: 0,
                         thirst: 0,
                         fatigue: 0,
@@ -2231,19 +2635,32 @@ mod tests {
                         life: LifeState::Alive,
                         materialized_at: 0,
                     },
-                ),
-                fixture_soldier(
-                    patient,
-                    Role::Rifle,
-                    0,
-                    990,
-                    Needs {
+                },
+                Soldier {
+                    id: patient,
+                    faction: 0,
+                    position: Position {
+                        x_mm: 0,
+                        y_mm: 0,
+                        cell: 0,
+                    },
+                    squad: None,
+                    role: Role::Rifle,
+                    rank: 0,
+                    health: 990,
+                    needs: Needs {
                         fatigue: 0,
                         hunger: 0,
                         thirst: 0,
                         sleep_debt: 0,
                     },
-                    LivingState {
+                    ammunition: 0,
+                    inventory: Inventory {
+                        food: 0,
+                        water: 0,
+                        medical: 0,
+                    },
+                    living: LivingState {
                         hunger: 0,
                         thirst: 0,
                         fatigue: 0,
@@ -2254,11 +2671,39 @@ mod tests {
                         life: LifeState::Alive,
                         materialized_at: 0,
                     },
-                ),
+                },
             ],
             absent_soldiers: vec![EntityId::from_parts(2, 0), EntityId::from_parts(0, 1)],
-            wounds: vec![wound],
-            wounds_of: vec![(patient, vec![wound]), (medic, vec![])],
+            wounds: vec![Wound {
+                id: WoundId(0),
+                patient,
+                created_at: 0,
+                spec: WoundSpec {
+                    trauma: 10,
+                    bleeding_per_second: 20,
+                    shock: 30,
+                },
+                controlled: false,
+                healed: false,
+            }],
+            wounds_of: vec![
+                (
+                    patient,
+                    vec![Wound {
+                        id: WoundId(0),
+                        patient,
+                        created_at: 0,
+                        spec: WoundSpec {
+                            trauma: 10,
+                            bleeding_per_second: 20,
+                            shock: 30,
+                        },
+                        controlled: false,
+                        healed: false,
+                    }],
+                ),
+                (medic, vec![]),
+            ],
             absent_wounds: vec![WoundId(1), WoundId(99)],
             casualties: vec![
                 (medic, None),
@@ -2331,58 +2776,37 @@ mod tests {
         let m0 = EntityId::from_parts(0, 0);
         let m1 = EntityId::from_parts(1, 0);
         let patient = EntityId::from_parts(2, 0);
-        let wound = Wound {
-            id: WoundId(0),
-            patient,
-            created_at: 0,
-            spec: WoundSpec {
-                trauma: 0,
-                bleeding_per_second: 0,
-                shock: 400,
-            },
-            controlled: false,
-            healed: false,
-        };
+
         PublicMedicalFixture {
             name: "Shock clock 14",
             clock: 14,
             soldier_count: 3,
             soldiers: vec![
-                fixture_soldier(
-                    m0,
-                    Role::Medic,
-                    2,
-                    1000,
-                    Needs {
+                Soldier {
+                    id: m0,
+                    faction: 0,
+                    position: Position {
+                        x_mm: 0,
+                        y_mm: 0,
+                        cell: 0,
+                    },
+                    squad: None,
+                    role: Role::Medic,
+                    rank: 0,
+                    health: 1000,
+                    needs: Needs {
                         fatigue: 14,
                         hunger: 14,
                         thirst: 28,
                         sleep_debt: 14,
                     },
-                    LivingState {
-                        hunger: 14,
-                        thirst: 28,
-                        fatigue: 14,
-                        sleep_debt: 14,
-                        morale: 1000,
-                        health: 1000,
-                        activity: Activity::Idle,
-                        life: LifeState::Alive,
-                        materialized_at: 14,
+                    ammunition: 0,
+                    inventory: Inventory {
+                        food: 0,
+                        water: 0,
+                        medical: 2,
                     },
-                ),
-                fixture_soldier(
-                    m1,
-                    Role::Medic,
-                    4,
-                    1000,
-                    Needs {
-                        fatigue: 14,
-                        hunger: 14,
-                        thirst: 28,
-                        sleep_debt: 14,
-                    },
-                    LivingState {
+                    living: LivingState {
                         hunger: 14,
                         thirst: 28,
                         fatigue: 14,
@@ -2393,19 +2817,32 @@ mod tests {
                         life: LifeState::Alive,
                         materialized_at: 14,
                     },
-                ),
-                fixture_soldier(
-                    patient,
-                    Role::Rifle,
-                    0,
-                    1000,
-                    Needs {
+                },
+                Soldier {
+                    id: m1,
+                    faction: 0,
+                    position: Position {
+                        x_mm: 0,
+                        y_mm: 0,
+                        cell: 0,
+                    },
+                    squad: None,
+                    role: Role::Medic,
+                    rank: 0,
+                    health: 1000,
+                    needs: Needs {
                         fatigue: 14,
                         hunger: 14,
                         thirst: 28,
                         sleep_debt: 14,
                     },
-                    LivingState {
+                    ammunition: 0,
+                    inventory: Inventory {
+                        food: 0,
+                        water: 0,
+                        medical: 4,
+                    },
+                    living: LivingState {
                         hunger: 14,
                         thirst: 28,
                         fatigue: 14,
@@ -2416,11 +2853,76 @@ mod tests {
                         life: LifeState::Alive,
                         materialized_at: 14,
                     },
-                ),
+                },
+                Soldier {
+                    id: patient,
+                    faction: 0,
+                    position: Position {
+                        x_mm: 0,
+                        y_mm: 0,
+                        cell: 0,
+                    },
+                    squad: None,
+                    role: Role::Rifle,
+                    rank: 0,
+                    health: 1000,
+                    needs: Needs {
+                        fatigue: 14,
+                        hunger: 14,
+                        thirst: 28,
+                        sleep_debt: 14,
+                    },
+                    ammunition: 0,
+                    inventory: Inventory {
+                        food: 0,
+                        water: 0,
+                        medical: 0,
+                    },
+                    living: LivingState {
+                        hunger: 14,
+                        thirst: 28,
+                        fatigue: 14,
+                        sleep_debt: 14,
+                        morale: 1000,
+                        health: 1000,
+                        activity: Activity::Idle,
+                        life: LifeState::Alive,
+                        materialized_at: 14,
+                    },
+                },
             ],
             absent_soldiers: vec![EntityId::from_parts(3, 0), EntityId::from_parts(0, 1)],
-            wounds: vec![wound],
-            wounds_of: vec![(patient, vec![wound]), (m0, vec![]), (m1, vec![])],
+            wounds: vec![Wound {
+                id: WoundId(0),
+                patient,
+                created_at: 0,
+                spec: WoundSpec {
+                    trauma: 0,
+                    bleeding_per_second: 0,
+                    shock: 400,
+                },
+                controlled: false,
+                healed: false,
+            }],
+            wounds_of: vec![
+                (
+                    patient,
+                    vec![Wound {
+                        id: WoundId(0),
+                        patient,
+                        created_at: 0,
+                        spec: WoundSpec {
+                            trauma: 0,
+                            bleeding_per_second: 0,
+                            shock: 400,
+                        },
+                        controlled: false,
+                        healed: false,
+                    }],
+                ),
+                (m0, vec![]),
+                (m1, vec![]),
+            ],
             absent_wounds: vec![WoundId(1), WoundId(99)],
             casualties: vec![
                 (m0, None),
@@ -2478,58 +2980,37 @@ mod tests {
         let m0 = EntityId::from_parts(0, 0);
         let m1 = EntityId::from_parts(1, 0);
         let patient = EntityId::from_parts(2, 0);
-        let wound = Wound {
-            id: WoundId(0),
-            patient,
-            created_at: 0,
-            spec: WoundSpec {
-                trauma: 0,
-                bleeding_per_second: 0,
-                shock: 400,
-            },
-            controlled: false,
-            healed: false,
-        };
+
         PublicMedicalFixture {
             name: "Shock clock 15",
             clock: 15,
             soldier_count: 3,
             soldiers: vec![
-                fixture_soldier(
-                    m0,
-                    Role::Medic,
-                    2,
-                    1000,
-                    Needs {
+                Soldier {
+                    id: m0,
+                    faction: 0,
+                    position: Position {
+                        x_mm: 0,
+                        y_mm: 0,
+                        cell: 0,
+                    },
+                    squad: None,
+                    role: Role::Medic,
+                    rank: 0,
+                    health: 1000,
+                    needs: Needs {
                         fatigue: 15,
                         hunger: 15,
                         thirst: 30,
                         sleep_debt: 15,
                     },
-                    LivingState {
-                        hunger: 15,
-                        thirst: 30,
-                        fatigue: 15,
-                        sleep_debt: 15,
-                        morale: 1000,
-                        health: 1000,
-                        activity: Activity::Idle,
-                        life: LifeState::Alive,
-                        materialized_at: 15,
+                    ammunition: 0,
+                    inventory: Inventory {
+                        food: 0,
+                        water: 0,
+                        medical: 2,
                     },
-                ),
-                fixture_soldier(
-                    m1,
-                    Role::Medic,
-                    4,
-                    1000,
-                    Needs {
-                        fatigue: 15,
-                        hunger: 15,
-                        thirst: 30,
-                        sleep_debt: 15,
-                    },
-                    LivingState {
+                    living: LivingState {
                         hunger: 15,
                         thirst: 30,
                         fatigue: 15,
@@ -2540,19 +3021,32 @@ mod tests {
                         life: LifeState::Alive,
                         materialized_at: 15,
                     },
-                ),
-                fixture_soldier(
-                    patient,
-                    Role::Rifle,
-                    0,
-                    1000,
-                    Needs {
+                },
+                Soldier {
+                    id: m1,
+                    faction: 0,
+                    position: Position {
+                        x_mm: 0,
+                        y_mm: 0,
+                        cell: 0,
+                    },
+                    squad: None,
+                    role: Role::Medic,
+                    rank: 0,
+                    health: 1000,
+                    needs: Needs {
                         fatigue: 15,
                         hunger: 15,
                         thirst: 30,
                         sleep_debt: 15,
                     },
-                    LivingState {
+                    ammunition: 0,
+                    inventory: Inventory {
+                        food: 0,
+                        water: 0,
+                        medical: 4,
+                    },
+                    living: LivingState {
                         hunger: 15,
                         thirst: 30,
                         fatigue: 15,
@@ -2563,11 +3057,76 @@ mod tests {
                         life: LifeState::Alive,
                         materialized_at: 15,
                     },
-                ),
+                },
+                Soldier {
+                    id: patient,
+                    faction: 0,
+                    position: Position {
+                        x_mm: 0,
+                        y_mm: 0,
+                        cell: 0,
+                    },
+                    squad: None,
+                    role: Role::Rifle,
+                    rank: 0,
+                    health: 1000,
+                    needs: Needs {
+                        fatigue: 15,
+                        hunger: 15,
+                        thirst: 30,
+                        sleep_debt: 15,
+                    },
+                    ammunition: 0,
+                    inventory: Inventory {
+                        food: 0,
+                        water: 0,
+                        medical: 0,
+                    },
+                    living: LivingState {
+                        hunger: 15,
+                        thirst: 30,
+                        fatigue: 15,
+                        sleep_debt: 15,
+                        morale: 1000,
+                        health: 1000,
+                        activity: Activity::Idle,
+                        life: LifeState::Alive,
+                        materialized_at: 15,
+                    },
+                },
             ],
             absent_soldiers: vec![EntityId::from_parts(3, 0), EntityId::from_parts(0, 1)],
-            wounds: vec![wound],
-            wounds_of: vec![(patient, vec![wound]), (m0, vec![]), (m1, vec![])],
+            wounds: vec![Wound {
+                id: WoundId(0),
+                patient,
+                created_at: 0,
+                spec: WoundSpec {
+                    trauma: 0,
+                    bleeding_per_second: 0,
+                    shock: 400,
+                },
+                controlled: false,
+                healed: false,
+            }],
+            wounds_of: vec![
+                (
+                    patient,
+                    vec![Wound {
+                        id: WoundId(0),
+                        patient,
+                        created_at: 0,
+                        spec: WoundSpec {
+                            trauma: 0,
+                            bleeding_per_second: 0,
+                            shock: 400,
+                        },
+                        controlled: false,
+                        healed: false,
+                    }],
+                ),
+                (m0, vec![]),
+                (m1, vec![]),
+            ],
             absent_wounds: vec![WoundId(1), WoundId(99)],
             casualties: vec![
                 (m0, None),
@@ -2626,70 +3185,37 @@ mod tests {
         let m1 = EntityId::from_parts(1, 0);
         let patient = EntityId::from_parts(2, 0);
         let patient2 = EntityId::from_parts(3, 0);
-        let wound0 = Wound {
-            id: WoundId(0),
-            patient,
-            created_at: 0,
-            spec: WoundSpec {
-                trauma: 0,
-                bleeding_per_second: 0,
-                shock: 400,
-            },
-            controlled: false,
-            healed: false,
-        };
-        let wound1 = Wound {
-            id: WoundId(1),
-            patient: patient2,
-            created_at: 0,
-            spec: WoundSpec {
-                trauma: 0,
-                bleeding_per_second: 0,
-                shock: 400,
-            },
-            controlled: false,
-            healed: false,
-        };
+
         PublicMedicalFixture {
             name: "Shock second patient post-wound",
             clock: 0,
             soldier_count: 4,
             soldiers: vec![
-                fixture_soldier(
-                    m0,
-                    Role::Medic,
-                    2,
-                    1000,
-                    Needs {
+                Soldier {
+                    id: m0,
+                    faction: 0,
+                    position: Position {
+                        x_mm: 0,
+                        y_mm: 0,
+                        cell: 0,
+                    },
+                    squad: None,
+                    role: Role::Medic,
+                    rank: 0,
+                    health: 1000,
+                    needs: Needs {
                         fatigue: 0,
                         hunger: 0,
                         thirst: 0,
                         sleep_debt: 0,
                     },
-                    LivingState {
-                        hunger: 0,
-                        thirst: 0,
-                        fatigue: 0,
-                        sleep_debt: 0,
-                        morale: 1000,
-                        health: 1000,
-                        activity: Activity::Idle,
-                        life: LifeState::Alive,
-                        materialized_at: 0,
+                    ammunition: 0,
+                    inventory: Inventory {
+                        food: 0,
+                        water: 0,
+                        medical: 2,
                     },
-                ),
-                fixture_soldier(
-                    m1,
-                    Role::Medic,
-                    4,
-                    1000,
-                    Needs {
-                        fatigue: 0,
-                        hunger: 0,
-                        thirst: 0,
-                        sleep_debt: 0,
-                    },
-                    LivingState {
+                    living: LivingState {
                         hunger: 0,
                         thirst: 0,
                         fatigue: 0,
@@ -2700,42 +3226,32 @@ mod tests {
                         life: LifeState::Alive,
                         materialized_at: 0,
                     },
-                ),
-                fixture_soldier(
-                    patient,
-                    Role::Rifle,
-                    0,
-                    1000,
-                    Needs {
+                },
+                Soldier {
+                    id: m1,
+                    faction: 0,
+                    position: Position {
+                        x_mm: 0,
+                        y_mm: 0,
+                        cell: 0,
+                    },
+                    squad: None,
+                    role: Role::Medic,
+                    rank: 0,
+                    health: 1000,
+                    needs: Needs {
                         fatigue: 0,
                         hunger: 0,
                         thirst: 0,
                         sleep_debt: 0,
                     },
-                    LivingState {
-                        hunger: 0,
-                        thirst: 0,
-                        fatigue: 0,
-                        sleep_debt: 0,
-                        morale: 1000,
-                        health: 1000,
-                        activity: Activity::Idle,
-                        life: LifeState::Alive,
-                        materialized_at: 0,
+                    ammunition: 0,
+                    inventory: Inventory {
+                        food: 0,
+                        water: 0,
+                        medical: 4,
                     },
-                ),
-                fixture_soldier(
-                    patient2,
-                    Role::Rifle,
-                    0,
-                    1000,
-                    Needs {
-                        fatigue: 0,
-                        hunger: 0,
-                        thirst: 0,
-                        sleep_debt: 0,
-                    },
-                    LivingState {
+                    living: LivingState {
                         hunger: 0,
                         thirst: 0,
                         fatigue: 0,
@@ -2746,13 +3262,138 @@ mod tests {
                         life: LifeState::Alive,
                         materialized_at: 0,
                     },
-                ),
+                },
+                Soldier {
+                    id: patient,
+                    faction: 0,
+                    position: Position {
+                        x_mm: 0,
+                        y_mm: 0,
+                        cell: 0,
+                    },
+                    squad: None,
+                    role: Role::Rifle,
+                    rank: 0,
+                    health: 1000,
+                    needs: Needs {
+                        fatigue: 0,
+                        hunger: 0,
+                        thirst: 0,
+                        sleep_debt: 0,
+                    },
+                    ammunition: 0,
+                    inventory: Inventory {
+                        food: 0,
+                        water: 0,
+                        medical: 0,
+                    },
+                    living: LivingState {
+                        hunger: 0,
+                        thirst: 0,
+                        fatigue: 0,
+                        sleep_debt: 0,
+                        morale: 1000,
+                        health: 1000,
+                        activity: Activity::Idle,
+                        life: LifeState::Alive,
+                        materialized_at: 0,
+                    },
+                },
+                Soldier {
+                    id: patient2,
+                    faction: 0,
+                    position: Position {
+                        x_mm: 0,
+                        y_mm: 0,
+                        cell: 0,
+                    },
+                    squad: None,
+                    role: Role::Rifle,
+                    rank: 0,
+                    health: 1000,
+                    needs: Needs {
+                        fatigue: 0,
+                        hunger: 0,
+                        thirst: 0,
+                        sleep_debt: 0,
+                    },
+                    ammunition: 0,
+                    inventory: Inventory {
+                        food: 0,
+                        water: 0,
+                        medical: 0,
+                    },
+                    living: LivingState {
+                        hunger: 0,
+                        thirst: 0,
+                        fatigue: 0,
+                        sleep_debt: 0,
+                        morale: 1000,
+                        health: 1000,
+                        activity: Activity::Idle,
+                        life: LifeState::Alive,
+                        materialized_at: 0,
+                    },
+                },
             ],
             absent_soldiers: vec![EntityId::from_parts(4, 0), EntityId::from_parts(0, 1)],
-            wounds: vec![wound0, wound1],
+            wounds: vec![
+                Wound {
+                    id: WoundId(0),
+                    patient,
+                    created_at: 0,
+                    spec: WoundSpec {
+                        trauma: 0,
+                        bleeding_per_second: 0,
+                        shock: 400,
+                    },
+                    controlled: false,
+                    healed: false,
+                },
+                Wound {
+                    id: WoundId(1),
+                    patient: patient2,
+                    created_at: 0,
+                    spec: WoundSpec {
+                        trauma: 0,
+                        bleeding_per_second: 0,
+                        shock: 400,
+                    },
+                    controlled: false,
+                    healed: false,
+                },
+            ],
             wounds_of: vec![
-                (patient, vec![wound0]),
-                (patient2, vec![wound1]),
+                (
+                    patient,
+                    vec![Wound {
+                        id: WoundId(0),
+                        patient,
+                        created_at: 0,
+                        spec: WoundSpec {
+                            trauma: 0,
+                            bleeding_per_second: 0,
+                            shock: 400,
+                        },
+                        controlled: false,
+                        healed: false,
+                    }],
+                ),
+                (
+                    patient2,
+                    vec![Wound {
+                        id: WoundId(1),
+                        patient: patient2,
+                        created_at: 0,
+                        spec: WoundSpec {
+                            trauma: 0,
+                            bleeding_per_second: 0,
+                            shock: 400,
+                        },
+                        controlled: false,
+                        healed: false,
+                    }],
+                ),
                 (m0, vec![]),
                 (m1, vec![]),
             ],
@@ -2826,70 +3467,37 @@ mod tests {
         let m1 = EntityId::from_parts(1, 0);
         let patient = EntityId::from_parts(2, 0);
         let patient2 = EntityId::from_parts(3, 0);
-        let wound0 = Wound {
-            id: WoundId(0),
-            patient,
-            created_at: 0,
-            spec: WoundSpec {
-                trauma: 0,
-                bleeding_per_second: 0,
-                shock: 400,
-            },
-            controlled: false,
-            healed: false,
-        };
-        let wound1 = Wound {
-            id: WoundId(1),
-            patient: patient2,
-            created_at: 0,
-            spec: WoundSpec {
-                trauma: 0,
-                bleeding_per_second: 0,
-                shock: 400,
-            },
-            controlled: false,
-            healed: false,
-        };
+
         PublicMedicalFixture {
             name: "Shock second selection",
             clock: 0,
             soldier_count: 4,
             soldiers: vec![
-                fixture_soldier(
-                    m0,
-                    Role::Medic,
-                    2,
-                    1000,
-                    Needs {
+                Soldier {
+                    id: m0,
+                    faction: 0,
+                    position: Position {
+                        x_mm: 0,
+                        y_mm: 0,
+                        cell: 0,
+                    },
+                    squad: None,
+                    role: Role::Medic,
+                    rank: 0,
+                    health: 1000,
+                    needs: Needs {
                         fatigue: 0,
                         hunger: 0,
                         thirst: 0,
                         sleep_debt: 0,
                     },
-                    LivingState {
-                        hunger: 0,
-                        thirst: 0,
-                        fatigue: 0,
-                        sleep_debt: 0,
-                        morale: 1000,
-                        health: 1000,
-                        activity: Activity::Idle,
-                        life: LifeState::Alive,
-                        materialized_at: 0,
+                    ammunition: 0,
+                    inventory: Inventory {
+                        food: 0,
+                        water: 0,
+                        medical: 2,
                     },
-                ),
-                fixture_soldier(
-                    m1,
-                    Role::Medic,
-                    2,
-                    1000,
-                    Needs {
-                        fatigue: 0,
-                        hunger: 0,
-                        thirst: 0,
-                        sleep_debt: 0,
-                    },
-                    LivingState {
+                    living: LivingState {
                         hunger: 0,
                         thirst: 0,
                         fatigue: 0,
@@ -2900,42 +3508,32 @@ mod tests {
                         life: LifeState::Alive,
                         materialized_at: 0,
                     },
-                ),
-                fixture_soldier(
-                    patient,
-                    Role::Rifle,
-                    0,
-                    1000,
-                    Needs {
+                },
+                Soldier {
+                    id: m1,
+                    faction: 0,
+                    position: Position {
+                        x_mm: 0,
+                        y_mm: 0,
+                        cell: 0,
+                    },
+                    squad: None,
+                    role: Role::Medic,
+                    rank: 0,
+                    health: 1000,
+                    needs: Needs {
                         fatigue: 0,
                         hunger: 0,
                         thirst: 0,
                         sleep_debt: 0,
                     },
-                    LivingState {
-                        hunger: 0,
-                        thirst: 0,
-                        fatigue: 0,
-                        sleep_debt: 0,
-                        morale: 1000,
-                        health: 1000,
-                        activity: Activity::Idle,
-                        life: LifeState::Alive,
-                        materialized_at: 0,
+                    ammunition: 0,
+                    inventory: Inventory {
+                        food: 0,
+                        water: 0,
+                        medical: 2,
                     },
-                ),
-                fixture_soldier(
-                    patient2,
-                    Role::Rifle,
-                    0,
-                    1000,
-                    Needs {
-                        fatigue: 0,
-                        hunger: 0,
-                        thirst: 0,
-                        sleep_debt: 0,
-                    },
-                    LivingState {
+                    living: LivingState {
                         hunger: 0,
                         thirst: 0,
                         fatigue: 0,
@@ -2946,13 +3544,138 @@ mod tests {
                         life: LifeState::Alive,
                         materialized_at: 0,
                     },
-                ),
+                },
+                Soldier {
+                    id: patient,
+                    faction: 0,
+                    position: Position {
+                        x_mm: 0,
+                        y_mm: 0,
+                        cell: 0,
+                    },
+                    squad: None,
+                    role: Role::Rifle,
+                    rank: 0,
+                    health: 1000,
+                    needs: Needs {
+                        fatigue: 0,
+                        hunger: 0,
+                        thirst: 0,
+                        sleep_debt: 0,
+                    },
+                    ammunition: 0,
+                    inventory: Inventory {
+                        food: 0,
+                        water: 0,
+                        medical: 0,
+                    },
+                    living: LivingState {
+                        hunger: 0,
+                        thirst: 0,
+                        fatigue: 0,
+                        sleep_debt: 0,
+                        morale: 1000,
+                        health: 1000,
+                        activity: Activity::Idle,
+                        life: LifeState::Alive,
+                        materialized_at: 0,
+                    },
+                },
+                Soldier {
+                    id: patient2,
+                    faction: 0,
+                    position: Position {
+                        x_mm: 0,
+                        y_mm: 0,
+                        cell: 0,
+                    },
+                    squad: None,
+                    role: Role::Rifle,
+                    rank: 0,
+                    health: 1000,
+                    needs: Needs {
+                        fatigue: 0,
+                        hunger: 0,
+                        thirst: 0,
+                        sleep_debt: 0,
+                    },
+                    ammunition: 0,
+                    inventory: Inventory {
+                        food: 0,
+                        water: 0,
+                        medical: 0,
+                    },
+                    living: LivingState {
+                        hunger: 0,
+                        thirst: 0,
+                        fatigue: 0,
+                        sleep_debt: 0,
+                        morale: 1000,
+                        health: 1000,
+                        activity: Activity::Idle,
+                        life: LifeState::Alive,
+                        materialized_at: 0,
+                    },
+                },
             ],
             absent_soldiers: vec![EntityId::from_parts(4, 0), EntityId::from_parts(0, 1)],
-            wounds: vec![wound0, wound1],
+            wounds: vec![
+                Wound {
+                    id: WoundId(0),
+                    patient,
+                    created_at: 0,
+                    spec: WoundSpec {
+                        trauma: 0,
+                        bleeding_per_second: 0,
+                        shock: 400,
+                    },
+                    controlled: false,
+                    healed: false,
+                },
+                Wound {
+                    id: WoundId(1),
+                    patient: patient2,
+                    created_at: 0,
+                    spec: WoundSpec {
+                        trauma: 0,
+                        bleeding_per_second: 0,
+                        shock: 400,
+                    },
+                    controlled: false,
+                    healed: false,
+                },
+            ],
             wounds_of: vec![
-                (patient, vec![wound0]),
-                (patient2, vec![wound1]),
+                (
+                    patient,
+                    vec![Wound {
+                        id: WoundId(0),
+                        patient,
+                        created_at: 0,
+                        spec: WoundSpec {
+                            trauma: 0,
+                            bleeding_per_second: 0,
+                            shock: 400,
+                        },
+                        controlled: false,
+                        healed: false,
+                    }],
+                ),
+                (
+                    patient2,
+                    vec![Wound {
+                        id: WoundId(1),
+                        patient: patient2,
+                        created_at: 0,
+                        spec: WoundSpec {
+                            trauma: 0,
+                            bleeding_per_second: 0,
+                            shock: 400,
+                        },
+                        controlled: false,
+                        healed: false,
+                    }],
+                ),
                 (m0, vec![]),
                 (m1, vec![]),
             ],
@@ -3037,35 +3760,37 @@ mod tests {
     fn healing_post_wound_fixture() -> PublicMedicalFixture {
         let medic = EntityId::from_parts(0, 0);
         let patient = EntityId::from_parts(1, 0);
-        let wound = Wound {
-            id: WoundId(0),
-            patient,
-            created_at: 0,
-            spec: WoundSpec {
-                trauma: 10,
-                bleeding_per_second: 20,
-                shock: 30,
-            },
-            controlled: false,
-            healed: false,
-        };
+
         PublicMedicalFixture {
             name: "healing post-wound",
             clock: 0,
             soldier_count: 2,
             soldiers: vec![
-                fixture_soldier(
-                    medic,
-                    Role::Medic,
-                    3,
-                    1000,
-                    Needs {
+                Soldier {
+                    id: medic,
+                    faction: 0,
+                    position: Position {
+                        x_mm: 0,
+                        y_mm: 0,
+                        cell: 0,
+                    },
+                    squad: None,
+                    role: Role::Medic,
+                    rank: 0,
+                    health: 1000,
+                    needs: Needs {
                         fatigue: 0,
                         hunger: 0,
                         thirst: 0,
                         sleep_debt: 0,
                     },
-                    LivingState {
+                    ammunition: 0,
+                    inventory: Inventory {
+                        food: 0,
+                        water: 0,
+                        medical: 3,
+                    },
+                    living: LivingState {
                         hunger: 0,
                         thirst: 0,
                         fatigue: 0,
@@ -3076,19 +3801,32 @@ mod tests {
                         life: LifeState::Alive,
                         materialized_at: 0,
                     },
-                ),
-                fixture_soldier(
-                    patient,
-                    Role::Rifle,
-                    0,
-                    990,
-                    Needs {
+                },
+                Soldier {
+                    id: patient,
+                    faction: 0,
+                    position: Position {
+                        x_mm: 0,
+                        y_mm: 0,
+                        cell: 0,
+                    },
+                    squad: None,
+                    role: Role::Rifle,
+                    rank: 0,
+                    health: 990,
+                    needs: Needs {
                         fatigue: 0,
                         hunger: 0,
                         thirst: 0,
                         sleep_debt: 0,
                     },
-                    LivingState {
+                    ammunition: 0,
+                    inventory: Inventory {
+                        food: 0,
+                        water: 0,
+                        medical: 0,
+                    },
+                    living: LivingState {
                         hunger: 0,
                         thirst: 0,
                         fatigue: 0,
@@ -3099,11 +3837,39 @@ mod tests {
                         life: LifeState::Alive,
                         materialized_at: 0,
                     },
-                ),
+                },
             ],
             absent_soldiers: vec![EntityId::from_parts(2, 0), EntityId::from_parts(0, 1)],
-            wounds: vec![wound],
-            wounds_of: vec![(patient, vec![wound]), (medic, vec![])],
+            wounds: vec![Wound {
+                id: WoundId(0),
+                patient,
+                created_at: 0,
+                spec: WoundSpec {
+                    trauma: 10,
+                    bleeding_per_second: 20,
+                    shock: 30,
+                },
+                controlled: false,
+                healed: false,
+            }],
+            wounds_of: vec![
+                (
+                    patient,
+                    vec![Wound {
+                        id: WoundId(0),
+                        patient,
+                        created_at: 0,
+                        spec: WoundSpec {
+                            trauma: 10,
+                            bleeding_per_second: 20,
+                            shock: 30,
+                        },
+                        controlled: false,
+                        healed: false,
+                    }],
+                ),
+                (medic, vec![]),
+            ],
             absent_wounds: vec![WoundId(1), WoundId(99)],
             casualties: vec![
                 (medic, None),
@@ -3150,58 +3916,37 @@ mod tests {
         let m0 = EntityId::from_parts(0, 0);
         let m1 = EntityId::from_parts(1, 0);
         let patient = EntityId::from_parts(2, 0);
-        let wound = Wound {
-            id: WoundId(0),
-            patient,
-            created_at: 0,
-            spec: WoundSpec {
-                trauma: 0,
-                bleeding_per_second: 0,
-                shock: 400,
-            },
-            controlled: false,
-            healed: false,
-        };
+
         PublicMedicalFixture {
             name: "Shock post-wound",
             clock: 0,
             soldier_count: 3,
             soldiers: vec![
-                fixture_soldier(
-                    m0,
-                    Role::Medic,
-                    4,
-                    1000,
-                    Needs {
+                Soldier {
+                    id: m0,
+                    faction: 0,
+                    position: Position {
+                        x_mm: 0,
+                        y_mm: 0,
+                        cell: 0,
+                    },
+                    squad: None,
+                    role: Role::Medic,
+                    rank: 0,
+                    health: 1000,
+                    needs: Needs {
                         fatigue: 0,
                         hunger: 0,
                         thirst: 0,
                         sleep_debt: 0,
                     },
-                    LivingState {
-                        hunger: 0,
-                        thirst: 0,
-                        fatigue: 0,
-                        sleep_debt: 0,
-                        morale: 1000,
-                        health: 1000,
-                        activity: Activity::Idle,
-                        life: LifeState::Alive,
-                        materialized_at: 0,
+                    ammunition: 0,
+                    inventory: Inventory {
+                        food: 0,
+                        water: 0,
+                        medical: 4,
                     },
-                ),
-                fixture_soldier(
-                    m1,
-                    Role::Medic,
-                    4,
-                    1000,
-                    Needs {
-                        fatigue: 0,
-                        hunger: 0,
-                        thirst: 0,
-                        sleep_debt: 0,
-                    },
-                    LivingState {
+                    living: LivingState {
                         hunger: 0,
                         thirst: 0,
                         fatigue: 0,
@@ -3212,19 +3957,32 @@ mod tests {
                         life: LifeState::Alive,
                         materialized_at: 0,
                     },
-                ),
-                fixture_soldier(
-                    patient,
-                    Role::Rifle,
-                    0,
-                    1000,
-                    Needs {
+                },
+                Soldier {
+                    id: m1,
+                    faction: 0,
+                    position: Position {
+                        x_mm: 0,
+                        y_mm: 0,
+                        cell: 0,
+                    },
+                    squad: None,
+                    role: Role::Medic,
+                    rank: 0,
+                    health: 1000,
+                    needs: Needs {
                         fatigue: 0,
                         hunger: 0,
                         thirst: 0,
                         sleep_debt: 0,
                     },
-                    LivingState {
+                    ammunition: 0,
+                    inventory: Inventory {
+                        food: 0,
+                        water: 0,
+                        medical: 4,
+                    },
+                    living: LivingState {
                         hunger: 0,
                         thirst: 0,
                         fatigue: 0,
@@ -3235,11 +3993,76 @@ mod tests {
                         life: LifeState::Alive,
                         materialized_at: 0,
                     },
-                ),
+                },
+                Soldier {
+                    id: patient,
+                    faction: 0,
+                    position: Position {
+                        x_mm: 0,
+                        y_mm: 0,
+                        cell: 0,
+                    },
+                    squad: None,
+                    role: Role::Rifle,
+                    rank: 0,
+                    health: 1000,
+                    needs: Needs {
+                        fatigue: 0,
+                        hunger: 0,
+                        thirst: 0,
+                        sleep_debt: 0,
+                    },
+                    ammunition: 0,
+                    inventory: Inventory {
+                        food: 0,
+                        water: 0,
+                        medical: 0,
+                    },
+                    living: LivingState {
+                        hunger: 0,
+                        thirst: 0,
+                        fatigue: 0,
+                        sleep_debt: 0,
+                        morale: 1000,
+                        health: 1000,
+                        activity: Activity::Idle,
+                        life: LifeState::Alive,
+                        materialized_at: 0,
+                    },
+                },
             ],
             absent_soldiers: vec![EntityId::from_parts(3, 0), EntityId::from_parts(0, 1)],
-            wounds: vec![wound],
-            wounds_of: vec![(patient, vec![wound]), (m0, vec![]), (m1, vec![])],
+            wounds: vec![Wound {
+                id: WoundId(0),
+                patient,
+                created_at: 0,
+                spec: WoundSpec {
+                    trauma: 0,
+                    bleeding_per_second: 0,
+                    shock: 400,
+                },
+                controlled: false,
+                healed: false,
+            }],
+            wounds_of: vec![
+                (
+                    patient,
+                    vec![Wound {
+                        id: WoundId(0),
+                        patient,
+                        created_at: 0,
+                        spec: WoundSpec {
+                            trauma: 0,
+                            bleeding_per_second: 0,
+                            shock: 400,
+                        },
+                        controlled: false,
+                        healed: false,
+                    }],
+                ),
+                (m0, vec![]),
+                (m1, vec![]),
+            ],
             absent_wounds: vec![WoundId(1), WoundId(99)],
             casualties: vec![
                 (m0, None),
@@ -3286,35 +4109,37 @@ mod tests {
     fn direct_post_wound_fixture() -> PublicMedicalFixture {
         let medic = EntityId::from_parts(0, 0);
         let patient = EntityId::from_parts(1, 0);
-        let wound = Wound {
-            id: WoundId(0),
-            patient,
-            created_at: 0,
-            spec: WoundSpec {
-                trauma: 10,
-                bleeding_per_second: 20,
-                shock: 30,
-            },
-            controlled: false,
-            healed: false,
-        };
+
         PublicMedicalFixture {
             name: "direct post-wound",
             clock: 0,
             soldier_count: 2,
             soldiers: vec![
-                fixture_soldier(
-                    medic,
-                    Role::Medic,
-                    5,
-                    1000,
-                    Needs {
+                Soldier {
+                    id: medic,
+                    faction: 0,
+                    position: Position {
+                        x_mm: 0,
+                        y_mm: 0,
+                        cell: 0,
+                    },
+                    squad: None,
+                    role: Role::Medic,
+                    rank: 0,
+                    health: 1000,
+                    needs: Needs {
                         fatigue: 0,
                         hunger: 0,
                         thirst: 0,
                         sleep_debt: 0,
                     },
-                    LivingState {
+                    ammunition: 0,
+                    inventory: Inventory {
+                        food: 0,
+                        water: 0,
+                        medical: 5,
+                    },
+                    living: LivingState {
                         hunger: 0,
                         thirst: 0,
                         fatigue: 0,
@@ -3325,19 +4150,32 @@ mod tests {
                         life: LifeState::Alive,
                         materialized_at: 0,
                     },
-                ),
-                fixture_soldier(
-                    patient,
-                    Role::Rifle,
-                    0,
-                    990,
-                    Needs {
+                },
+                Soldier {
+                    id: patient,
+                    faction: 0,
+                    position: Position {
+                        x_mm: 0,
+                        y_mm: 0,
+                        cell: 0,
+                    },
+                    squad: None,
+                    role: Role::Rifle,
+                    rank: 0,
+                    health: 990,
+                    needs: Needs {
                         fatigue: 0,
                         hunger: 0,
                         thirst: 0,
                         sleep_debt: 0,
                     },
-                    LivingState {
+                    ammunition: 0,
+                    inventory: Inventory {
+                        food: 0,
+                        water: 0,
+                        medical: 0,
+                    },
+                    living: LivingState {
                         hunger: 0,
                         thirst: 0,
                         fatigue: 0,
@@ -3348,11 +4186,39 @@ mod tests {
                         life: LifeState::Alive,
                         materialized_at: 0,
                     },
-                ),
+                },
             ],
             absent_soldiers: vec![EntityId::from_parts(2, 0), EntityId::from_parts(0, 1)],
-            wounds: vec![wound],
-            wounds_of: vec![(patient, vec![wound]), (medic, vec![])],
+            wounds: vec![Wound {
+                id: WoundId(0),
+                patient,
+                created_at: 0,
+                spec: WoundSpec {
+                    trauma: 10,
+                    bleeding_per_second: 20,
+                    shock: 30,
+                },
+                controlled: false,
+                healed: false,
+            }],
+            wounds_of: vec![
+                (
+                    patient,
+                    vec![Wound {
+                        id: WoundId(0),
+                        patient,
+                        created_at: 0,
+                        spec: WoundSpec {
+                            trauma: 10,
+                            bleeding_per_second: 20,
+                            shock: 30,
+                        },
+                        controlled: false,
+                        healed: false,
+                    }],
+                ),
+                (medic, vec![]),
+            ],
             absent_wounds: vec![WoundId(1), WoundId(99)],
             casualties: vec![
                 (medic, None),
@@ -3398,35 +4264,37 @@ mod tests {
     fn direct_active_fixture() -> PublicMedicalFixture {
         let medic = EntityId::from_parts(0, 0);
         let patient = EntityId::from_parts(1, 0);
-        let wound = Wound {
-            id: WoundId(0),
-            patient,
-            created_at: 0,
-            spec: WoundSpec {
-                trauma: 10,
-                bleeding_per_second: 20,
-                shock: 30,
-            },
-            controlled: false,
-            healed: false,
-        };
+
         PublicMedicalFixture {
             name: "direct active",
             clock: 0,
             soldier_count: 2,
             soldiers: vec![
-                fixture_soldier(
-                    medic,
-                    Role::Medic,
-                    4,
-                    1000,
-                    Needs {
+                Soldier {
+                    id: medic,
+                    faction: 0,
+                    position: Position {
+                        x_mm: 0,
+                        y_mm: 0,
+                        cell: 0,
+                    },
+                    squad: None,
+                    role: Role::Medic,
+                    rank: 0,
+                    health: 1000,
+                    needs: Needs {
                         fatigue: 0,
                         hunger: 0,
                         thirst: 0,
                         sleep_debt: 0,
                     },
-                    LivingState {
+                    ammunition: 0,
+                    inventory: Inventory {
+                        food: 0,
+                        water: 0,
+                        medical: 4,
+                    },
+                    living: LivingState {
                         hunger: 0,
                         thirst: 0,
                         fatigue: 0,
@@ -3437,19 +4305,32 @@ mod tests {
                         life: LifeState::Alive,
                         materialized_at: 0,
                     },
-                ),
-                fixture_soldier(
-                    patient,
-                    Role::Rifle,
-                    0,
-                    990,
-                    Needs {
+                },
+                Soldier {
+                    id: patient,
+                    faction: 0,
+                    position: Position {
+                        x_mm: 0,
+                        y_mm: 0,
+                        cell: 0,
+                    },
+                    squad: None,
+                    role: Role::Rifle,
+                    rank: 0,
+                    health: 990,
+                    needs: Needs {
                         fatigue: 0,
                         hunger: 0,
                         thirst: 0,
                         sleep_debt: 0,
                     },
-                    LivingState {
+                    ammunition: 0,
+                    inventory: Inventory {
+                        food: 0,
+                        water: 0,
+                        medical: 0,
+                    },
+                    living: LivingState {
                         hunger: 0,
                         thirst: 0,
                         fatigue: 0,
@@ -3460,11 +4341,39 @@ mod tests {
                         life: LifeState::Alive,
                         materialized_at: 0,
                     },
-                ),
+                },
             ],
             absent_soldiers: vec![EntityId::from_parts(2, 0), EntityId::from_parts(0, 1)],
-            wounds: vec![wound],
-            wounds_of: vec![(patient, vec![wound]), (medic, vec![])],
+            wounds: vec![Wound {
+                id: WoundId(0),
+                patient,
+                created_at: 0,
+                spec: WoundSpec {
+                    trauma: 10,
+                    bleeding_per_second: 20,
+                    shock: 30,
+                },
+                controlled: false,
+                healed: false,
+            }],
+            wounds_of: vec![
+                (
+                    patient,
+                    vec![Wound {
+                        id: WoundId(0),
+                        patient,
+                        created_at: 0,
+                        spec: WoundSpec {
+                            trauma: 10,
+                            bleeding_per_second: 20,
+                            shock: 30,
+                        },
+                        controlled: false,
+                        healed: false,
+                    }],
+                ),
+                (medic, vec![]),
+            ],
             absent_wounds: vec![WoundId(1), WoundId(99)],
             casualties: vec![
                 (medic, None),
@@ -3520,35 +4429,37 @@ mod tests {
     fn direct_interrupted_fixture() -> PublicMedicalFixture {
         let medic = EntityId::from_parts(0, 0);
         let patient = EntityId::from_parts(1, 0);
-        let wound = Wound {
-            id: WoundId(0),
-            patient,
-            created_at: 0,
-            spec: WoundSpec {
-                trauma: 10,
-                bleeding_per_second: 20,
-                shock: 30,
-            },
-            controlled: false,
-            healed: false,
-        };
+
         PublicMedicalFixture {
             name: "direct interrupted",
             clock: 0,
             soldier_count: 2,
             soldiers: vec![
-                fixture_soldier(
-                    medic,
-                    Role::Medic,
-                    4,
-                    1000,
-                    Needs {
+                Soldier {
+                    id: medic,
+                    faction: 0,
+                    position: Position {
+                        x_mm: 0,
+                        y_mm: 0,
+                        cell: 0,
+                    },
+                    squad: None,
+                    role: Role::Medic,
+                    rank: 0,
+                    health: 1000,
+                    needs: Needs {
                         fatigue: 0,
                         hunger: 0,
                         thirst: 0,
                         sleep_debt: 0,
                     },
-                    LivingState {
+                    ammunition: 0,
+                    inventory: Inventory {
+                        food: 0,
+                        water: 0,
+                        medical: 4,
+                    },
+                    living: LivingState {
                         hunger: 0,
                         thirst: 0,
                         fatigue: 0,
@@ -3559,19 +4470,32 @@ mod tests {
                         life: LifeState::Alive,
                         materialized_at: 0,
                     },
-                ),
-                fixture_soldier(
-                    patient,
-                    Role::Rifle,
-                    0,
-                    990,
-                    Needs {
+                },
+                Soldier {
+                    id: patient,
+                    faction: 0,
+                    position: Position {
+                        x_mm: 0,
+                        y_mm: 0,
+                        cell: 0,
+                    },
+                    squad: None,
+                    role: Role::Rifle,
+                    rank: 0,
+                    health: 990,
+                    needs: Needs {
                         fatigue: 0,
                         hunger: 0,
                         thirst: 0,
                         sleep_debt: 0,
                     },
-                    LivingState {
+                    ammunition: 0,
+                    inventory: Inventory {
+                        food: 0,
+                        water: 0,
+                        medical: 0,
+                    },
+                    living: LivingState {
                         hunger: 0,
                         thirst: 0,
                         fatigue: 0,
@@ -3582,11 +4506,39 @@ mod tests {
                         life: LifeState::Alive,
                         materialized_at: 0,
                     },
-                ),
+                },
             ],
             absent_soldiers: vec![EntityId::from_parts(2, 0), EntityId::from_parts(0, 1)],
-            wounds: vec![wound],
-            wounds_of: vec![(patient, vec![wound]), (medic, vec![])],
+            wounds: vec![Wound {
+                id: WoundId(0),
+                patient,
+                created_at: 0,
+                spec: WoundSpec {
+                    trauma: 10,
+                    bleeding_per_second: 20,
+                    shock: 30,
+                },
+                controlled: false,
+                healed: false,
+            }],
+            wounds_of: vec![
+                (
+                    patient,
+                    vec![Wound {
+                        id: WoundId(0),
+                        patient,
+                        created_at: 0,
+                        spec: WoundSpec {
+                            trauma: 10,
+                            bleeding_per_second: 20,
+                            shock: 30,
+                        },
+                        controlled: false,
+                        healed: false,
+                    }],
+                ),
+                (medic, vec![]),
+            ],
             absent_wounds: vec![WoundId(1), WoundId(99)],
             casualties: vec![
                 (medic, None),
@@ -3645,35 +4597,37 @@ mod tests {
     fn direct_clock20_fixture() -> PublicMedicalFixture {
         let medic = EntityId::from_parts(0, 0);
         let patient = EntityId::from_parts(1, 0);
-        let wound = Wound {
-            id: WoundId(0),
-            patient,
-            created_at: 0,
-            spec: WoundSpec {
-                trauma: 10,
-                bleeding_per_second: 20,
-                shock: 30,
-            },
-            controlled: false,
-            healed: false,
-        };
+
         PublicMedicalFixture {
             name: "direct clock 20",
             clock: 20,
             soldier_count: 2,
             soldiers: vec![
-                fixture_soldier(
-                    medic,
-                    Role::Medic,
-                    4,
-                    1000,
-                    Needs {
+                Soldier {
+                    id: medic,
+                    faction: 0,
+                    position: Position {
+                        x_mm: 0,
+                        y_mm: 0,
+                        cell: 0,
+                    },
+                    squad: None,
+                    role: Role::Medic,
+                    rank: 0,
+                    health: 1000,
+                    needs: Needs {
                         fatigue: 20,
                         hunger: 20,
                         thirst: 40,
                         sleep_debt: 20,
                     },
-                    LivingState {
+                    ammunition: 0,
+                    inventory: Inventory {
+                        food: 0,
+                        water: 0,
+                        medical: 4,
+                    },
+                    living: LivingState {
                         hunger: 20,
                         thirst: 40,
                         fatigue: 20,
@@ -3684,19 +4638,32 @@ mod tests {
                         life: LifeState::Alive,
                         materialized_at: 20,
                     },
-                ),
-                fixture_soldier(
-                    patient,
-                    Role::Rifle,
-                    0,
-                    990,
-                    Needs {
+                },
+                Soldier {
+                    id: patient,
+                    faction: 0,
+                    position: Position {
+                        x_mm: 0,
+                        y_mm: 0,
+                        cell: 0,
+                    },
+                    squad: None,
+                    role: Role::Rifle,
+                    rank: 0,
+                    health: 990,
+                    needs: Needs {
                         fatigue: 20,
                         hunger: 20,
                         thirst: 40,
                         sleep_debt: 20,
                     },
-                    LivingState {
+                    ammunition: 0,
+                    inventory: Inventory {
+                        food: 0,
+                        water: 0,
+                        medical: 0,
+                    },
+                    living: LivingState {
                         hunger: 20,
                         thirst: 40,
                         fatigue: 20,
@@ -3707,11 +4674,39 @@ mod tests {
                         life: LifeState::Alive,
                         materialized_at: 20,
                     },
-                ),
+                },
             ],
             absent_soldiers: vec![EntityId::from_parts(2, 0), EntityId::from_parts(0, 1)],
-            wounds: vec![wound],
-            wounds_of: vec![(patient, vec![wound]), (medic, vec![])],
+            wounds: vec![Wound {
+                id: WoundId(0),
+                patient,
+                created_at: 0,
+                spec: WoundSpec {
+                    trauma: 10,
+                    bleeding_per_second: 20,
+                    shock: 30,
+                },
+                controlled: false,
+                healed: false,
+            }],
+            wounds_of: vec![
+                (
+                    patient,
+                    vec![Wound {
+                        id: WoundId(0),
+                        patient,
+                        created_at: 0,
+                        spec: WoundSpec {
+                            trauma: 10,
+                            bleeding_per_second: 20,
+                            shock: 30,
+                        },
+                        controlled: false,
+                        healed: false,
+                    }],
+                ),
+                (medic, vec![]),
+            ],
             absent_wounds: vec![WoundId(1), WoundId(99)],
             casualties: vec![
                 (medic, None),
@@ -3770,35 +4765,37 @@ mod tests {
     fn healing_active_fixture() -> PublicMedicalFixture {
         let medic = EntityId::from_parts(0, 0);
         let patient = EntityId::from_parts(1, 0);
-        let wound = Wound {
-            id: WoundId(0),
-            patient,
-            created_at: 0,
-            spec: WoundSpec {
-                trauma: 10,
-                bleeding_per_second: 20,
-                shock: 30,
-            },
-            controlled: false,
-            healed: false,
-        };
+
         PublicMedicalFixture {
             name: "healing active",
             clock: 0,
             soldier_count: 2,
             soldiers: vec![
-                fixture_soldier(
-                    medic,
-                    Role::Medic,
-                    2,
-                    1000,
-                    Needs {
+                Soldier {
+                    id: medic,
+                    faction: 0,
+                    position: Position {
+                        x_mm: 0,
+                        y_mm: 0,
+                        cell: 0,
+                    },
+                    squad: None,
+                    role: Role::Medic,
+                    rank: 0,
+                    health: 1000,
+                    needs: Needs {
                         fatigue: 0,
                         hunger: 0,
                         thirst: 0,
                         sleep_debt: 0,
                     },
-                    LivingState {
+                    ammunition: 0,
+                    inventory: Inventory {
+                        food: 0,
+                        water: 0,
+                        medical: 2,
+                    },
+                    living: LivingState {
                         hunger: 0,
                         thirst: 0,
                         fatigue: 0,
@@ -3809,19 +4806,32 @@ mod tests {
                         life: LifeState::Alive,
                         materialized_at: 0,
                     },
-                ),
-                fixture_soldier(
-                    patient,
-                    Role::Rifle,
-                    0,
-                    990,
-                    Needs {
+                },
+                Soldier {
+                    id: patient,
+                    faction: 0,
+                    position: Position {
+                        x_mm: 0,
+                        y_mm: 0,
+                        cell: 0,
+                    },
+                    squad: None,
+                    role: Role::Rifle,
+                    rank: 0,
+                    health: 990,
+                    needs: Needs {
                         fatigue: 0,
                         hunger: 0,
                         thirst: 0,
                         sleep_debt: 0,
                     },
-                    LivingState {
+                    ammunition: 0,
+                    inventory: Inventory {
+                        food: 0,
+                        water: 0,
+                        medical: 0,
+                    },
+                    living: LivingState {
                         hunger: 0,
                         thirst: 0,
                         fatigue: 0,
@@ -3832,11 +4842,39 @@ mod tests {
                         life: LifeState::Alive,
                         materialized_at: 0,
                     },
-                ),
+                },
             ],
             absent_soldiers: vec![EntityId::from_parts(2, 0), EntityId::from_parts(0, 1)],
-            wounds: vec![wound],
-            wounds_of: vec![(patient, vec![wound]), (medic, vec![])],
+            wounds: vec![Wound {
+                id: WoundId(0),
+                patient,
+                created_at: 0,
+                spec: WoundSpec {
+                    trauma: 10,
+                    bleeding_per_second: 20,
+                    shock: 30,
+                },
+                controlled: false,
+                healed: false,
+            }],
+            wounds_of: vec![
+                (
+                    patient,
+                    vec![Wound {
+                        id: WoundId(0),
+                        patient,
+                        created_at: 0,
+                        spec: WoundSpec {
+                            trauma: 10,
+                            bleeding_per_second: 20,
+                            shock: 30,
+                        },
+                        controlled: false,
+                        healed: false,
+                    }],
+                ),
+                (medic, vec![]),
+            ],
             absent_wounds: vec![WoundId(1), WoundId(99)],
             casualties: vec![
                 (medic, None),
@@ -3892,35 +4930,37 @@ mod tests {
     fn healing_clock9_fixture() -> PublicMedicalFixture {
         let medic = EntityId::from_parts(0, 0);
         let patient = EntityId::from_parts(1, 0);
-        let wound = Wound {
-            id: WoundId(0),
-            patient,
-            created_at: 0,
-            spec: WoundSpec {
-                trauma: 10,
-                bleeding_per_second: 20,
-                shock: 30,
-            },
-            controlled: false,
-            healed: false,
-        };
+
         PublicMedicalFixture {
             name: "healing boundary minus one",
             clock: 9,
             soldier_count: 2,
             soldiers: vec![
-                fixture_soldier(
-                    medic,
-                    Role::Medic,
-                    2,
-                    1000,
-                    Needs {
+                Soldier {
+                    id: medic,
+                    faction: 0,
+                    position: Position {
+                        x_mm: 0,
+                        y_mm: 0,
+                        cell: 0,
+                    },
+                    squad: None,
+                    role: Role::Medic,
+                    rank: 0,
+                    health: 1000,
+                    needs: Needs {
                         fatigue: 9,
                         hunger: 9,
                         thirst: 18,
                         sleep_debt: 9,
                     },
-                    LivingState {
+                    ammunition: 0,
+                    inventory: Inventory {
+                        food: 0,
+                        water: 0,
+                        medical: 2,
+                    },
+                    living: LivingState {
                         hunger: 9,
                         thirst: 18,
                         fatigue: 9,
@@ -3931,19 +4971,32 @@ mod tests {
                         life: LifeState::Alive,
                         materialized_at: 9,
                     },
-                ),
-                fixture_soldier(
-                    patient,
-                    Role::Rifle,
-                    0,
-                    990,
-                    Needs {
+                },
+                Soldier {
+                    id: patient,
+                    faction: 0,
+                    position: Position {
+                        x_mm: 0,
+                        y_mm: 0,
+                        cell: 0,
+                    },
+                    squad: None,
+                    role: Role::Rifle,
+                    rank: 0,
+                    health: 990,
+                    needs: Needs {
                         fatigue: 9,
                         hunger: 9,
                         thirst: 18,
                         sleep_debt: 9,
                     },
-                    LivingState {
+                    ammunition: 0,
+                    inventory: Inventory {
+                        food: 0,
+                        water: 0,
+                        medical: 0,
+                    },
+                    living: LivingState {
                         hunger: 9,
                         thirst: 18,
                         fatigue: 9,
@@ -3954,11 +5007,39 @@ mod tests {
                         life: LifeState::Alive,
                         materialized_at: 9,
                     },
-                ),
+                },
             ],
             absent_soldiers: vec![EntityId::from_parts(2, 0), EntityId::from_parts(0, 1)],
-            wounds: vec![wound],
-            wounds_of: vec![(patient, vec![wound]), (medic, vec![])],
+            wounds: vec![Wound {
+                id: WoundId(0),
+                patient,
+                created_at: 0,
+                spec: WoundSpec {
+                    trauma: 10,
+                    bleeding_per_second: 20,
+                    shock: 30,
+                },
+                controlled: false,
+                healed: false,
+            }],
+            wounds_of: vec![
+                (
+                    patient,
+                    vec![Wound {
+                        id: WoundId(0),
+                        patient,
+                        created_at: 0,
+                        spec: WoundSpec {
+                            trauma: 10,
+                            bleeding_per_second: 20,
+                            shock: 30,
+                        },
+                        controlled: false,
+                        healed: false,
+                    }],
+                ),
+                (medic, vec![]),
+            ],
             absent_wounds: vec![WoundId(1), WoundId(99)],
             casualties: vec![
                 (medic, None),
@@ -4014,35 +5095,37 @@ mod tests {
     fn healing_completed_fixture() -> PublicMedicalFixture {
         let medic = EntityId::from_parts(0, 0);
         let patient = EntityId::from_parts(1, 0);
-        let wound = Wound {
-            id: WoundId(0),
-            patient,
-            created_at: 0,
-            spec: WoundSpec {
-                trauma: 10,
-                bleeding_per_second: 20,
-                shock: 30,
-            },
-            controlled: true,
-            healed: false,
-        };
+
         PublicMedicalFixture {
             name: "healing completed",
             clock: 10,
             soldier_count: 2,
             soldiers: vec![
-                fixture_soldier(
-                    medic,
-                    Role::Medic,
-                    2,
-                    1000,
-                    Needs {
+                Soldier {
+                    id: medic,
+                    faction: 0,
+                    position: Position {
+                        x_mm: 0,
+                        y_mm: 0,
+                        cell: 0,
+                    },
+                    squad: None,
+                    role: Role::Medic,
+                    rank: 0,
+                    health: 1000,
+                    needs: Needs {
                         fatigue: 10,
                         hunger: 10,
                         thirst: 20,
                         sleep_debt: 10,
                     },
-                    LivingState {
+                    ammunition: 0,
+                    inventory: Inventory {
+                        food: 0,
+                        water: 0,
+                        medical: 2,
+                    },
+                    living: LivingState {
                         hunger: 10,
                         thirst: 20,
                         fatigue: 10,
@@ -4053,19 +5136,32 @@ mod tests {
                         life: LifeState::Alive,
                         materialized_at: 10,
                     },
-                ),
-                fixture_soldier(
-                    patient,
-                    Role::Rifle,
-                    0,
-                    990,
-                    Needs {
+                },
+                Soldier {
+                    id: patient,
+                    faction: 0,
+                    position: Position {
+                        x_mm: 0,
+                        y_mm: 0,
+                        cell: 0,
+                    },
+                    squad: None,
+                    role: Role::Rifle,
+                    rank: 0,
+                    health: 990,
+                    needs: Needs {
                         fatigue: 10,
                         hunger: 10,
                         thirst: 20,
                         sleep_debt: 10,
                     },
-                    LivingState {
+                    ammunition: 0,
+                    inventory: Inventory {
+                        food: 0,
+                        water: 0,
+                        medical: 0,
+                    },
+                    living: LivingState {
                         hunger: 10,
                         thirst: 20,
                         fatigue: 10,
@@ -4076,11 +5172,39 @@ mod tests {
                         life: LifeState::Alive,
                         materialized_at: 10,
                     },
-                ),
+                },
             ],
             absent_soldiers: vec![EntityId::from_parts(2, 0), EntityId::from_parts(0, 1)],
-            wounds: vec![wound],
-            wounds_of: vec![(patient, vec![wound]), (medic, vec![])],
+            wounds: vec![Wound {
+                id: WoundId(0),
+                patient,
+                created_at: 0,
+                spec: WoundSpec {
+                    trauma: 10,
+                    bleeding_per_second: 20,
+                    shock: 30,
+                },
+                controlled: true,
+                healed: false,
+            }],
+            wounds_of: vec![
+                (
+                    patient,
+                    vec![Wound {
+                        id: WoundId(0),
+                        patient,
+                        created_at: 0,
+                        spec: WoundSpec {
+                            trauma: 10,
+                            bleeding_per_second: 20,
+                            shock: 30,
+                        },
+                        controlled: true,
+                        healed: false,
+                    }],
+                ),
+                (medic, vec![]),
+            ],
             absent_wounds: vec![WoundId(1), WoundId(99)],
             casualties: vec![
                 (medic, None),
@@ -4136,58 +5260,37 @@ mod tests {
     fn healing_clock15_fixture() -> PublicMedicalFixture {
         let medic = EntityId::from_parts(0, 0);
         let patient = EntityId::from_parts(1, 0);
-        let wound = Wound {
-            id: WoundId(0),
-            patient,
-            created_at: 0,
-            spec: WoundSpec {
-                trauma: 10,
-                bleeding_per_second: 20,
-                shock: 30,
-            },
-            controlled: true,
-            healed: false,
-        };
+
         PublicMedicalFixture {
             name: "healing tick",
             clock: 15,
             soldier_count: 2,
             soldiers: vec![
-                fixture_soldier(
-                    medic,
-                    Role::Medic,
-                    2,
-                    1000,
-                    Needs {
+                Soldier {
+                    id: medic,
+                    faction: 0,
+                    position: Position {
+                        x_mm: 0,
+                        y_mm: 0,
+                        cell: 0,
+                    },
+                    squad: None,
+                    role: Role::Medic,
+                    rank: 0,
+                    health: 1000,
+                    needs: Needs {
                         fatigue: 15,
                         hunger: 15,
                         thirst: 30,
                         sleep_debt: 15,
                     },
-                    LivingState {
-                        hunger: 15,
-                        thirst: 30,
-                        fatigue: 15,
-                        sleep_debt: 15,
-                        morale: 1000,
-                        health: 1000,
-                        activity: Activity::Idle,
-                        life: LifeState::Alive,
-                        materialized_at: 15,
+                    ammunition: 0,
+                    inventory: Inventory {
+                        food: 0,
+                        water: 0,
+                        medical: 2,
                     },
-                ),
-                fixture_soldier(
-                    patient,
-                    Role::Rifle,
-                    0,
-                    1000,
-                    Needs {
-                        fatigue: 15,
-                        hunger: 15,
-                        thirst: 30,
-                        sleep_debt: 15,
-                    },
-                    LivingState {
+                    living: LivingState {
                         hunger: 15,
                         thirst: 30,
                         fatigue: 15,
@@ -4198,11 +5301,75 @@ mod tests {
                         life: LifeState::Alive,
                         materialized_at: 15,
                     },
-                ),
+                },
+                Soldier {
+                    id: patient,
+                    faction: 0,
+                    position: Position {
+                        x_mm: 0,
+                        y_mm: 0,
+                        cell: 0,
+                    },
+                    squad: None,
+                    role: Role::Rifle,
+                    rank: 0,
+                    health: 1000,
+                    needs: Needs {
+                        fatigue: 15,
+                        hunger: 15,
+                        thirst: 30,
+                        sleep_debt: 15,
+                    },
+                    ammunition: 0,
+                    inventory: Inventory {
+                        food: 0,
+                        water: 0,
+                        medical: 0,
+                    },
+                    living: LivingState {
+                        hunger: 15,
+                        thirst: 30,
+                        fatigue: 15,
+                        sleep_debt: 15,
+                        morale: 1000,
+                        health: 1000,
+                        activity: Activity::Idle,
+                        life: LifeState::Alive,
+                        materialized_at: 15,
+                    },
+                },
             ],
             absent_soldiers: vec![EntityId::from_parts(2, 0), EntityId::from_parts(0, 1)],
-            wounds: vec![wound],
-            wounds_of: vec![(patient, vec![wound]), (medic, vec![])],
+            wounds: vec![Wound {
+                id: WoundId(0),
+                patient,
+                created_at: 0,
+                spec: WoundSpec {
+                    trauma: 10,
+                    bleeding_per_second: 20,
+                    shock: 30,
+                },
+                controlled: true,
+                healed: false,
+            }],
+            wounds_of: vec![
+                (
+                    patient,
+                    vec![Wound {
+                        id: WoundId(0),
+                        patient,
+                        created_at: 0,
+                        spec: WoundSpec {
+                            trauma: 10,
+                            bleeding_per_second: 20,
+                            shock: 30,
+                        },
+                        controlled: true,
+                        healed: false,
+                    }],
+                ),
+                (medic, vec![]),
+            ],
             absent_wounds: vec![WoundId(1), WoundId(99)],
             casualties: vec![
                 (medic, None),
@@ -4258,58 +5425,37 @@ mod tests {
     fn healing_terminal_fixture() -> PublicMedicalFixture {
         let medic = EntityId::from_parts(0, 0);
         let patient = EntityId::from_parts(1, 0);
-        let wound = Wound {
-            id: WoundId(0),
-            patient,
-            created_at: 0,
-            spec: WoundSpec {
-                trauma: 10,
-                bleeding_per_second: 20,
-                shock: 30,
-            },
-            controlled: true,
-            healed: true,
-        };
+
         PublicMedicalFixture {
             name: "healing terminal",
             clock: 20,
             soldier_count: 2,
             soldiers: vec![
-                fixture_soldier(
-                    medic,
-                    Role::Medic,
-                    2,
-                    1000,
-                    Needs {
+                Soldier {
+                    id: medic,
+                    faction: 0,
+                    position: Position {
+                        x_mm: 0,
+                        y_mm: 0,
+                        cell: 0,
+                    },
+                    squad: None,
+                    role: Role::Medic,
+                    rank: 0,
+                    health: 1000,
+                    needs: Needs {
                         fatigue: 20,
                         hunger: 20,
                         thirst: 40,
                         sleep_debt: 20,
                     },
-                    LivingState {
-                        hunger: 20,
-                        thirst: 40,
-                        fatigue: 20,
-                        sleep_debt: 20,
-                        morale: 1000,
-                        health: 1000,
-                        activity: Activity::Idle,
-                        life: LifeState::Alive,
-                        materialized_at: 20,
+                    ammunition: 0,
+                    inventory: Inventory {
+                        food: 0,
+                        water: 0,
+                        medical: 2,
                     },
-                ),
-                fixture_soldier(
-                    patient,
-                    Role::Rifle,
-                    0,
-                    1000,
-                    Needs {
-                        fatigue: 20,
-                        hunger: 20,
-                        thirst: 40,
-                        sleep_debt: 20,
-                    },
-                    LivingState {
+                    living: LivingState {
                         hunger: 20,
                         thirst: 40,
                         fatigue: 20,
@@ -4320,11 +5466,75 @@ mod tests {
                         life: LifeState::Alive,
                         materialized_at: 20,
                     },
-                ),
+                },
+                Soldier {
+                    id: patient,
+                    faction: 0,
+                    position: Position {
+                        x_mm: 0,
+                        y_mm: 0,
+                        cell: 0,
+                    },
+                    squad: None,
+                    role: Role::Rifle,
+                    rank: 0,
+                    health: 1000,
+                    needs: Needs {
+                        fatigue: 20,
+                        hunger: 20,
+                        thirst: 40,
+                        sleep_debt: 20,
+                    },
+                    ammunition: 0,
+                    inventory: Inventory {
+                        food: 0,
+                        water: 0,
+                        medical: 0,
+                    },
+                    living: LivingState {
+                        hunger: 20,
+                        thirst: 40,
+                        fatigue: 20,
+                        sleep_debt: 20,
+                        morale: 1000,
+                        health: 1000,
+                        activity: Activity::Idle,
+                        life: LifeState::Alive,
+                        materialized_at: 20,
+                    },
+                },
             ],
             absent_soldiers: vec![EntityId::from_parts(2, 0), EntityId::from_parts(0, 1)],
-            wounds: vec![wound],
-            wounds_of: vec![(patient, vec![wound]), (medic, vec![])],
+            wounds: vec![Wound {
+                id: WoundId(0),
+                patient,
+                created_at: 0,
+                spec: WoundSpec {
+                    trauma: 10,
+                    bleeding_per_second: 20,
+                    shock: 30,
+                },
+                controlled: true,
+                healed: true,
+            }],
+            wounds_of: vec![
+                (
+                    patient,
+                    vec![Wound {
+                        id: WoundId(0),
+                        patient,
+                        created_at: 0,
+                        spec: WoundSpec {
+                            trauma: 10,
+                            bleeding_per_second: 20,
+                            shock: 30,
+                        },
+                        controlled: true,
+                        healed: true,
+                    }],
+                ),
+                (medic, vec![]),
+            ],
             absent_wounds: vec![WoundId(1), WoundId(99)],
             casualties: vec![
                 (medic, None),
@@ -4380,47 +5590,37 @@ mod tests {
     fn healing_completed_probe_fixture() -> PublicMedicalFixture {
         let medic = EntityId::from_parts(0, 0);
         let patient = EntityId::from_parts(1, 0);
-        let wound0 = Wound {
-            id: WoundId(0),
-            patient,
-            created_at: 0,
-            spec: WoundSpec {
-                trauma: 10,
-                bleeding_per_second: 20,
-                shock: 30,
-            },
-            controlled: true,
-            healed: false,
-        };
-        let wound1 = Wound {
-            id: WoundId(1),
-            patient,
-            created_at: 10,
-            spec: WoundSpec {
-                trauma: 1,
-                bleeding_per_second: 1,
-                shock: 1,
-            },
-            controlled: false,
-            healed: false,
-        };
+
         PublicMedicalFixture {
             name: "healing completed allocation probe",
             clock: 10,
             soldier_count: 2,
             soldiers: vec![
-                fixture_soldier(
-                    medic,
-                    Role::Medic,
-                    1,
-                    1000,
-                    Needs {
+                Soldier {
+                    id: medic,
+                    faction: 0,
+                    position: Position {
+                        x_mm: 0,
+                        y_mm: 0,
+                        cell: 0,
+                    },
+                    squad: None,
+                    role: Role::Medic,
+                    rank: 0,
+                    health: 1000,
+                    needs: Needs {
                         fatigue: 10,
                         hunger: 10,
                         thirst: 20,
                         sleep_debt: 10,
                     },
-                    LivingState {
+                    ammunition: 0,
+                    inventory: Inventory {
+                        food: 0,
+                        water: 0,
+                        medical: 1,
+                    },
+                    living: LivingState {
                         hunger: 10,
                         thirst: 20,
                         fatigue: 10,
@@ -4431,19 +5631,32 @@ mod tests {
                         life: LifeState::Alive,
                         materialized_at: 10,
                     },
-                ),
-                fixture_soldier(
-                    patient,
-                    Role::Rifle,
-                    0,
-                    989,
-                    Needs {
+                },
+                Soldier {
+                    id: patient,
+                    faction: 0,
+                    position: Position {
+                        x_mm: 0,
+                        y_mm: 0,
+                        cell: 0,
+                    },
+                    squad: None,
+                    role: Role::Rifle,
+                    rank: 0,
+                    health: 989,
+                    needs: Needs {
                         fatigue: 10,
                         hunger: 10,
                         thirst: 20,
                         sleep_debt: 10,
                     },
-                    LivingState {
+                    ammunition: 0,
+                    inventory: Inventory {
+                        food: 0,
+                        water: 0,
+                        medical: 0,
+                    },
+                    living: LivingState {
                         hunger: 10,
                         thirst: 20,
                         fatigue: 10,
@@ -4454,11 +5667,67 @@ mod tests {
                         life: LifeState::Alive,
                         materialized_at: 10,
                     },
-                ),
+                },
             ],
             absent_soldiers: vec![EntityId::from_parts(2, 0), EntityId::from_parts(0, 1)],
-            wounds: vec![wound0, wound1],
-            wounds_of: vec![(patient, vec![wound0, wound1]), (medic, vec![])],
+            wounds: vec![
+                Wound {
+                    id: WoundId(0),
+                    patient,
+                    created_at: 0,
+                    spec: WoundSpec {
+                        trauma: 10,
+                        bleeding_per_second: 20,
+                        shock: 30,
+                    },
+                    controlled: true,
+                    healed: false,
+                },
+                Wound {
+                    id: WoundId(1),
+                    patient,
+                    created_at: 10,
+                    spec: WoundSpec {
+                        trauma: 1,
+                        bleeding_per_second: 1,
+                        shock: 1,
+                    },
+                    controlled: false,
+                    healed: false,
+                },
+            ],
+            wounds_of: vec![
+                (
+                    patient,
+                    vec![
+                        Wound {
+                            id: WoundId(0),
+                            patient,
+                            created_at: 0,
+                            spec: WoundSpec {
+                                trauma: 10,
+                                bleeding_per_second: 20,
+                                shock: 30,
+                            },
+                            controlled: true,
+                            healed: false,
+                        },
+                        Wound {
+                            id: WoundId(1),
+                            patient,
+                            created_at: 10,
+                            spec: WoundSpec {
+                                trauma: 1,
+                                bleeding_per_second: 1,
+                                shock: 1,
+                            },
+                            controlled: false,
+                            healed: false,
+                        },
+                    ],
+                ),
+                (medic, vec![]),
+            ],
             absent_wounds: vec![WoundId(2), WoundId(99)],
             casualties: vec![
                 (medic, None),
@@ -4527,47 +5796,37 @@ mod tests {
     fn healing_final_probe_fixture() -> PublicMedicalFixture {
         let medic = EntityId::from_parts(0, 0);
         let patient = EntityId::from_parts(1, 0);
-        let wound0 = Wound {
-            id: WoundId(0),
-            patient,
-            created_at: 0,
-            spec: WoundSpec {
-                trauma: 10,
-                bleeding_per_second: 20,
-                shock: 30,
-            },
-            controlled: true,
-            healed: true,
-        };
-        let wound1 = Wound {
-            id: WoundId(1),
-            patient,
-            created_at: 20,
-            spec: WoundSpec {
-                trauma: 1,
-                bleeding_per_second: 1,
-                shock: 1,
-            },
-            controlled: false,
-            healed: false,
-        };
+
         PublicMedicalFixture {
             name: "healing final allocation probe",
             clock: 20,
             soldier_count: 2,
             soldiers: vec![
-                fixture_soldier(
-                    medic,
-                    Role::Medic,
-                    1,
-                    1000,
-                    Needs {
+                Soldier {
+                    id: medic,
+                    faction: 0,
+                    position: Position {
+                        x_mm: 0,
+                        y_mm: 0,
+                        cell: 0,
+                    },
+                    squad: None,
+                    role: Role::Medic,
+                    rank: 0,
+                    health: 1000,
+                    needs: Needs {
                         fatigue: 20,
                         hunger: 20,
                         thirst: 40,
                         sleep_debt: 20,
                     },
-                    LivingState {
+                    ammunition: 0,
+                    inventory: Inventory {
+                        food: 0,
+                        water: 0,
+                        medical: 1,
+                    },
+                    living: LivingState {
                         hunger: 20,
                         thirst: 40,
                         fatigue: 20,
@@ -4578,19 +5837,32 @@ mod tests {
                         life: LifeState::Alive,
                         materialized_at: 20,
                     },
-                ),
-                fixture_soldier(
-                    patient,
-                    Role::Rifle,
-                    0,
-                    999,
-                    Needs {
+                },
+                Soldier {
+                    id: patient,
+                    faction: 0,
+                    position: Position {
+                        x_mm: 0,
+                        y_mm: 0,
+                        cell: 0,
+                    },
+                    squad: None,
+                    role: Role::Rifle,
+                    rank: 0,
+                    health: 999,
+                    needs: Needs {
                         fatigue: 20,
                         hunger: 20,
                         thirst: 40,
                         sleep_debt: 20,
                     },
-                    LivingState {
+                    ammunition: 0,
+                    inventory: Inventory {
+                        food: 0,
+                        water: 0,
+                        medical: 0,
+                    },
+                    living: LivingState {
                         hunger: 20,
                         thirst: 40,
                         fatigue: 20,
@@ -4601,11 +5873,67 @@ mod tests {
                         life: LifeState::Alive,
                         materialized_at: 20,
                     },
-                ),
+                },
             ],
             absent_soldiers: vec![EntityId::from_parts(2, 0), EntityId::from_parts(0, 1)],
-            wounds: vec![wound0, wound1],
-            wounds_of: vec![(patient, vec![wound0, wound1]), (medic, vec![])],
+            wounds: vec![
+                Wound {
+                    id: WoundId(0),
+                    patient,
+                    created_at: 0,
+                    spec: WoundSpec {
+                        trauma: 10,
+                        bleeding_per_second: 20,
+                        shock: 30,
+                    },
+                    controlled: true,
+                    healed: true,
+                },
+                Wound {
+                    id: WoundId(1),
+                    patient,
+                    created_at: 20,
+                    spec: WoundSpec {
+                        trauma: 1,
+                        bleeding_per_second: 1,
+                        shock: 1,
+                    },
+                    controlled: false,
+                    healed: false,
+                },
+            ],
+            wounds_of: vec![
+                (
+                    patient,
+                    vec![
+                        Wound {
+                            id: WoundId(0),
+                            patient,
+                            created_at: 0,
+                            spec: WoundSpec {
+                                trauma: 10,
+                                bleeding_per_second: 20,
+                                shock: 30,
+                            },
+                            controlled: true,
+                            healed: true,
+                        },
+                        Wound {
+                            id: WoundId(1),
+                            patient,
+                            created_at: 20,
+                            spec: WoundSpec {
+                                trauma: 1,
+                                bleeding_per_second: 1,
+                                shock: 1,
+                            },
+                            controlled: false,
+                            healed: false,
+                        },
+                    ],
+                ),
+                (medic, vec![]),
+            ],
             absent_wounds: vec![WoundId(2), WoundId(99)],
             casualties: vec![
                 (medic, None),
@@ -4674,58 +6002,37 @@ mod tests {
     fn healing_clock21_fixture() -> PublicMedicalFixture {
         let medic = EntityId::from_parts(0, 0);
         let patient = EntityId::from_parts(1, 0);
-        let wound = Wound {
-            id: WoundId(0),
-            patient,
-            created_at: 0,
-            spec: WoundSpec {
-                trauma: 10,
-                bleeding_per_second: 20,
-                shock: 30,
-            },
-            controlled: true,
-            healed: true,
-        };
+
         PublicMedicalFixture {
             name: "healing clock 21",
             clock: 21,
             soldier_count: 2,
             soldiers: vec![
-                fixture_soldier(
-                    medic,
-                    Role::Medic,
-                    2,
-                    1000,
-                    Needs {
+                Soldier {
+                    id: medic,
+                    faction: 0,
+                    position: Position {
+                        x_mm: 0,
+                        y_mm: 0,
+                        cell: 0,
+                    },
+                    squad: None,
+                    role: Role::Medic,
+                    rank: 0,
+                    health: 1000,
+                    needs: Needs {
                         fatigue: 21,
                         hunger: 21,
                         thirst: 42,
                         sleep_debt: 21,
                     },
-                    LivingState {
-                        hunger: 21,
-                        thirst: 42,
-                        fatigue: 21,
-                        sleep_debt: 21,
-                        morale: 1000,
-                        health: 1000,
-                        activity: Activity::Idle,
-                        life: LifeState::Alive,
-                        materialized_at: 21,
+                    ammunition: 0,
+                    inventory: Inventory {
+                        food: 0,
+                        water: 0,
+                        medical: 2,
                     },
-                ),
-                fixture_soldier(
-                    patient,
-                    Role::Rifle,
-                    0,
-                    1000,
-                    Needs {
-                        fatigue: 21,
-                        hunger: 21,
-                        thirst: 42,
-                        sleep_debt: 21,
-                    },
-                    LivingState {
+                    living: LivingState {
                         hunger: 21,
                         thirst: 42,
                         fatigue: 21,
@@ -4736,11 +6043,75 @@ mod tests {
                         life: LifeState::Alive,
                         materialized_at: 21,
                     },
-                ),
+                },
+                Soldier {
+                    id: patient,
+                    faction: 0,
+                    position: Position {
+                        x_mm: 0,
+                        y_mm: 0,
+                        cell: 0,
+                    },
+                    squad: None,
+                    role: Role::Rifle,
+                    rank: 0,
+                    health: 1000,
+                    needs: Needs {
+                        fatigue: 21,
+                        hunger: 21,
+                        thirst: 42,
+                        sleep_debt: 21,
+                    },
+                    ammunition: 0,
+                    inventory: Inventory {
+                        food: 0,
+                        water: 0,
+                        medical: 0,
+                    },
+                    living: LivingState {
+                        hunger: 21,
+                        thirst: 42,
+                        fatigue: 21,
+                        sleep_debt: 21,
+                        morale: 1000,
+                        health: 1000,
+                        activity: Activity::Idle,
+                        life: LifeState::Alive,
+                        materialized_at: 21,
+                    },
+                },
             ],
             absent_soldiers: vec![EntityId::from_parts(2, 0), EntityId::from_parts(0, 1)],
-            wounds: vec![wound],
-            wounds_of: vec![(patient, vec![wound]), (medic, vec![])],
+            wounds: vec![Wound {
+                id: WoundId(0),
+                patient,
+                created_at: 0,
+                spec: WoundSpec {
+                    trauma: 10,
+                    bleeding_per_second: 20,
+                    shock: 30,
+                },
+                controlled: true,
+                healed: true,
+            }],
+            wounds_of: vec![
+                (
+                    patient,
+                    vec![Wound {
+                        id: WoundId(0),
+                        patient,
+                        created_at: 0,
+                        spec: WoundSpec {
+                            trauma: 10,
+                            bleeding_per_second: 20,
+                            shock: 30,
+                        },
+                        controlled: true,
+                        healed: true,
+                    }],
+                ),
+                (medic, vec![]),
+            ],
             absent_wounds: vec![WoundId(1), WoundId(99)],
             casualties: vec![
                 (medic, None),
@@ -4836,10 +6207,28 @@ mod tests {
                 materialized_at: 0
             })
         );
-        assert_medical_totals(&after_wound, 5, 0);
+        assert_eq!(
+            after_wound.resource_totals(),
+            ResourceTotals {
+                ammunition: 0,
+                stockpile_supplies: 0,
+                carried_food: 0,
+                carried_water: 0,
+                carried_medical: 5,
+                sourced_food: 0,
+                sourced_water: 0,
+                consumed_food: 0,
+                consumed_water: 0,
+                lost_food: 0,
+                lost_water: 0,
+                sourced_medical: 5,
+                consumed_medical: 0,
+                lost_medical: 0,
+            }
+        );
         let wound_fixture = direct_post_wound_fixture();
         let after_wound = verified_restore(&after_wound, &wound_fixture);
-        let mut wound_allocator_probe = World::from_snapshot(&after_wound.snapshot()).unwrap();
+        let mut wound_allocator_probe = verified_restore(&after_wound, &wound_fixture);
         assert_eq!(
             wound_allocator_probe.apply(Command::InflictWound {
                 patient,
@@ -4893,10 +6282,28 @@ mod tests {
                 status: TreatmentStatus::Active
             })
         );
-        assert_medical_totals(&active, 4, 1);
+        assert_eq!(
+            active.resource_totals(),
+            ResourceTotals {
+                ammunition: 0,
+                stockpile_supplies: 0,
+                carried_food: 0,
+                carried_water: 0,
+                carried_medical: 4,
+                sourced_food: 0,
+                sourced_water: 0,
+                consumed_food: 0,
+                consumed_water: 0,
+                lost_food: 0,
+                lost_water: 0,
+                sourced_medical: 5,
+                consumed_medical: 1,
+                lost_medical: 0,
+            }
+        );
         let active_fixture = direct_active_fixture();
         let active = verified_restore(&active, &active_fixture);
-        let mut busy_probe = World::from_snapshot(&active.snapshot()).unwrap();
+        let mut busy_probe = verified_restore(&active, &active_fixture);
         let endpoint = EntityId::from_parts(2, 0);
         spawn_literal(&mut busy_probe, endpoint, Role::Rifle, 0);
         assert_eq!(
@@ -4967,10 +6374,28 @@ mod tests {
                 }
             })
         );
-        assert_medical_totals(&interrupted, 4, 1);
+        assert_eq!(
+            interrupted.resource_totals(),
+            ResourceTotals {
+                ammunition: 0,
+                stockpile_supplies: 0,
+                carried_food: 0,
+                carried_water: 0,
+                carried_medical: 4,
+                sourced_food: 0,
+                sourced_water: 0,
+                consumed_food: 0,
+                consumed_water: 0,
+                lost_food: 0,
+                lost_water: 0,
+                sourced_medical: 5,
+                consumed_medical: 1,
+                lost_medical: 0,
+            }
+        );
         let interrupted_fixture_value = direct_interrupted_fixture();
         let interrupted = verified_restore(&interrupted, &interrupted_fixture_value);
-        let mut release_probe = World::from_snapshot(&interrupted.snapshot()).unwrap();
+        let mut release_probe = verified_restore(&interrupted, &interrupted_fixture_value);
         assert_eq!(
             release_probe.apply(Command::StartTreatment {
                 medic,
@@ -5012,9 +6437,7 @@ mod tests {
         assert_eq!(unchanged.snapshot(), before);
         assert_eq!(unchanged.state_digest(), 0xaa8a_d8b6_9e55_cfe2);
         interrupted_fixture_value.assert_world(&unchanged);
-        let unchanged_restored = World::from_snapshot(&unchanged.snapshot()).unwrap();
-        interrupted_fixture_value.assert_world(&unchanged_restored);
-        assert_eq!(unchanged_restored.snapshot(), unchanged.snapshot());
+        let unchanged = verified_restore(&unchanged, &interrupted_fixture_value);
         let advance = r#"{"version":1,"command":"advance_to","target":20}"#;
         let (response, advanced) = exchange(req(advance), false, unchanged);
         assert_eq!(status(&response), "HTTP/1.1 200 OK");
@@ -5033,7 +6456,25 @@ mod tests {
             }
         );
         assert!(!advanced.wound(WoundId(0)).unwrap().controlled);
-        assert_medical_totals(&advanced, 4, 1);
+        assert_eq!(
+            advanced.resource_totals(),
+            ResourceTotals {
+                ammunition: 0,
+                stockpile_supplies: 0,
+                carried_food: 0,
+                carried_water: 0,
+                carried_medical: 4,
+                sourced_food: 0,
+                sourced_water: 0,
+                consumed_food: 0,
+                consumed_water: 0,
+                lost_food: 0,
+                lost_water: 0,
+                sourced_medical: 5,
+                consumed_medical: 1,
+                lost_medical: 0,
+            }
+        );
         let advanced_fixture = direct_clock20_fixture();
         verified_restore(&advanced, &advanced_fixture);
     }
@@ -5088,7 +6529,25 @@ mod tests {
                 materialized_at: 0
             })
         );
-        assert_medical_totals(&world, 8, 0);
+        assert_eq!(
+            world.resource_totals(),
+            ResourceTotals {
+                ammunition: 0,
+                stockpile_supplies: 0,
+                carried_food: 0,
+                carried_water: 0,
+                carried_medical: 8,
+                sourced_food: 0,
+                sourced_water: 0,
+                consumed_food: 0,
+                consumed_water: 0,
+                lost_food: 0,
+                lost_water: 0,
+                sourced_medical: 8,
+                consumed_medical: 0,
+                lost_medical: 0,
+            }
+        );
         let world = verified_restore(&world, &shock_post_wound_fixture());
 
         let (response, active) = exchange(
@@ -5115,7 +6574,25 @@ mod tests {
                 status: TreatmentStatus::Active
             })
         );
-        assert_medical_totals(&active, 6, 2);
+        assert_eq!(
+            active.resource_totals(),
+            ResourceTotals {
+                ammunition: 0,
+                stockpile_supplies: 0,
+                carried_food: 0,
+                carried_water: 0,
+                carried_medical: 6,
+                sourced_food: 0,
+                sourced_water: 0,
+                consumed_food: 0,
+                consumed_water: 0,
+                lost_food: 0,
+                lost_water: 0,
+                sourced_medical: 8,
+                consumed_medical: 2,
+                lost_medical: 0,
+            }
+        );
         assert_eq!(
             active.wounds_of(patient),
             vec![Wound {
@@ -5148,41 +6625,31 @@ mod tests {
             clock: 0,
             soldier_count: 3,
             soldiers: vec![
-                fixture_soldier(
-                    m0,
-                    Role::Medic,
-                    2,
-                    1000,
-                    Needs {
+                Soldier {
+                    id: m0,
+                    faction: 0,
+                    position: Position {
+                        x_mm: 0,
+                        y_mm: 0,
+                        cell: 0,
+                    },
+                    squad: None,
+                    role: Role::Medic,
+                    rank: 0,
+                    health: 1000,
+                    needs: Needs {
                         fatigue: 0,
                         hunger: 0,
                         thirst: 0,
                         sleep_debt: 0,
                     },
-                    LivingState {
-                        hunger: 0,
-                        thirst: 0,
-                        fatigue: 0,
-                        sleep_debt: 0,
-                        morale: 1000,
-                        health: 1000,
-                        activity: Activity::Idle,
-                        life: LifeState::Alive,
-                        materialized_at: 0,
+                    ammunition: 0,
+                    inventory: Inventory {
+                        food: 0,
+                        water: 0,
+                        medical: 2,
                     },
-                ),
-                fixture_soldier(
-                    m1,
-                    Role::Medic,
-                    4,
-                    1000,
-                    Needs {
-                        fatigue: 0,
-                        hunger: 0,
-                        thirst: 0,
-                        sleep_debt: 0,
-                    },
-                    LivingState {
+                    living: LivingState {
                         hunger: 0,
                         thirst: 0,
                         fatigue: 0,
@@ -5193,19 +6660,32 @@ mod tests {
                         life: LifeState::Alive,
                         materialized_at: 0,
                     },
-                ),
-                fixture_soldier(
-                    patient,
-                    Role::Rifle,
-                    0,
-                    1000,
-                    Needs {
+                },
+                Soldier {
+                    id: m1,
+                    faction: 0,
+                    position: Position {
+                        x_mm: 0,
+                        y_mm: 0,
+                        cell: 0,
+                    },
+                    squad: None,
+                    role: Role::Medic,
+                    rank: 0,
+                    health: 1000,
+                    needs: Needs {
                         fatigue: 0,
                         hunger: 0,
                         thirst: 0,
                         sleep_debt: 0,
                     },
-                    LivingState {
+                    ammunition: 0,
+                    inventory: Inventory {
+                        food: 0,
+                        water: 0,
+                        medical: 4,
+                    },
+                    living: LivingState {
                         hunger: 0,
                         thirst: 0,
                         fatigue: 0,
@@ -5216,7 +6696,43 @@ mod tests {
                         life: LifeState::Alive,
                         materialized_at: 0,
                     },
-                ),
+                },
+                Soldier {
+                    id: patient,
+                    faction: 0,
+                    position: Position {
+                        x_mm: 0,
+                        y_mm: 0,
+                        cell: 0,
+                    },
+                    squad: None,
+                    role: Role::Rifle,
+                    rank: 0,
+                    health: 1000,
+                    needs: Needs {
+                        fatigue: 0,
+                        hunger: 0,
+                        thirst: 0,
+                        sleep_debt: 0,
+                    },
+                    ammunition: 0,
+                    inventory: Inventory {
+                        food: 0,
+                        water: 0,
+                        medical: 0,
+                    },
+                    living: LivingState {
+                        hunger: 0,
+                        thirst: 0,
+                        fatigue: 0,
+                        sleep_debt: 0,
+                        morale: 1000,
+                        health: 1000,
+                        activity: Activity::Idle,
+                        life: LifeState::Alive,
+                        materialized_at: 0,
+                    },
+                },
             ],
             absent_soldiers: vec![EntityId::from_parts(3, 0), EntityId::from_parts(0, 1)],
             wounds: vec![Wound {
@@ -5303,7 +6819,7 @@ mod tests {
         };
         let active = verified_restore(&active, &shock_fixture);
 
-        let mut selection_probe = World::from_snapshot(&active.snapshot()).unwrap();
+        let mut selection_probe = verified_restore(&active, &shock_fixture);
         let patient2 = EntityId::from_parts(3, 0);
         spawn_literal(&mut selection_probe, patient2, Role::Rifle, 0);
         assert_eq!(
@@ -5366,7 +6882,7 @@ mod tests {
         assert_eq!(selection_probe.soldier(m1).unwrap().inventory.medical, 2);
         verified_restore(&selection_probe, &shock_selection_probe_fixture());
 
-        let mut due_probe = World::from_snapshot(&active.snapshot()).unwrap();
+        let mut due_probe = verified_restore(&active, &shock_fixture);
         assert_eq!(
             due_probe.apply(Command::AdvanceTo { target: 14 }),
             sim_core::ApplyOutcome {
@@ -5496,7 +7012,25 @@ mod tests {
                 status: TreatmentStatus::Active
             })
         );
-        assert_medical_totals(&active, 2, 1);
+        assert_eq!(
+            active.resource_totals(),
+            ResourceTotals {
+                ammunition: 0,
+                stockpile_supplies: 0,
+                carried_food: 0,
+                carried_water: 0,
+                carried_medical: 2,
+                sourced_food: 0,
+                sourced_water: 0,
+                consumed_food: 0,
+                consumed_water: 0,
+                lost_food: 0,
+                lost_water: 0,
+                sourced_medical: 3,
+                consumed_medical: 1,
+                lost_medical: 0,
+            }
+        );
         let active_fixture = healing_active_fixture();
         let active = verified_restore(&active, &active_fixture);
 
@@ -5527,7 +7061,25 @@ mod tests {
                 materialized_at: 9
             })
         );
-        assert_medical_totals(&before, 2, 1);
+        assert_eq!(
+            before.resource_totals(),
+            ResourceTotals {
+                ammunition: 0,
+                stockpile_supplies: 0,
+                carried_food: 0,
+                carried_water: 0,
+                carried_medical: 2,
+                sourced_food: 0,
+                sourced_water: 0,
+                consumed_food: 0,
+                consumed_water: 0,
+                lost_food: 0,
+                lost_water: 0,
+                sourced_medical: 3,
+                consumed_medical: 1,
+                lost_medical: 0,
+            }
+        );
         let before_fixture = healing_clock9_fixture();
         let before = verified_restore(&before, &before_fixture);
 
@@ -5573,19 +7125,36 @@ mod tests {
             })
         );
         assert_eq!(completed.soldier(patient).unwrap().health, 990);
-        assert_medical_totals(&completed, 2, 1);
+        assert_eq!(
+            completed.resource_totals(),
+            ResourceTotals {
+                ammunition: 0,
+                stockpile_supplies: 0,
+                carried_food: 0,
+                carried_water: 0,
+                carried_medical: 2,
+                sourced_food: 0,
+                sourced_water: 0,
+                consumed_food: 0,
+                consumed_water: 0,
+                lost_food: 0,
+                lost_water: 0,
+                sourced_medical: 3,
+                consumed_medical: 1,
+                lost_medical: 0,
+            }
+        );
         let completed_fixture = healing_completed_fixture();
         let completed = verified_restore(&completed, &completed_fixture);
-        let mut completed_release_probe = World::from_snapshot(&completed.snapshot()).unwrap();
-        let future_wound = WoundSpec {
-            trauma: 1,
-            bleeding_per_second: 1,
-            shock: 1,
-        };
+        let mut completed_release_probe = verified_restore(&completed, &completed_fixture);
         assert_eq!(
             completed_release_probe.apply(Command::InflictWound {
                 patient,
-                wound: future_wound
+                wound: WoundSpec {
+                    trauma: 1,
+                    bleeding_per_second: 1,
+                    shock: 1
+                }
             }),
             sim_core::ApplyOutcome {
                 clock: 10,
@@ -5595,7 +7164,11 @@ mod tests {
                         event: Event::WoundInflicted {
                             id: WoundId(1),
                             patient,
-                            wound: future_wound
+                            wound: WoundSpec {
+                                trauma: 1,
+                                bleeding_per_second: 1,
+                                shock: 1
+                            }
                         }
                     },
                     TimedEvent {
@@ -5664,7 +7237,25 @@ mod tests {
             })
         );
         assert_eq!(tick.soldier(patient).unwrap().health, 1000);
-        assert_medical_totals(&tick, 2, 1);
+        assert_eq!(
+            tick.resource_totals(),
+            ResourceTotals {
+                ammunition: 0,
+                stockpile_supplies: 0,
+                carried_food: 0,
+                carried_water: 0,
+                carried_medical: 2,
+                sourced_food: 0,
+                sourced_water: 0,
+                consumed_food: 0,
+                consumed_water: 0,
+                lost_food: 0,
+                lost_water: 0,
+                sourced_medical: 3,
+                consumed_medical: 1,
+                lost_medical: 0,
+            }
+        );
         let tick_fixture = healing_clock15_fixture();
         let tick = verified_restore(&tick, &tick_fixture);
 
@@ -5710,14 +7301,36 @@ mod tests {
             TreatmentStatus::Completed { at: 10 }
         );
         assert_eq!(healed.soldier(patient).unwrap().health, 1000);
-        assert_medical_totals(&healed, 2, 1);
+        assert_eq!(
+            healed.resource_totals(),
+            ResourceTotals {
+                ammunition: 0,
+                stockpile_supplies: 0,
+                carried_food: 0,
+                carried_water: 0,
+                carried_medical: 2,
+                sourced_food: 0,
+                sourced_water: 0,
+                consumed_food: 0,
+                consumed_water: 0,
+                lost_food: 0,
+                lost_water: 0,
+                sourced_medical: 3,
+                consumed_medical: 1,
+                lost_medical: 0,
+            }
+        );
         let healed_fixture = healing_terminal_fixture();
         let healed = verified_restore(&healed, &healed_fixture);
-        let mut final_release_probe = World::from_snapshot(&healed.snapshot()).unwrap();
+        let mut final_release_probe = verified_restore(&healed, &healed_fixture);
         assert_eq!(
             final_release_probe.apply(Command::InflictWound {
                 patient,
-                wound: future_wound
+                wound: WoundSpec {
+                    trauma: 1,
+                    bleeding_per_second: 1,
+                    shock: 1
+                }
             }),
             sim_core::ApplyOutcome {
                 clock: 20,
@@ -5726,7 +7339,11 @@ mod tests {
                     event: Event::WoundInflicted {
                         id: WoundId(1),
                         patient,
-                        wound: future_wound
+                        wound: WoundSpec {
+                            trauma: 1,
+                            bleeding_per_second: 1,
+                            shock: 1
+                        }
                     }
                 }],
                 error: None,
@@ -5762,7 +7379,7 @@ mod tests {
         assert_eq!(final_release_probe.treatment(TreatmentId(2)), None);
         verified_restore(&final_release_probe, &healing_final_probe_fixture());
 
-        let mut terminal_probe = World::from_snapshot(&healed.snapshot()).unwrap();
+        let mut terminal_probe = verified_restore(&healed, &healed_fixture);
         assert_eq!(
             terminal_probe.apply(Command::AdvanceTo { target: 21 }),
             sim_core::ApplyOutcome {
