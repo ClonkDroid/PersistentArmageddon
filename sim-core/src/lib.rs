@@ -16467,6 +16467,7 @@ mod private_invariants {
             casualty: CasualtyState,
             wounds: BTreeMap<WoundId, Wound>,
             treatment: Treatment,
+            next_wound_id: u64,
             bleeding: BTreeMap<EntityId, u64>,
             available: bool,
             totals: ResourceTotals,
@@ -16492,7 +16493,14 @@ mod private_invariants {
         fn history_world(
             food: u32,
             water: u32,
-        ) -> (World, EntityId, EntityId, WoundId, TreatmentId) {
+        ) -> (
+            World,
+            EntityId,
+            EntityId,
+            WoundId,
+            TreatmentId,
+            Vec<TimedEvent>,
+        ) {
             let mut world = World::new(91);
             let medic_inventory = Inventory {
                 food: 0,
@@ -16506,47 +16514,43 @@ mod private_invariants {
             };
             let medic_spec = literal_spec(Role::Medic, medic_inventory);
             let medic_outcome = world.apply(Command::SpawnSoldier { spec: medic_spec });
-            let medic = match medic_outcome.events.as_slice() {
-                [TimedEvent {
+            let medic = EntityId::from_parts(0, 0);
+            assert_eq!(
+                medic_outcome.events,
+                vec![TimedEvent {
                     at: 0,
-                    event: Event::SoldierSpawned { id, loadout },
-                }] => {
-                    assert_eq!(
-                        *loadout,
-                        Loadout {
+                    event: Event::SoldierSpawned {
+                        id: EntityId::from_parts(0, 0),
+                        loadout: Loadout {
                             ammunition: 0,
                             food: 0,
                             water: 0,
-                            medical: 8
-                        }
-                    );
-                    *id
-                }
-                events => panic!("literal medic spawn events: {events:?}"),
-            };
+                            medical: 8,
+                        },
+                    },
+                }]
+            );
             assert_eq!(medic_outcome.clock, 0);
             assert_eq!(medic_outcome.error, None);
             assert_eq!(medic_outcome.blocked, None);
             let patient_spec = literal_spec(Role::Rifle, patient_inventory);
             let patient_outcome = world.apply(Command::SpawnSoldier { spec: patient_spec });
-            let patient = match patient_outcome.events.as_slice() {
-                [TimedEvent {
+            let patient = EntityId::from_parts(1, 0);
+            assert_eq!(
+                patient_outcome.events,
+                vec![TimedEvent {
                     at: 0,
-                    event: Event::SoldierSpawned { id, loadout },
-                }] => {
-                    assert_eq!(
-                        *loadout,
-                        Loadout {
+                    event: Event::SoldierSpawned {
+                        id: EntityId::from_parts(1, 0),
+                        loadout: Loadout {
                             ammunition: 0,
                             food,
                             water,
-                            medical: 0
-                        }
-                    );
-                    *id
-                }
-                events => panic!("literal patient spawn events: {events:?}"),
-            };
+                            medical: 0,
+                        },
+                    },
+                }]
+            );
             assert_eq!(patient_outcome.clock, 0);
             assert_eq!(patient_outcome.error, None);
             assert_eq!(patient_outcome.blocked, None);
@@ -16648,7 +16652,15 @@ mod private_invariants {
                     },
                 )])
             );
-            (world, medic, patient, wound, treatment)
+            let setup_medical_events = vec![wound_outcome.events[0], treatment_outcome.events[0]];
+            (
+                world,
+                medic,
+                patient,
+                wound,
+                treatment,
+                setup_medical_events,
+            )
         }
 
         fn assert_fixture(
@@ -16729,8 +16741,7 @@ mod private_invariants {
                 "{label}: treatments"
             );
             assert_eq!(
-                world.next_wound_id,
-                expected.wounds.len() as u64,
+                world.next_wound_id, expected.next_wound_id,
                 "{label}: wound allocator"
             );
             assert_eq!(world.next_treatment_id, 1, "{label}: treatment allocator");
@@ -17024,7 +17035,8 @@ mod private_invariants {
                 },
             ),
         ] {
-            let (mut world, medic, patient, wound, treatment) = history_world(food, water);
+            let (mut world, medic, patient, wound, treatment, setup_medical_events) =
+                history_world(food, water);
             let completion = world.apply(Command::AdvanceTo { target: 10 });
             assert_eq!(completion.clock, 10);
             assert_eq!(completion.error, None);
@@ -17072,7 +17084,9 @@ mod private_invariants {
                 .filter(|e| {
                     matches!(
                         e.event,
-                        Event::RecoveryTicked { .. }
+                        Event::WoundInflicted { .. }
+                            | Event::TreatmentStarted { .. }
+                            | Event::RecoveryTicked { .. }
                             | Event::WoundHealed { .. }
                             | Event::RecoveryChanged { .. }
                             | Event::TreatmentCompleted { .. }
@@ -17131,6 +17145,132 @@ mod private_invariants {
                     },
                 ]
             );
+            assert_eq!(
+                setup_medical_events,
+                vec![
+                    TimedEvent {
+                        at: 0,
+                        event: Event::WoundInflicted {
+                            id: WoundId(0),
+                            patient: EntityId::from_parts(1, 0),
+                            wound: initial_spec,
+                        },
+                    },
+                    TimedEvent {
+                        at: 0,
+                        event: Event::TreatmentStarted {
+                            id: TreatmentId(0),
+                            medic: EntityId::from_parts(0, 0),
+                            patient: EntityId::from_parts(1, 0),
+                            wound: Some(WoundId(0)),
+                            kind: TreatmentKind::Hemostatic,
+                            completes_at: 10,
+                            consumed: HEMOSTATIC_COST,
+                        },
+                    },
+                ]
+            );
+            for (name, count) in [
+                (
+                    "long wound inflictions",
+                    relevant
+                        .iter()
+                        .filter(|e| matches!(e.event, Event::WoundInflicted { .. }))
+                        .count(),
+                ),
+                (
+                    "long treatment starts",
+                    relevant
+                        .iter()
+                        .filter(|e| matches!(e.event, Event::TreatmentStarted { .. }))
+                        .count(),
+                ),
+                (
+                    "long treatment completions",
+                    relevant
+                        .iter()
+                        .filter(|e| matches!(e.event, Event::TreatmentCompleted { .. }))
+                        .count(),
+                ),
+                (
+                    "long treatment interruptions",
+                    relevant
+                        .iter()
+                        .filter(|e| matches!(e.event, Event::TreatmentInterrupted { .. }))
+                        .count(),
+                ),
+            ] {
+                assert_eq!(count, 0, "{name}");
+            }
+            let scenario_medical_events: Vec<_> = setup_medical_events
+                .iter()
+                .chain(completion.events.iter())
+                .chain(death.events.iter())
+                .filter(|e| {
+                    matches!(
+                        e.event,
+                        Event::WoundInflicted { .. }
+                            | Event::TreatmentStarted { .. }
+                            | Event::TreatmentCompleted { .. }
+                            | Event::TreatmentInterrupted { .. }
+                            | Event::WoundHealed { .. }
+                            | Event::SoldierDied { .. }
+                    )
+                })
+                .copied()
+                .collect();
+            for (name, expected_count, count) in [
+                (
+                    "scenario wound inflictions",
+                    1,
+                    scenario_medical_events
+                        .iter()
+                        .filter(|e| matches!(e.event, Event::WoundInflicted { .. }))
+                        .count(),
+                ),
+                (
+                    "scenario treatment starts",
+                    1,
+                    scenario_medical_events
+                        .iter()
+                        .filter(|e| matches!(e.event, Event::TreatmentStarted { .. }))
+                        .count(),
+                ),
+                (
+                    "scenario treatment completions",
+                    1,
+                    scenario_medical_events
+                        .iter()
+                        .filter(|e| matches!(e.event, Event::TreatmentCompleted { .. }))
+                        .count(),
+                ),
+                (
+                    "scenario wound healing",
+                    1,
+                    scenario_medical_events
+                        .iter()
+                        .filter(|e| matches!(e.event, Event::WoundHealed { .. }))
+                        .count(),
+                ),
+                (
+                    "scenario treatment interruptions",
+                    0,
+                    scenario_medical_events
+                        .iter()
+                        .filter(|e| matches!(e.event, Event::TreatmentInterrupted { .. }))
+                        .count(),
+                ),
+                (
+                    "scenario deaths",
+                    2,
+                    scenario_medical_events
+                        .iter()
+                        .filter(|e| matches!(e.event, Event::SoldierDied { .. }))
+                        .count(),
+                ),
+            ] {
+                assert_eq!(count, expected_count, "{name}");
+            }
             assert_eq!(
                 relevant
                     .iter()
@@ -17204,6 +17344,7 @@ mod private_invariants {
                         consumed: HEMOSTATIC_COST,
                         status: TreatmentStatus::Completed { at: 10 },
                     },
+                    next_wound_id: 1,
                     bleeding: BTreeMap::new(),
                     available: false,
                     totals,
@@ -17212,7 +17353,8 @@ mod private_invariants {
         }
 
         for cause in [DeathCause::ImmediateTrauma, DeathCause::TraumaticShock] {
-            let (mut world, medic, patient, wound, treatment) = history_world(0, 0);
+            let (mut world, medic, patient, wound, treatment, _setup_medical_events) =
+                history_world(0, 0);
             let fatal_spec = if cause == DeathCause::ImmediateTrauma {
                 WoundSpec {
                     trauma: 1000,
@@ -17376,6 +17518,7 @@ mod private_invariants {
                             reason: InterruptionReason::PatientDied,
                         },
                     },
+                    next_wound_id: 2,
                     bleeding: BTreeMap::from([(patient, 1)]),
                     available: true,
                     totals: ResourceTotals {
@@ -17398,7 +17541,8 @@ mod private_invariants {
             );
         }
 
-        let (mut world, medic, patient, wound, treatment) = history_world(0, 0);
+        let (mut world, medic, patient, wound, treatment, _setup_medical_events) =
+            history_world(0, 0);
         let second_spec = WoundSpec {
             trauma: 0,
             bleeding_per_second: 1000,
@@ -17544,6 +17688,7 @@ mod private_invariants {
                         reason: InterruptionReason::Ineligible,
                     },
                 },
+                next_wound_id: 2,
                 bleeding: BTreeMap::from([(patient, 1001)]),
                 available: true,
                 totals: ResourceTotals {
@@ -17567,7 +17712,8 @@ mod private_invariants {
 
         // M1.2 has no public Exhaustion transition. This is the sole schema-level
         // control, after a literally pinned public explicit interruption.
-        let (mut world, medic, patient, wound, treatment) = history_world(0, 0);
+        let (mut world, medic, patient, wound, treatment, _setup_medical_events) =
+            history_world(0, 0);
         let interrupted = world.apply(Command::InterruptTreatment { id: treatment });
         assert_eq!(interrupted.clock, 0);
         assert_eq!(interrupted.error, None);
@@ -17665,6 +17811,7 @@ mod private_invariants {
                         reason: InterruptionReason::Explicit,
                     },
                 },
+                next_wound_id: 1,
                 bleeding: BTreeMap::from([(patient, 1)]),
                 available: true,
                 totals: ResourceTotals {
