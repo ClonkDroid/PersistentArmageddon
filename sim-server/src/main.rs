@@ -1102,225 +1102,225 @@ mod tests {
 
     #[test]
     fn gate_c2_legacy_real_http_compatibility_and_wrong_typed_extras() {
+        struct LegacyWorldFixture {
+            clock: u64,
+            soldier_count: usize,
+            absent_soldiers: [EntityId; 2],
+            empty_wounds_of: EntityId,
+            absent_wounds: [WoundId; 2],
+            casualty: (EntityId, Option<CasualtyState>),
+            absent_treatments: [TreatmentId; 2],
+            stockpile: (u32, Option<Stock>),
+            unrelated_stockpile: u32,
+            absent_squad: u32,
+            absent_hot_cell: u32,
+            hot_cell_count: usize,
+            totals: ResourceTotals,
+            digest: u64,
+        }
+
+        impl LegacyWorldFixture {
+            fn assert_world(&self, world: &World, name: &str) {
+                assert_eq!(world.clock(), self.clock, "{name}");
+                assert_eq!(world.soldier_count(), self.soldier_count, "{name}");
+                for id in self.absent_soldiers {
+                    assert_eq!(world.soldier(id), None, "{name}");
+                }
+                assert_eq!(world.wounds_of(self.empty_wounds_of), vec![], "{name}");
+                for id in self.absent_wounds {
+                    assert_eq!(world.wound(id), None, "{name}");
+                }
+                assert_eq!(
+                    world.casualty_state(self.casualty.0),
+                    self.casualty.1,
+                    "{name}"
+                );
+                for id in self.absent_treatments {
+                    assert_eq!(world.treatment(id), None, "{name}");
+                }
+                assert_eq!(
+                    world.stockpile(self.stockpile.0),
+                    self.stockpile.1,
+                    "{name}"
+                );
+                assert_eq!(world.stockpile(self.unrelated_stockpile), None, "{name}");
+                assert_eq!(world.squad(self.absent_squad), None, "{name}");
+                assert_eq!(world.hot_cell(self.absent_hot_cell), None, "{name}");
+                assert_eq!(world.hot_cell_count(), self.hot_cell_count, "{name}");
+                assert_eq!(world.resource_totals(), self.totals, "{name}");
+                assert_eq!(world.state_digest(), self.digest, "{name}");
+            }
+        }
+
         struct LegacySuccess {
             name: &'static str,
             seed: u64,
-            initial_clock: u64,
-            initial_stock: Option<Stock>,
-            initial_totals: ResourceTotals,
-            initial_digest: u64,
+            initial: LegacyWorldFixture,
             body: &'static str,
             response: Value,
-            clock: u64,
-            stock: Option<Stock>,
-            totals: ResourceTotals,
-            digest: u64,
+            final_state: LegacyWorldFixture,
         }
         let legacy = [
             LegacySuccess {
                 name: "null-heavy create_stockpile",
                 seed: 31,
-                initial_clock: 0,
-                initial_stock: None,
-                initial_totals: ResourceTotals {
-                    ammunition: 0,
-                    stockpile_supplies: 0,
-                    carried_food: 0,
-                    carried_water: 0,
-                    carried_medical: 0,
-                    sourced_food: 0,
-                    sourced_water: 0,
-                    consumed_food: 0,
-                    consumed_water: 0,
-                    lost_food: 0,
-                    lost_water: 0,
-                    sourced_medical: 0,
-                    consumed_medical: 0,
-                    lost_medical: 0,
+                initial: LegacyWorldFixture {
+                    clock: 0,
+                    soldier_count: 0,
+                    absent_soldiers: [EntityId::from_parts(0, 0), EntityId::from_parts(7, 0)],
+                    empty_wounds_of: EntityId::from_parts(0, 0),
+                    absent_wounds: [WoundId(0), WoundId(7)],
+                    casualty: (EntityId::from_parts(0, 0), None),
+                    absent_treatments: [TreatmentId(0), TreatmentId(7)],
+                    stockpile: (7, None),
+                    unrelated_stockpile: 8,
+                    absent_squad: 7,
+                    absent_hot_cell: 7,
+                    hot_cell_count: 0,
+                    totals: ResourceTotals {
+                        ammunition: 0,
+                        stockpile_supplies: 0,
+                        carried_food: 0,
+                        carried_water: 0,
+                        carried_medical: 0,
+                        sourced_food: 0,
+                        sourced_water: 0,
+                        consumed_food: 0,
+                        consumed_water: 0,
+                        lost_food: 0,
+                        lost_water: 0,
+                        sourced_medical: 0,
+                        consumed_medical: 0,
+                        lost_medical: 0,
+                    },
+                    digest: 0x0c06_8a8d_648b_9f5d,
                 },
-                initial_digest: 0x0c06_8a8d_648b_9f5d,
                 body: r#"{"version":1,"command":"create_stockpile","id":7,"ammunition":9,"supplies":3,"target":null,"from":null,"to":null,"cell":null,"hot":null,"at":null,"activity":null,"patient":null,"medic":null,"wound":null,"trauma":null,"bleeding_per_second":null,"shock":null,"kind":null,"treatment":null}"#,
                 response: json!({"version":1,"clock":0,"events":[{"at":0,"event":{"type":"stockpile_created","id":7,"initial":{"ammunition":9,"supplies":3}}}],"terminal_error":null,"blocked":null,"digest":"c333945e80f9b8d1"}),
-                clock: 0,
-                stock: Some(Stock {
-                    ammunition: 9,
-                    supplies: 3,
-                }),
-                totals: ResourceTotals {
-                    ammunition: 9,
-                    stockpile_supplies: 3,
-                    carried_food: 0,
-                    carried_water: 0,
-                    carried_medical: 0,
-                    sourced_food: 0,
-                    sourced_water: 0,
-                    consumed_food: 0,
-                    consumed_water: 0,
-                    lost_food: 0,
-                    lost_water: 0,
-                    sourced_medical: 0,
-                    consumed_medical: 0,
-                    lost_medical: 0,
+                final_state: LegacyWorldFixture {
+                    clock: 0,
+                    soldier_count: 0,
+                    absent_soldiers: [EntityId::from_parts(0, 0), EntityId::from_parts(7, 0)],
+                    empty_wounds_of: EntityId::from_parts(0, 0),
+                    absent_wounds: [WoundId(0), WoundId(7)],
+                    casualty: (EntityId::from_parts(0, 0), None),
+                    absent_treatments: [TreatmentId(0), TreatmentId(7)],
+                    stockpile: (
+                        7,
+                        Some(Stock {
+                            ammunition: 9,
+                            supplies: 3,
+                        }),
+                    ),
+                    unrelated_stockpile: 8,
+                    absent_squad: 7,
+                    absent_hot_cell: 7,
+                    hot_cell_count: 0,
+                    totals: ResourceTotals {
+                        ammunition: 9,
+                        stockpile_supplies: 3,
+                        carried_food: 0,
+                        carried_water: 0,
+                        carried_medical: 0,
+                        sourced_food: 0,
+                        sourced_water: 0,
+                        consumed_food: 0,
+                        consumed_water: 0,
+                        lost_food: 0,
+                        lost_water: 0,
+                        sourced_medical: 0,
+                        consumed_medical: 0,
+                        lost_medical: 0,
+                    },
+                    digest: 0xc333_945e_80f9_b8d1,
                 },
-                digest: 0xc333_945e_80f9_b8d1,
             },
             LegacySuccess {
                 name: "null-heavy advance_to",
                 seed: 31,
-                initial_clock: 0,
-                initial_stock: None,
-                initial_totals: ResourceTotals {
-                    ammunition: 0,
-                    stockpile_supplies: 0,
-                    carried_food: 0,
-                    carried_water: 0,
-                    carried_medical: 0,
-                    sourced_food: 0,
-                    sourced_water: 0,
-                    consumed_food: 0,
-                    consumed_water: 0,
-                    lost_food: 0,
-                    lost_water: 0,
-                    sourced_medical: 0,
-                    consumed_medical: 0,
-                    lost_medical: 0,
+                initial: LegacyWorldFixture {
+                    clock: 0,
+                    soldier_count: 0,
+                    absent_soldiers: [EntityId::from_parts(0, 0), EntityId::from_parts(7, 0)],
+                    empty_wounds_of: EntityId::from_parts(0, 0),
+                    absent_wounds: [WoundId(0), WoundId(7)],
+                    casualty: (EntityId::from_parts(0, 0), None),
+                    absent_treatments: [TreatmentId(0), TreatmentId(7)],
+                    stockpile: (7, None),
+                    unrelated_stockpile: 8,
+                    absent_squad: 7,
+                    absent_hot_cell: 7,
+                    hot_cell_count: 0,
+                    totals: ResourceTotals {
+                        ammunition: 0,
+                        stockpile_supplies: 0,
+                        carried_food: 0,
+                        carried_water: 0,
+                        carried_medical: 0,
+                        sourced_food: 0,
+                        sourced_water: 0,
+                        consumed_food: 0,
+                        consumed_water: 0,
+                        lost_food: 0,
+                        lost_water: 0,
+                        sourced_medical: 0,
+                        consumed_medical: 0,
+                        lost_medical: 0,
+                    },
+                    digest: 0x0c06_8a8d_648b_9f5d,
                 },
-                initial_digest: 0x0c06_8a8d_648b_9f5d,
                 body: r#"{"version":1,"command":"advance_to","target":1,"id":null,"from":null,"to":null,"ammunition":null,"supplies":null,"cell":null,"hot":null,"at":null,"activity":null,"patient":null,"medic":null,"wound":null,"trauma":null,"bleeding_per_second":null,"shock":null,"kind":null,"treatment":null}"#,
                 response: json!({"version":1,"clock":1,"events":[{"at":1,"event":{"type":"time_advanced","from":0,"to":1,"hot_cells_stepped":0,"fixed_steps_per_hot_cell":0}}],"terminal_error":null,"blocked":null,"digest":"4215b2950c54e5bc"}),
-                clock: 1,
-                stock: None,
-                totals: ResourceTotals {
-                    ammunition: 0,
-                    stockpile_supplies: 0,
-                    carried_food: 0,
-                    carried_water: 0,
-                    carried_medical: 0,
-                    sourced_food: 0,
-                    sourced_water: 0,
-                    consumed_food: 0,
-                    consumed_water: 0,
-                    lost_food: 0,
-                    lost_water: 0,
-                    sourced_medical: 0,
-                    consumed_medical: 0,
-                    lost_medical: 0,
+                final_state: LegacyWorldFixture {
+                    clock: 1,
+                    soldier_count: 0,
+                    absent_soldiers: [EntityId::from_parts(0, 0), EntityId::from_parts(7, 0)],
+                    empty_wounds_of: EntityId::from_parts(0, 0),
+                    absent_wounds: [WoundId(0), WoundId(7)],
+                    casualty: (EntityId::from_parts(0, 0), None),
+                    absent_treatments: [TreatmentId(0), TreatmentId(7)],
+                    stockpile: (7, None),
+                    unrelated_stockpile: 8,
+                    absent_squad: 7,
+                    absent_hot_cell: 7,
+                    hot_cell_count: 0,
+                    totals: ResourceTotals {
+                        ammunition: 0,
+                        stockpile_supplies: 0,
+                        carried_food: 0,
+                        carried_water: 0,
+                        carried_medical: 0,
+                        sourced_food: 0,
+                        sourced_water: 0,
+                        consumed_food: 0,
+                        consumed_water: 0,
+                        lost_food: 0,
+                        lost_water: 0,
+                        sourced_medical: 0,
+                        consumed_medical: 0,
+                        lost_medical: 0,
+                    },
+                    digest: 0x4215_b295_0c54_e5bc,
                 },
-                digest: 0x4215_b295_0c54_e5bc,
             },
         ];
         for fixture in legacy {
             let initial = World::new(fixture.seed);
-            assert_eq!(initial.clock(), fixture.initial_clock, "{}", fixture.name);
-            assert_eq!(initial.soldier_count(), 0, "{}", fixture.name);
-            assert_eq!(
-                initial.resource_totals(),
-                fixture.initial_totals,
-                "{}",
-                fixture.name
-            );
-            assert_eq!(
-                initial.stockpile(7),
-                fixture.initial_stock,
-                "{}",
-                fixture.name
-            );
-            assert_eq!(
-                initial.state_digest(),
-                fixture.initial_digest,
-                "{}",
-                fixture.name
-            );
-            assert_eq!(
-                initial.soldier(EntityId::from_parts(0, 0)),
-                None,
-                "{}",
-                fixture.name
-            );
-            assert_eq!(initial.wound(WoundId(0)), None, "{}", fixture.name);
-            assert_eq!(
-                initial.wounds_of(EntityId::from_parts(0, 0)),
-                vec![],
-                "{}",
-                fixture.name
-            );
-            assert_eq!(
-                initial.casualty_state(EntityId::from_parts(0, 0)),
-                None,
-                "{}",
-                fixture.name
-            );
-            assert_eq!(initial.treatment(TreatmentId(0)), None, "{}", fixture.name);
-            assert_eq!(initial.squad(7), None, "{}", fixture.name);
-            assert_eq!(initial.hot_cell(7), None, "{}", fixture.name);
-            assert_eq!(initial.hot_cell_count(), 0, "{}", fixture.name);
+            fixture.initial.assert_world(&initial, fixture.name);
             let (response, world) = exchange(req(fixture.body), false, initial);
             assert_eq!(status(&response), "HTTP/1.1 200 OK", "{}", fixture.name);
             assert_eq!(json_body(&response), fixture.response, "{}", fixture.name);
-            assert_eq!(world.clock(), fixture.clock, "{}", fixture.name);
-            assert_eq!(world.soldier_count(), 0, "{}", fixture.name);
-            assert_eq!(world.stockpile(7), fixture.stock, "{}", fixture.name);
-            assert_eq!(world.resource_totals(), fixture.totals, "{}", fixture.name);
-            assert_eq!(world.squad(7), None, "{}", fixture.name);
-            assert_eq!(world.hot_cell(7), None, "{}", fixture.name);
-            assert_eq!(world.hot_cell_count(), 0, "{}", fixture.name);
-            assert_eq!(
-                world.soldier(EntityId::from_parts(0, 0)),
-                None,
-                "{}",
-                fixture.name
-            );
-            assert_eq!(world.wound(WoundId(0)), None, "{}", fixture.name);
-            assert_eq!(
-                world.wounds_of(EntityId::from_parts(0, 0)),
-                vec![],
-                "{}",
-                fixture.name
-            );
-            assert_eq!(
-                world.casualty_state(EntityId::from_parts(0, 0)),
-                None,
-                "{}",
-                fixture.name
-            );
-            assert_eq!(world.treatment(TreatmentId(0)), None, "{}", fixture.name);
-            assert_eq!(world.state_digest(), fixture.digest, "{}", fixture.name);
+            fixture.final_state.assert_world(&world, fixture.name);
             let bytes = world.snapshot();
             let restored = World::from_snapshot(&bytes).unwrap();
-            assert_eq!(restored.clock(), fixture.clock, "{}", fixture.name);
-            assert_eq!(restored.soldier_count(), 0, "{}", fixture.name);
-            assert_eq!(restored.stockpile(7), fixture.stock, "{}", fixture.name);
-            assert_eq!(
-                restored.resource_totals(),
-                fixture.totals,
-                "{}",
-                fixture.name
-            );
-            assert_eq!(restored.squad(7), None, "{}", fixture.name);
-            assert_eq!(restored.hot_cell(7), None, "{}", fixture.name);
-            assert_eq!(restored.hot_cell_count(), 0, "{}", fixture.name);
-            assert_eq!(
-                restored.soldier(EntityId::from_parts(0, 0)),
-                None,
-                "{}",
-                fixture.name
-            );
-            assert_eq!(restored.wound(WoundId(0)), None, "{}", fixture.name);
-            assert_eq!(
-                restored.wounds_of(EntityId::from_parts(0, 0)),
-                vec![],
-                "{}",
-                fixture.name
-            );
-            assert_eq!(
-                restored.casualty_state(EntityId::from_parts(0, 0)),
-                None,
-                "{}",
-                fixture.name
-            );
-            assert_eq!(restored.treatment(TreatmentId(0)), None, "{}", fixture.name);
-            assert_eq!(restored.state_digest(), fixture.digest, "{}", fixture.name);
+            fixture.final_state.assert_world(&restored, fixture.name);
             assert_eq!(restored.snapshot(), bytes, "{}", fixture.name);
+            assert_eq!(
+                restored.state_digest(),
+                world.state_digest(),
+                "{}",
+                fixture.name
+            );
         }
 
         let wrong_typed_extras = [
@@ -6333,8 +6333,9 @@ mod tests {
                 blocked: None,
             }
         );
+        let busy_fixture = direct_busy_probe_fixture();
+        let mut busy_probe = verified_restore(&busy_probe, &busy_fixture);
         let busy_before = busy_probe.snapshot();
-        direct_busy_probe_fixture().assert_world(&busy_probe);
         assert_eq!(
             busy_probe.apply(Command::RequestTreatment {
                 patient: endpoint,
@@ -6349,7 +6350,7 @@ mod tests {
             }
         );
         assert_eq!(busy_probe.snapshot(), busy_before);
-        verified_restore(&busy_probe, &direct_busy_probe_fixture());
+        verified_restore(&busy_probe, &busy_fixture);
         let interrupt = r#"{"version":1,"command":"interrupt_treatment","treatment":0}"#;
         let (response, interrupted) = exchange(req(interrupt), false, active);
         assert_eq!(status(&response), "HTTP/1.1 200 OK");
