@@ -8748,6 +8748,607 @@ mod tests {
         assert_eq!(names.len(), 11);
     }
 
+    fn f6_spawn(world: &mut World, id: EntityId, role: Role, medical: u32) {
+        assert_eq!(
+            world.apply(Command::SpawnSoldier {
+                spec: SoldierSpec {
+                    faction: 0,
+                    position: Position {
+                        x_mm: 0,
+                        y_mm: 0,
+                        cell: 0
+                    },
+                    squad: None,
+                    role,
+                    rank: 0,
+                    health: 1000,
+                    ammunition: 0,
+                    inventory: Inventory {
+                        food: 0,
+                        water: 0,
+                        medical
+                    },
+                },
+            }),
+            ApplyOutcome {
+                clock: 0,
+                events: vec![TimedEvent {
+                    at: 0,
+                    event: Event::SoldierSpawned {
+                        id,
+                        loadout: sim_core::Loadout {
+                            ammunition: 0,
+                            food: 0,
+                            water: 0,
+                            medical
+                        }
+                    }
+                }],
+                error: None,
+                blocked: None,
+            }
+        );
+    }
+
+    fn f6_absent_source() -> World {
+        let mut world = World::new(29);
+        f6_spawn(&mut world, EntityId::from_parts(0, 0), Role::Medic, 3);
+        f6_spawn(&mut world, EntityId::from_parts(1, 0), Role::Rifle, 0);
+        assert_eq!(
+            world.apply(Command::InflictWound {
+                patient: EntityId::from_parts(1, 0),
+                wound: WoundSpec {
+                    trauma: 10,
+                    bleeding_per_second: 20,
+                    shock: 30
+                }
+            }),
+            ApplyOutcome {
+                clock: 0,
+                events: vec![TimedEvent {
+                    at: 0,
+                    event: Event::WoundInflicted {
+                        id: WoundId(0),
+                        patient: EntityId::from_parts(1, 0),
+                        wound: WoundSpec {
+                            trauma: 10,
+                            bleeding_per_second: 20,
+                            shock: 30
+                        }
+                    }
+                }],
+                error: None,
+                blocked: None
+            }
+        );
+        world
+    }
+
+    fn f6_controlled_source() -> World {
+        let mut world = f6_absent_source();
+        assert_eq!(
+            world.apply(Command::StartTreatment {
+                medic: EntityId::from_parts(0, 0),
+                patient: EntityId::from_parts(1, 0),
+                wound: Some(WoundId(0)),
+                kind: TreatmentKind::Hemostatic
+            }),
+            ApplyOutcome {
+                clock: 0,
+                events: vec![TimedEvent {
+                    at: 0,
+                    event: Event::TreatmentStarted {
+                        id: TreatmentId(0),
+                        medic: EntityId::from_parts(0, 0),
+                        patient: EntityId::from_parts(1, 0),
+                        wound: Some(WoundId(0)),
+                        kind: TreatmentKind::Hemostatic,
+                        completes_at: 10,
+                        consumed: 1
+                    }
+                }],
+                error: None,
+                blocked: None
+            }
+        );
+        let out = world.apply(Command::AdvanceTo { target: 10 });
+        assert_eq!(out.error, None);
+        assert_eq!(out.blocked, None);
+        world
+    }
+
+    fn f6_healed_source() -> World {
+        let mut world = f6_controlled_source();
+        let out = world.apply(Command::AdvanceTo { target: 20 });
+        assert_eq!(out.error, None);
+        assert_eq!(out.blocked, None);
+        world
+    }
+
+    fn f6_shock_no_casualty_source() -> World {
+        let mut world = World::new(29);
+        f6_spawn(&mut world, EntityId::from_parts(0, 0), Role::Medic, 3);
+        f6_spawn(&mut world, EntityId::from_parts(1, 0), Role::Rifle, 0);
+        world
+    }
+
+    fn f6_zero_shock_source() -> World {
+        let mut world = World::new(61);
+        f6_spawn(&mut world, EntityId::from_parts(0, 0), Role::Medic, 5);
+        f6_spawn(&mut world, EntityId::from_parts(1, 0), Role::Rifle, 0);
+        assert_eq!(
+            world
+                .apply(Command::InflictWound {
+                    patient: EntityId::from_parts(1, 0),
+                    wound: WoundSpec {
+                        trauma: 0,
+                        bleeding_per_second: 20,
+                        shock: 0
+                    }
+                })
+                .error,
+            None
+        );
+        world
+    }
+
+    fn f6_other_patient_source() -> World {
+        let mut world = World::new(62);
+        f6_spawn(&mut world, EntityId::from_parts(0, 0), Role::Medic, 5);
+        f6_spawn(&mut world, EntityId::from_parts(1, 0), Role::Rifle, 0);
+        f6_spawn(&mut world, EntityId::from_parts(2, 0), Role::Rifle, 0);
+        assert_eq!(
+            world
+                .apply(Command::InflictWound {
+                    patient: EntityId::from_parts(2, 0),
+                    wound: WoundSpec {
+                        trauma: 0,
+                        bleeding_per_second: 20,
+                        shock: 0
+                    }
+                })
+                .error,
+            None
+        );
+        world
+    }
+
+    fn f6_removed_owner_source() -> World {
+        let mut world = World::new(63);
+        f6_spawn(&mut world, EntityId::from_parts(0, 0), Role::Medic, 5);
+        f6_spawn(&mut world, EntityId::from_parts(1, 0), Role::Rifle, 0);
+        f6_spawn(&mut world, EntityId::from_parts(2, 0), Role::Rifle, 0);
+        assert_eq!(
+            world
+                .apply(Command::InflictWound {
+                    patient: EntityId::from_parts(2, 0),
+                    wound: WoundSpec {
+                        trauma: 0,
+                        bleeding_per_second: 20,
+                        shock: 0
+                    }
+                })
+                .error,
+            None
+        );
+        assert_eq!(
+            world.apply(Command::DespawnSoldier {
+                id: EntityId::from_parts(2, 0)
+            }),
+            ApplyOutcome {
+                clock: 0,
+                events: vec![TimedEvent {
+                    at: 0,
+                    event: Event::SoldierRemoved {
+                        id: EntityId::from_parts(2, 0),
+                        loadout: sim_core::Loadout {
+                            ammunition: 0,
+                            food: 0,
+                            water: 0,
+                            medical: 0
+                        }
+                    }
+                }],
+                error: None,
+                blocked: None
+            }
+        );
+        world
+    }
+
+    fn f6_absent_fixture() -> PublicMedicalFixture {
+        healing_post_wound_fixture()
+    }
+    fn f6_controlled_fixture() -> PublicMedicalFixture {
+        healing_completed_fixture()
+    }
+    fn f6_healed_fixture() -> PublicMedicalFixture {
+        healing_terminal_fixture()
+    }
+    fn f6_shock_no_casualty_fixture() -> PublicMedicalFixture {
+        healing_setup_fixture()
+    }
+
+    fn f6_simple_fixture(mode: u8) -> PublicMedicalFixture {
+        let other = mode == 1;
+        let removed = mode == 2;
+        let seed_digest = match mode {
+            0 => 0x85ba_4f91_4644_5383,
+            1 => 0x669c_9532_1422_5f15,
+            _ => 0xb9e2_60b0_dfd9_fdef,
+        };
+        let mut soldiers = vec![
+            Soldier {
+                id: EntityId::from_parts(0, 0),
+                faction: 0,
+                position: Position {
+                    x_mm: 0,
+                    y_mm: 0,
+                    cell: 0,
+                },
+                squad: None,
+                role: Role::Medic,
+                rank: 0,
+                health: 1000,
+                needs: Needs {
+                    fatigue: 0,
+                    hunger: 0,
+                    thirst: 0,
+                    sleep_debt: 0,
+                },
+                ammunition: 0,
+                inventory: Inventory {
+                    food: 0,
+                    water: 0,
+                    medical: 5,
+                },
+                living: LivingState {
+                    hunger: 0,
+                    thirst: 0,
+                    fatigue: 0,
+                    sleep_debt: 0,
+                    morale: 1000,
+                    health: 1000,
+                    activity: Activity::Idle,
+                    life: LifeState::Alive,
+                    materialized_at: 0,
+                },
+            },
+            Soldier {
+                id: EntityId::from_parts(1, 0),
+                faction: 0,
+                position: Position {
+                    x_mm: 0,
+                    y_mm: 0,
+                    cell: 0,
+                },
+                squad: None,
+                role: Role::Rifle,
+                rank: 0,
+                health: 1000,
+                needs: Needs {
+                    fatigue: 0,
+                    hunger: 0,
+                    thirst: 0,
+                    sleep_debt: 0,
+                },
+                ammunition: 0,
+                inventory: Inventory {
+                    food: 0,
+                    water: 0,
+                    medical: 0,
+                },
+                living: LivingState {
+                    hunger: 0,
+                    thirst: 0,
+                    fatigue: 0,
+                    sleep_debt: 0,
+                    morale: 1000,
+                    health: 1000,
+                    activity: Activity::Idle,
+                    life: LifeState::Alive,
+                    materialized_at: 0,
+                },
+            },
+        ];
+        if other {
+            soldiers.push(Soldier {
+                id: EntityId::from_parts(2, 0),
+                faction: 0,
+                position: Position {
+                    x_mm: 0,
+                    y_mm: 0,
+                    cell: 0,
+                },
+                squad: None,
+                role: Role::Rifle,
+                rank: 0,
+                health: 1000,
+                needs: Needs {
+                    fatigue: 0,
+                    hunger: 0,
+                    thirst: 0,
+                    sleep_debt: 0,
+                },
+                ammunition: 0,
+                inventory: Inventory {
+                    food: 0,
+                    water: 0,
+                    medical: 0,
+                },
+                living: LivingState {
+                    hunger: 0,
+                    thirst: 0,
+                    fatigue: 0,
+                    sleep_debt: 0,
+                    morale: 1000,
+                    health: 1000,
+                    activity: Activity::Idle,
+                    life: LifeState::Alive,
+                    materialized_at: 0,
+                },
+            });
+        }
+        let wound = Wound {
+            id: WoundId(0),
+            patient: EntityId::from_parts(if other { 2 } else { 1 }, 0),
+            created_at: 0,
+            spec: WoundSpec {
+                trauma: 0,
+                bleeding_per_second: 20,
+                shock: 0,
+            },
+            controlled: false,
+            healed: false,
+        };
+        PublicMedicalFixture {
+            name: "f6 simple",
+            clock: 0,
+            soldier_count: if other { 3 } else { 2 },
+            soldiers,
+            absent_soldiers: vec![EntityId::from_parts(if removed { 2 } else { 3 }, 0)],
+            wounds: if removed { vec![] } else { vec![wound] },
+            wounds_of: if removed {
+                vec![
+                    (EntityId::from_parts(0, 0), vec![]),
+                    (EntityId::from_parts(1, 0), vec![]),
+                ]
+            } else if other {
+                vec![
+                    (EntityId::from_parts(0, 0), vec![]),
+                    (EntityId::from_parts(1, 0), vec![]),
+                    (EntityId::from_parts(2, 0), vec![wound]),
+                ]
+            } else {
+                vec![
+                    (EntityId::from_parts(0, 0), vec![]),
+                    (EntityId::from_parts(1, 0), vec![wound]),
+                ]
+            },
+            absent_wounds: if removed {
+                vec![WoundId(0), WoundId(1), WoundId(u64::MAX)]
+            } else {
+                vec![WoundId(1), WoundId(u64::MAX)]
+            },
+            casualties: if removed {
+                vec![
+                    (EntityId::from_parts(0, 0), None),
+                    (EntityId::from_parts(1, 0), None),
+                    (EntityId::from_parts(2, 0), None),
+                ]
+            } else if other {
+                vec![
+                    (EntityId::from_parts(0, 0), None),
+                    (EntityId::from_parts(1, 0), None),
+                    (
+                        EntityId::from_parts(2, 0),
+                        Some(CasualtyState {
+                            blood: 5000,
+                            shock: 0,
+                            shock_remainder: 0,
+                            incapacitated: false,
+                            recovering: false,
+                            recovery_next_at: None,
+                            materialized_at: 0,
+                        }),
+                    ),
+                ]
+            } else {
+                vec![
+                    (EntityId::from_parts(0, 0), None),
+                    (
+                        EntityId::from_parts(1, 0),
+                        Some(CasualtyState {
+                            blood: 5000,
+                            shock: 0,
+                            shock_remainder: 0,
+                            incapacitated: false,
+                            recovering: false,
+                            recovery_next_at: None,
+                            materialized_at: 0,
+                        }),
+                    ),
+                ]
+            },
+            treatments: vec![],
+            absent_treatments: vec![TreatmentId(0), TreatmentId(1)],
+            totals: ResourceTotals {
+                ammunition: 0,
+                stockpile_supplies: 0,
+                carried_food: 0,
+                carried_water: 0,
+                carried_medical: 5,
+                sourced_food: 0,
+                sourced_water: 0,
+                consumed_food: 0,
+                consumed_water: 0,
+                lost_food: 0,
+                lost_water: 0,
+                sourced_medical: 5,
+                consumed_medical: 0,
+                lost_medical: 0,
+            },
+            absent_stockpiles: vec![0, 7],
+            absent_squads: vec![0, 7],
+            absent_hot_cells: vec![0, 7],
+            hot_cell_count: 0,
+            digest: seed_digest,
+        }
+    }
+    fn f6_zero_shock_fixture() -> PublicMedicalFixture {
+        f6_simple_fixture(0)
+    }
+    fn f6_other_patient_fixture() -> PublicMedicalFixture {
+        f6_simple_fixture(1)
+    }
+    fn f6_removed_owner_fixture() -> PublicMedicalFixture {
+        f6_simple_fixture(2)
+    }
+
+    struct F6Row {
+        name: &'static str,
+        source: fn() -> World,
+        fixture: fn() -> PublicMedicalFixture,
+        request: &'static str,
+        expected: &'static str,
+    }
+    const F6_ROWS: [F6Row; 16] = [
+        F6Row {
+            name: "direct_hemostatic_absent_wound",
+            source: f6_absent_source,
+            fixture: f6_absent_fixture,
+            request: r#"{"version":1,"command":"start_treatment","medic":0,"patient":1,"wound":1,"kind":"hemostatic"}"#,
+            expected: r#"{"blocked":null,"clock":0,"digest":"e409bfccd97b10f5","events":[],"terminal_error":"invalid_treatment","version":1}"#,
+        },
+        F6Row {
+            name: "requested_hemostatic_absent_wound",
+            source: f6_absent_source,
+            fixture: f6_absent_fixture,
+            request: r#"{"version":1,"command":"request_treatment","patient":1,"wound":1,"kind":"hemostatic"}"#,
+            expected: r#"{"blocked":null,"clock":0,"digest":"e409bfccd97b10f5","events":[],"terminal_error":"invalid_treatment","version":1}"#,
+        },
+        F6Row {
+            name: "direct_hemostatic_wire_valid_max_wound",
+            source: f6_absent_source,
+            fixture: f6_absent_fixture,
+            request: r#"{"version":1,"command":"start_treatment","medic":0,"patient":1,"wound":18446744073709551615,"kind":"hemostatic"}"#,
+            expected: r#"{"blocked":null,"clock":0,"digest":"e409bfccd97b10f5","events":[],"terminal_error":"invalid_treatment","version":1}"#,
+        },
+        F6Row {
+            name: "requested_hemostatic_wire_valid_max_wound",
+            source: f6_absent_source,
+            fixture: f6_absent_fixture,
+            request: r#"{"version":1,"command":"request_treatment","patient":1,"wound":18446744073709551615,"kind":"hemostatic"}"#,
+            expected: r#"{"blocked":null,"clock":0,"digest":"e409bfccd97b10f5","events":[],"terminal_error":"invalid_treatment","version":1}"#,
+        },
+        F6Row {
+            name: "direct_hemostatic_other_patient_wound",
+            source: f6_other_patient_source,
+            fixture: f6_other_patient_fixture,
+            request: r#"{"version":1,"command":"start_treatment","medic":0,"patient":1,"wound":0,"kind":"hemostatic"}"#,
+            expected: r#"{"blocked":null,"clock":0,"digest":"669c953214225f15","events":[],"terminal_error":"invalid_treatment","version":1}"#,
+        },
+        F6Row {
+            name: "requested_hemostatic_other_patient_wound",
+            source: f6_other_patient_source,
+            fixture: f6_other_patient_fixture,
+            request: r#"{"version":1,"command":"request_treatment","patient":1,"wound":0,"kind":"hemostatic"}"#,
+            expected: r#"{"blocked":null,"clock":0,"digest":"669c953214225f15","events":[],"terminal_error":"invalid_treatment","version":1}"#,
+        },
+        F6Row {
+            name: "direct_hemostatic_controlled_wound",
+            source: f6_controlled_source,
+            fixture: f6_controlled_fixture,
+            request: r#"{"version":1,"command":"start_treatment","medic":0,"patient":1,"wound":0,"kind":"hemostatic"}"#,
+            expected: r#"{"blocked":null,"clock":10,"digest":"f10dc636c78be1da","events":[],"terminal_error":"invalid_treatment","version":1}"#,
+        },
+        F6Row {
+            name: "requested_hemostatic_controlled_wound",
+            source: f6_controlled_source,
+            fixture: f6_controlled_fixture,
+            request: r#"{"version":1,"command":"request_treatment","patient":1,"wound":0,"kind":"hemostatic"}"#,
+            expected: r#"{"blocked":null,"clock":10,"digest":"f10dc636c78be1da","events":[],"terminal_error":"invalid_treatment","version":1}"#,
+        },
+        F6Row {
+            name: "direct_hemostatic_healed_wound",
+            source: f6_healed_source,
+            fixture: f6_healed_fixture,
+            request: r#"{"version":1,"command":"start_treatment","medic":0,"patient":1,"wound":0,"kind":"hemostatic"}"#,
+            expected: r#"{"blocked":null,"clock":20,"digest":"bce6a737b43e2693","events":[],"terminal_error":"invalid_treatment","version":1}"#,
+        },
+        F6Row {
+            name: "requested_hemostatic_healed_wound",
+            source: f6_healed_source,
+            fixture: f6_healed_fixture,
+            request: r#"{"version":1,"command":"request_treatment","patient":1,"wound":0,"kind":"hemostatic"}"#,
+            expected: r#"{"blocked":null,"clock":20,"digest":"bce6a737b43e2693","events":[],"terminal_error":"invalid_treatment","version":1}"#,
+        },
+        F6Row {
+            name: "direct_hemostatic_removed_owner_wound",
+            source: f6_removed_owner_source,
+            fixture: f6_removed_owner_fixture,
+            request: r#"{"version":1,"command":"start_treatment","medic":0,"patient":1,"wound":0,"kind":"hemostatic"}"#,
+            expected: r#"{"blocked":null,"clock":0,"digest":"b9e260b0dfd9fdef","events":[],"terminal_error":"invalid_treatment","version":1}"#,
+        },
+        F6Row {
+            name: "requested_hemostatic_removed_owner_wound",
+            source: f6_removed_owner_source,
+            fixture: f6_removed_owner_fixture,
+            request: r#"{"version":1,"command":"request_treatment","patient":1,"wound":0,"kind":"hemostatic"}"#,
+            expected: r#"{"blocked":null,"clock":0,"digest":"b9e260b0dfd9fdef","events":[],"terminal_error":"invalid_treatment","version":1}"#,
+        },
+        F6Row {
+            name: "direct_shock_no_casualty",
+            source: f6_shock_no_casualty_source,
+            fixture: f6_shock_no_casualty_fixture,
+            request: r#"{"version":1,"command":"start_treatment","medic":0,"patient":1,"kind":"shock"}"#,
+            expected: r#"{"blocked":null,"clock":0,"digest":"a531059e3401271d","events":[],"terminal_error":"invalid_treatment","version":1}"#,
+        },
+        F6Row {
+            name: "requested_shock_no_casualty",
+            source: f6_shock_no_casualty_source,
+            fixture: f6_shock_no_casualty_fixture,
+            request: r#"{"version":1,"command":"request_treatment","patient":1,"kind":"shock"}"#,
+            expected: r#"{"blocked":null,"clock":0,"digest":"a531059e3401271d","events":[],"terminal_error":"invalid_treatment","version":1}"#,
+        },
+        F6Row {
+            name: "direct_shock_zero_shock_casualty",
+            source: f6_zero_shock_source,
+            fixture: f6_zero_shock_fixture,
+            request: r#"{"version":1,"command":"start_treatment","medic":0,"patient":1,"kind":"shock"}"#,
+            expected: r#"{"blocked":null,"clock":0,"digest":"85ba4f9146445383","events":[],"terminal_error":"invalid_treatment","version":1}"#,
+        },
+        F6Row {
+            name: "requested_shock_zero_shock_casualty",
+            source: f6_zero_shock_source,
+            fixture: f6_zero_shock_fixture,
+            request: r#"{"version":1,"command":"request_treatment","patient":1,"kind":"shock"}"#,
+            expected: r#"{"blocked":null,"clock":0,"digest":"85ba4f9146445383","events":[],"terminal_error":"invalid_treatment","version":1}"#,
+        },
+    ];
+
+    #[test]
+    fn gate_c2_f6_treatment_target_semantic_matrix() {
+        assert_eq!(F6_ROWS.len(), 16);
+        let mut names = std::collections::BTreeSet::new();
+        for row in &F6_ROWS {
+            assert!(names.insert(row.name));
+            let source = (row.source)();
+            let fixture = (row.fixture)();
+            fixture.assert_world(&source);
+            let pre = source.snapshot();
+            let restored = verified_restore(&source, &fixture);
+            let (response, rejected) = exchange(req(row.request), false, restored);
+            assert_eq!(status(&response), "HTTP/1.1 200 OK", "{}", row.name);
+            assert_eq!(raw_body(&response), row.expected.as_bytes(), "{}", row.name);
+            fixture.assert_world(&rejected);
+            assert_eq!(rejected.snapshot(), pre, "{}", row.name);
+            let again = verified_restore(&rejected, &fixture);
+            assert_eq!(again.snapshot(), pre, "{}", row.name);
+        }
+        assert_eq!(names.len(), 16);
+    }
+
     #[test]
     fn live_socket_framing_and_typed_outcomes() {
         let (response, world) = exchange(
