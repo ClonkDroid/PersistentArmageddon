@@ -8225,7 +8225,7 @@ mod tests {
             casualties: vec![(
                 EntityId::from_parts(0, 0),
                 Some(CasualtyState {
-                    blood: BLOOD_MAX,
+                    blood: 5000,
                     shock: 0,
                     shock_remainder: 0,
                     incapacitated: false,
