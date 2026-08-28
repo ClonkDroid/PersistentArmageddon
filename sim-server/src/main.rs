@@ -9887,7 +9887,7 @@ mod tests {
                 ),
                 (medic, vec![]),
             ],
-            absent_wounds: vec![WoundId(1), WoundId(99)],
+            absent_wounds: vec![WoundId(1), WoundId(99), WoundId(18446744073709551615)],
             casualties: vec![
                 (medic, None),
                 (
@@ -10041,7 +10041,7 @@ mod tests {
                 ),
                 (medic, vec![]),
             ],
-            absent_wounds: vec![WoundId(1), WoundId(99)],
+            absent_wounds: vec![WoundId(1), WoundId(99), WoundId(18446744073709551615)],
             casualties: vec![
                 (medic, None),
                 (
@@ -10205,7 +10205,7 @@ mod tests {
                 ),
                 (medic, vec![]),
             ],
-            absent_wounds: vec![WoundId(1), WoundId(99)],
+            absent_wounds: vec![WoundId(1), WoundId(99), WoundId(18446744073709551615)],
             casualties: vec![
                 (medic, None),
                 (
@@ -10341,7 +10341,12 @@ mod tests {
                 (EntityId::from_parts(0, 0), vec![]),
                 (EntityId::from_parts(1, 0), vec![]),
             ],
-            absent_wounds: vec![WoundId(0), WoundId(1), WoundId(99)],
+            absent_wounds: vec![
+                WoundId(0),
+                WoundId(1),
+                WoundId(99),
+                WoundId(18446744073709551615),
+            ],
             casualties: vec![
                 (EntityId::from_parts(0, 0), None),
                 (EntityId::from_parts(1, 0), None),
@@ -10450,7 +10455,11 @@ mod tests {
                     },
                 },
             ],
-            absent_soldiers: vec![EntityId::from_parts(3, 0)],
+            absent_soldiers: vec![
+                EntityId::from_parts(3, 0),
+                EntityId::from_parts(2, 0),
+                EntityId::from_parts(0, 1),
+            ],
             wounds: vec![Wound {
                 id: WoundId(0),
                 patient: EntityId::from_parts(1, 0),
@@ -10481,7 +10490,7 @@ mod tests {
                     }],
                 ),
             ],
-            absent_wounds: vec![WoundId(1), WoundId(u64::MAX)],
+            absent_wounds: vec![WoundId(1), WoundId(99), WoundId(18446744073709551615)],
             casualties: vec![
                 (EntityId::from_parts(0, 0), None),
                 (
@@ -10638,7 +10647,7 @@ mod tests {
                     },
                 },
             ],
-            absent_soldiers: vec![EntityId::from_parts(3, 0)],
+            absent_soldiers: vec![EntityId::from_parts(3, 0), EntityId::from_parts(0, 1)],
             wounds: vec![Wound {
                 id: WoundId(0),
                 patient: EntityId::from_parts(2, 0),
@@ -10670,7 +10679,7 @@ mod tests {
                     }],
                 ),
             ],
-            absent_wounds: vec![WoundId(1), WoundId(u64::MAX)],
+            absent_wounds: vec![WoundId(1), WoundId(99), WoundId(18446744073709551615)],
             casualties: vec![
                 (EntityId::from_parts(0, 0), None),
                 (EntityId::from_parts(1, 0), None),
@@ -10792,13 +10801,22 @@ mod tests {
                     },
                 },
             ],
-            absent_soldiers: vec![EntityId::from_parts(2, 0)],
+            absent_soldiers: vec![
+                EntityId::from_parts(2, 0),
+                EntityId::from_parts(3, 0),
+                EntityId::from_parts(0, 1),
+            ],
             wounds: vec![],
             wounds_of: vec![
                 (EntityId::from_parts(0, 0), vec![]),
                 (EntityId::from_parts(1, 0), vec![]),
             ],
-            absent_wounds: vec![WoundId(0), WoundId(1), WoundId(u64::MAX)],
+            absent_wounds: vec![
+                WoundId(0),
+                WoundId(1),
+                WoundId(99),
+                WoundId(18446744073709551615),
+            ],
             casualties: vec![
                 (EntityId::from_parts(0, 0), None),
                 (EntityId::from_parts(1, 0), None),
