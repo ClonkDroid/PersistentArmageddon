@@ -10992,6 +10992,1295 @@ mod tests {
         assert_eq!(names.len(), 16);
     }
 
+    fn f7a_absent_max_source() -> World {
+        let mut world = World::new(71);
+        assert_eq!(
+            world.apply(Command::SpawnSoldier {
+                spec: SoldierSpec {
+                    faction: 0,
+                    position: Position {
+                        x_mm: 0,
+                        y_mm: 0,
+                        cell: 0
+                    },
+                    squad: None,
+                    role: Role::Rifle,
+                    rank: 0,
+                    health: 1000,
+                    ammunition: 0,
+                    inventory: Inventory {
+                        food: 0,
+                        water: 0,
+                        medical: 0
+                    }
+                }
+            }),
+            ApplyOutcome {
+                clock: 0,
+                events: vec![TimedEvent {
+                    at: 0,
+                    event: Event::SoldierSpawned {
+                        id: EntityId::from_parts(0, 0),
+                        loadout: sim_core::Loadout {
+                            ammunition: 0,
+                            food: 0,
+                            water: 0,
+                            medical: 0
+                        }
+                    }
+                }],
+                error: None,
+                blocked: None
+            }
+        );
+        assert_eq!(
+            world.apply(Command::SpawnSoldier {
+                spec: SoldierSpec {
+                    faction: 0,
+                    position: Position {
+                        x_mm: 0,
+                        y_mm: 0,
+                        cell: 0
+                    },
+                    squad: None,
+                    role: Role::Medic,
+                    rank: 0,
+                    health: 1000,
+                    ammunition: 0,
+                    inventory: Inventory {
+                        food: 0,
+                        water: 0,
+                        medical: 3
+                    }
+                }
+            }),
+            ApplyOutcome {
+                clock: 0,
+                events: vec![TimedEvent {
+                    at: 0,
+                    event: Event::SoldierSpawned {
+                        id: EntityId::from_parts(1, 0),
+                        loadout: sim_core::Loadout {
+                            ammunition: 0,
+                            food: 0,
+                            water: 0,
+                            medical: 3
+                        }
+                    }
+                }],
+                error: None,
+                blocked: None
+            }
+        );
+        assert_eq!(
+            world.apply(Command::InflictWound {
+                patient: EntityId::from_parts(0, 0),
+                wound: WoundSpec {
+                    trauma: 10,
+                    bleeding_per_second: 20,
+                    shock: 30
+                }
+            }),
+            ApplyOutcome {
+                clock: 0,
+                events: vec![TimedEvent {
+                    at: 0,
+                    event: Event::WoundInflicted {
+                        id: WoundId(0),
+                        patient: EntityId::from_parts(0, 0),
+                        wound: WoundSpec {
+                            trauma: 10,
+                            bleeding_per_second: 20,
+                            shock: 30
+                        }
+                    }
+                }],
+                error: None,
+                blocked: None
+            }
+        );
+        world
+    }
+
+    fn f7a_stale_generation_source() -> World {
+        let mut world = World::new(72);
+        assert_eq!(
+            world.apply(Command::SpawnSoldier {
+                spec: SoldierSpec {
+                    faction: 0,
+                    position: Position {
+                        x_mm: 0,
+                        y_mm: 0,
+                        cell: 0
+                    },
+                    squad: None,
+                    role: Role::Medic,
+                    rank: 0,
+                    health: 1000,
+                    ammunition: 0,
+                    inventory: Inventory {
+                        food: 0,
+                        water: 0,
+                        medical: 3
+                    }
+                }
+            }),
+            ApplyOutcome {
+                clock: 0,
+                events: vec![TimedEvent {
+                    at: 0,
+                    event: Event::SoldierSpawned {
+                        id: EntityId::from_parts(0, 0),
+                        loadout: sim_core::Loadout {
+                            ammunition: 0,
+                            food: 0,
+                            water: 0,
+                            medical: 3
+                        }
+                    }
+                }],
+                error: None,
+                blocked: None
+            }
+        );
+        assert_eq!(
+            world.apply(Command::SpawnSoldier {
+                spec: SoldierSpec {
+                    faction: 0,
+                    position: Position {
+                        x_mm: 0,
+                        y_mm: 0,
+                        cell: 0
+                    },
+                    squad: None,
+                    role: Role::Rifle,
+                    rank: 0,
+                    health: 1000,
+                    ammunition: 0,
+                    inventory: Inventory {
+                        food: 0,
+                        water: 0,
+                        medical: 0
+                    }
+                }
+            }),
+            ApplyOutcome {
+                clock: 0,
+                events: vec![TimedEvent {
+                    at: 0,
+                    event: Event::SoldierSpawned {
+                        id: EntityId::from_parts(1, 0),
+                        loadout: sim_core::Loadout {
+                            ammunition: 0,
+                            food: 0,
+                            water: 0,
+                            medical: 0
+                        }
+                    }
+                }],
+                error: None,
+                blocked: None
+            }
+        );
+        assert_eq!(
+            world.apply(Command::DespawnSoldier {
+                id: EntityId::from_parts(0, 0)
+            }),
+            ApplyOutcome {
+                clock: 0,
+                events: vec![TimedEvent {
+                    at: 0,
+                    event: Event::SoldierRemoved {
+                        id: EntityId::from_parts(0, 0),
+                        loadout: sim_core::Loadout {
+                            ammunition: 0,
+                            food: 0,
+                            water: 0,
+                            medical: 3
+                        }
+                    }
+                }],
+                error: None,
+                blocked: None
+            }
+        );
+        assert_eq!(
+            world.apply(Command::SpawnSoldier {
+                spec: SoldierSpec {
+                    faction: 0,
+                    position: Position {
+                        x_mm: 0,
+                        y_mm: 0,
+                        cell: 0
+                    },
+                    squad: None,
+                    role: Role::Medic,
+                    rank: 0,
+                    health: 1000,
+                    ammunition: 0,
+                    inventory: Inventory {
+                        food: 0,
+                        water: 0,
+                        medical: 3
+                    }
+                }
+            }),
+            ApplyOutcome {
+                clock: 0,
+                events: vec![TimedEvent {
+                    at: 0,
+                    event: Event::SoldierSpawned {
+                        id: EntityId::from_parts(0, 1),
+                        loadout: sim_core::Loadout {
+                            ammunition: 0,
+                            food: 0,
+                            water: 0,
+                            medical: 3
+                        }
+                    }
+                }],
+                error: None,
+                blocked: None
+            }
+        );
+        assert_eq!(
+            world.apply(Command::InflictWound {
+                patient: EntityId::from_parts(1, 0),
+                wound: WoundSpec {
+                    trauma: 10,
+                    bleeding_per_second: 20,
+                    shock: 30
+                }
+            }),
+            ApplyOutcome {
+                clock: 0,
+                events: vec![TimedEvent {
+                    at: 0,
+                    event: Event::WoundInflicted {
+                        id: WoundId(0),
+                        patient: EntityId::from_parts(1, 0),
+                        wound: WoundSpec {
+                            trauma: 10,
+                            bleeding_per_second: 20,
+                            shock: 30
+                        }
+                    }
+                }],
+                error: None,
+                blocked: None
+            }
+        );
+        world
+    }
+
+    fn f7a_wrong_role_source() -> World {
+        let mut world = World::new(73);
+        assert_eq!(
+            world.apply(Command::SpawnSoldier {
+                spec: SoldierSpec {
+                    faction: 0,
+                    position: Position {
+                        x_mm: 0,
+                        y_mm: 0,
+                        cell: 0
+                    },
+                    squad: None,
+                    role: Role::Rifle,
+                    rank: 0,
+                    health: 1000,
+                    ammunition: 0,
+                    inventory: Inventory {
+                        food: 0,
+                        water: 0,
+                        medical: 0
+                    }
+                }
+            }),
+            ApplyOutcome {
+                clock: 0,
+                events: vec![TimedEvent {
+                    at: 0,
+                    event: Event::SoldierSpawned {
+                        id: EntityId::from_parts(0, 0),
+                        loadout: sim_core::Loadout {
+                            ammunition: 0,
+                            food: 0,
+                            water: 0,
+                            medical: 0
+                        }
+                    }
+                }],
+                error: None,
+                blocked: None
+            }
+        );
+        assert_eq!(
+            world.apply(Command::SpawnSoldier {
+                spec: SoldierSpec {
+                    faction: 0,
+                    position: Position {
+                        x_mm: 0,
+                        y_mm: 0,
+                        cell: 0
+                    },
+                    squad: None,
+                    role: Role::Rifle,
+                    rank: 0,
+                    health: 1000,
+                    ammunition: 0,
+                    inventory: Inventory {
+                        food: 0,
+                        water: 0,
+                        medical: 3
+                    }
+                }
+            }),
+            ApplyOutcome {
+                clock: 0,
+                events: vec![TimedEvent {
+                    at: 0,
+                    event: Event::SoldierSpawned {
+                        id: EntityId::from_parts(1, 0),
+                        loadout: sim_core::Loadout {
+                            ammunition: 0,
+                            food: 0,
+                            water: 0,
+                            medical: 3
+                        }
+                    }
+                }],
+                error: None,
+                blocked: None
+            }
+        );
+        assert_eq!(
+            world.apply(Command::InflictWound {
+                patient: EntityId::from_parts(0, 0),
+                wound: WoundSpec {
+                    trauma: 10,
+                    bleeding_per_second: 20,
+                    shock: 30
+                }
+            }),
+            ApplyOutcome {
+                clock: 0,
+                events: vec![TimedEvent {
+                    at: 0,
+                    event: Event::WoundInflicted {
+                        id: WoundId(0),
+                        patient: EntityId::from_parts(0, 0),
+                        wound: WoundSpec {
+                            trauma: 10,
+                            bleeding_per_second: 20,
+                            shock: 30
+                        }
+                    }
+                }],
+                error: None,
+                blocked: None
+            }
+        );
+        world
+    }
+
+    fn f7a_dead_medic_source() -> World {
+        let mut world = World::new(74);
+        assert_eq!(
+            world.apply(Command::SpawnSoldier {
+                spec: SoldierSpec {
+                    faction: 0,
+                    position: Position {
+                        x_mm: 0,
+                        y_mm: 0,
+                        cell: 0
+                    },
+                    squad: None,
+                    role: Role::Rifle,
+                    rank: 0,
+                    health: 1000,
+                    ammunition: 0,
+                    inventory: Inventory {
+                        food: 0,
+                        water: 0,
+                        medical: 0
+                    }
+                }
+            }),
+            ApplyOutcome {
+                clock: 0,
+                events: vec![TimedEvent {
+                    at: 0,
+                    event: Event::SoldierSpawned {
+                        id: EntityId::from_parts(0, 0),
+                        loadout: sim_core::Loadout {
+                            ammunition: 0,
+                            food: 0,
+                            water: 0,
+                            medical: 0
+                        }
+                    }
+                }],
+                error: None,
+                blocked: None
+            }
+        );
+        assert_eq!(
+            world.apply(Command::SpawnSoldier {
+                spec: SoldierSpec {
+                    faction: 0,
+                    position: Position {
+                        x_mm: 0,
+                        y_mm: 0,
+                        cell: 0
+                    },
+                    squad: None,
+                    role: Role::Medic,
+                    rank: 0,
+                    health: 1000,
+                    ammunition: 0,
+                    inventory: Inventory {
+                        food: 0,
+                        water: 0,
+                        medical: 3
+                    }
+                }
+            }),
+            ApplyOutcome {
+                clock: 0,
+                events: vec![TimedEvent {
+                    at: 0,
+                    event: Event::SoldierSpawned {
+                        id: EntityId::from_parts(1, 0),
+                        loadout: sim_core::Loadout {
+                            ammunition: 0,
+                            food: 0,
+                            water: 0,
+                            medical: 3
+                        }
+                    }
+                }],
+                error: None,
+                blocked: None
+            }
+        );
+        assert_eq!(
+            world.apply(Command::InflictWound {
+                patient: EntityId::from_parts(1, 0),
+                wound: WoundSpec {
+                    trauma: 1000,
+                    bleeding_per_second: 0,
+                    shock: 0
+                }
+            }),
+            ApplyOutcome {
+                clock: 0,
+                events: vec![
+                    TimedEvent {
+                        at: 0,
+                        event: Event::WoundInflicted {
+                            id: WoundId(0),
+                            patient: EntityId::from_parts(1, 0),
+                            wound: WoundSpec {
+                                trauma: 1000,
+                                bleeding_per_second: 0,
+                                shock: 0
+                            }
+                        }
+                    },
+                    TimedEvent {
+                        at: 0,
+                        event: Event::SoldierDied {
+                            id: EntityId::from_parts(1, 0),
+                            cause: DeathCause::ImmediateTrauma,
+                            health_before: 1000
+                        }
+                    }
+                ],
+                error: None,
+                blocked: None
+            }
+        );
+        assert_eq!(
+            world.apply(Command::InflictWound {
+                patient: EntityId::from_parts(0, 0),
+                wound: WoundSpec {
+                    trauma: 10,
+                    bleeding_per_second: 20,
+                    shock: 30
+                }
+            }),
+            ApplyOutcome {
+                clock: 0,
+                events: vec![TimedEvent {
+                    at: 0,
+                    event: Event::WoundInflicted {
+                        id: WoundId(1),
+                        patient: EntityId::from_parts(0, 0),
+                        wound: WoundSpec {
+                            trauma: 10,
+                            bleeding_per_second: 20,
+                            shock: 30
+                        }
+                    }
+                }],
+                error: None,
+                blocked: None
+            }
+        );
+        world
+    }
+
+    fn f7a_absent_max_fixture() -> PublicMedicalFixture {
+        PublicMedicalFixture {
+            name: "f7a_absent_max_fixture",
+            clock: 0,
+            soldier_count: 2,
+            soldiers: vec![
+                Soldier {
+                    id: EntityId::from_parts(0, 0),
+                    faction: 0,
+                    position: Position {
+                        x_mm: 0,
+                        y_mm: 0,
+                        cell: 0,
+                    },
+                    squad: None,
+                    role: Role::Rifle,
+                    rank: 0,
+                    health: 990,
+                    needs: Needs {
+                        fatigue: 0,
+                        hunger: 0,
+                        thirst: 0,
+                        sleep_debt: 0,
+                    },
+                    ammunition: 0,
+                    inventory: Inventory {
+                        food: 0,
+                        water: 0,
+                        medical: 0,
+                    },
+                    living: LivingState {
+                        hunger: 0,
+                        thirst: 0,
+                        fatigue: 0,
+                        sleep_debt: 0,
+                        morale: 1000,
+                        health: 990,
+                        activity: Activity::Idle,
+                        life: LifeState::Alive,
+                        materialized_at: 0,
+                    },
+                },
+                Soldier {
+                    id: EntityId::from_parts(1, 0),
+                    faction: 0,
+                    position: Position {
+                        x_mm: 0,
+                        y_mm: 0,
+                        cell: 0,
+                    },
+                    squad: None,
+                    role: Role::Medic,
+                    rank: 0,
+                    health: 1000,
+                    needs: Needs {
+                        fatigue: 0,
+                        hunger: 0,
+                        thirst: 0,
+                        sleep_debt: 0,
+                    },
+                    ammunition: 0,
+                    inventory: Inventory {
+                        food: 0,
+                        water: 0,
+                        medical: 3,
+                    },
+                    living: LivingState {
+                        hunger: 0,
+                        thirst: 0,
+                        fatigue: 0,
+                        sleep_debt: 0,
+                        morale: 1000,
+                        health: 1000,
+                        activity: Activity::Idle,
+                        life: LifeState::Alive,
+                        materialized_at: 0,
+                    },
+                },
+            ],
+            absent_soldiers: vec![
+                EntityId::from_parts(2, 0),
+                EntityId::from_raw(18446744073709551615),
+            ],
+            wounds: vec![Wound {
+                id: WoundId(0),
+                patient: EntityId::from_parts(0, 0),
+                created_at: 0,
+                spec: WoundSpec {
+                    trauma: 10,
+                    bleeding_per_second: 20,
+                    shock: 30,
+                },
+                controlled: false,
+                healed: false,
+            }],
+            wounds_of: vec![
+                (
+                    EntityId::from_parts(0, 0),
+                    vec![Wound {
+                        id: WoundId(0),
+                        patient: EntityId::from_parts(0, 0),
+                        created_at: 0,
+                        spec: WoundSpec {
+                            trauma: 10,
+                            bleeding_per_second: 20,
+                            shock: 30,
+                        },
+                        controlled: false,
+                        healed: false,
+                    }],
+                ),
+                (EntityId::from_parts(1, 0), vec![]),
+            ],
+            absent_wounds: vec![WoundId(1), WoundId(99), WoundId(18446744073709551615)],
+            casualties: vec![
+                (
+                    EntityId::from_parts(0, 0),
+                    Some(CasualtyState {
+                        blood: 5000,
+                        shock: 30,
+                        shock_remainder: 0,
+                        incapacitated: false,
+                        recovering: false,
+                        recovery_next_at: None,
+                        materialized_at: 0,
+                    }),
+                ),
+                (EntityId::from_parts(1, 0), None),
+            ],
+            treatments: vec![],
+            absent_treatments: vec![
+                TreatmentId(0),
+                TreatmentId(99),
+                TreatmentId(18446744073709551615),
+            ],
+            totals: ResourceTotals {
+                ammunition: 0,
+                stockpile_supplies: 0,
+                carried_food: 0,
+                carried_water: 0,
+                carried_medical: 3,
+                sourced_food: 0,
+                sourced_water: 0,
+                consumed_food: 0,
+                consumed_water: 0,
+                lost_food: 0,
+                lost_water: 0,
+                sourced_medical: 3,
+                consumed_medical: 0,
+                lost_medical: 0,
+            },
+            absent_stockpiles: vec![0, 7],
+            absent_squads: vec![0, 7],
+            absent_hot_cells: vec![0, 7],
+            hot_cell_count: 0,
+            digest: 0x0c08_8cb5_ece4_bb67,
+        }
+    }
+
+    fn f7a_stale_generation_fixture() -> PublicMedicalFixture {
+        PublicMedicalFixture {
+            name: "f7a_stale_generation_fixture",
+            clock: 0,
+            soldier_count: 2,
+            soldiers: vec![
+                Soldier {
+                    id: EntityId::from_parts(0, 1),
+                    faction: 0,
+                    position: Position {
+                        x_mm: 0,
+                        y_mm: 0,
+                        cell: 0,
+                    },
+                    squad: None,
+                    role: Role::Medic,
+                    rank: 0,
+                    health: 1000,
+                    needs: Needs {
+                        fatigue: 0,
+                        hunger: 0,
+                        thirst: 0,
+                        sleep_debt: 0,
+                    },
+                    ammunition: 0,
+                    inventory: Inventory {
+                        food: 0,
+                        water: 0,
+                        medical: 3,
+                    },
+                    living: LivingState {
+                        hunger: 0,
+                        thirst: 0,
+                        fatigue: 0,
+                        sleep_debt: 0,
+                        morale: 1000,
+                        health: 1000,
+                        activity: Activity::Idle,
+                        life: LifeState::Alive,
+                        materialized_at: 0,
+                    },
+                },
+                Soldier {
+                    id: EntityId::from_parts(1, 0),
+                    faction: 0,
+                    position: Position {
+                        x_mm: 0,
+                        y_mm: 0,
+                        cell: 0,
+                    },
+                    squad: None,
+                    role: Role::Rifle,
+                    rank: 0,
+                    health: 990,
+                    needs: Needs {
+                        fatigue: 0,
+                        hunger: 0,
+                        thirst: 0,
+                        sleep_debt: 0,
+                    },
+                    ammunition: 0,
+                    inventory: Inventory {
+                        food: 0,
+                        water: 0,
+                        medical: 0,
+                    },
+                    living: LivingState {
+                        hunger: 0,
+                        thirst: 0,
+                        fatigue: 0,
+                        sleep_debt: 0,
+                        morale: 1000,
+                        health: 990,
+                        activity: Activity::Idle,
+                        life: LifeState::Alive,
+                        materialized_at: 0,
+                    },
+                },
+            ],
+            absent_soldiers: vec![
+                EntityId::from_parts(0, 0),
+                EntityId::from_parts(2, 0),
+                EntityId::from_raw(18446744073709551615),
+            ],
+            wounds: vec![Wound {
+                id: WoundId(0),
+                patient: EntityId::from_parts(1, 0),
+                created_at: 0,
+                spec: WoundSpec {
+                    trauma: 10,
+                    bleeding_per_second: 20,
+                    shock: 30,
+                },
+                controlled: false,
+                healed: false,
+            }],
+            wounds_of: vec![
+                (EntityId::from_parts(0, 1), vec![]),
+                (
+                    EntityId::from_parts(1, 0),
+                    vec![Wound {
+                        id: WoundId(0),
+                        patient: EntityId::from_parts(1, 0),
+                        created_at: 0,
+                        spec: WoundSpec {
+                            trauma: 10,
+                            bleeding_per_second: 20,
+                            shock: 30,
+                        },
+                        controlled: false,
+                        healed: false,
+                    }],
+                ),
+            ],
+            absent_wounds: vec![WoundId(1), WoundId(99), WoundId(18446744073709551615)],
+            casualties: vec![
+                (EntityId::from_parts(0, 1), None),
+                (
+                    EntityId::from_parts(1, 0),
+                    Some(CasualtyState {
+                        blood: 5000,
+                        shock: 30,
+                        shock_remainder: 0,
+                        incapacitated: false,
+                        recovering: false,
+                        recovery_next_at: None,
+                        materialized_at: 0,
+                    }),
+                ),
+                (EntityId::from_parts(0, 0), None),
+            ],
+            treatments: vec![],
+            absent_treatments: vec![
+                TreatmentId(0),
+                TreatmentId(99),
+                TreatmentId(18446744073709551615),
+            ],
+            totals: ResourceTotals {
+                ammunition: 0,
+                stockpile_supplies: 0,
+                carried_food: 0,
+                carried_water: 0,
+                carried_medical: 3,
+                sourced_food: 0,
+                sourced_water: 0,
+                consumed_food: 0,
+                consumed_water: 0,
+                lost_food: 0,
+                lost_water: 0,
+                sourced_medical: 6,
+                consumed_medical: 0,
+                lost_medical: 3,
+            },
+            absent_stockpiles: vec![0, 7],
+            absent_squads: vec![0, 7],
+            absent_hot_cells: vec![0, 7],
+            hot_cell_count: 0,
+            digest: 0x647c_8e2f_07ed_0a06,
+        }
+    }
+
+    fn f7a_wrong_role_fixture() -> PublicMedicalFixture {
+        PublicMedicalFixture {
+            name: "f7a_wrong_role_fixture",
+            clock: 0,
+            soldier_count: 2,
+            soldiers: vec![
+                Soldier {
+                    id: EntityId::from_parts(0, 0),
+                    faction: 0,
+                    position: Position {
+                        x_mm: 0,
+                        y_mm: 0,
+                        cell: 0,
+                    },
+                    squad: None,
+                    role: Role::Rifle,
+                    rank: 0,
+                    health: 990,
+                    needs: Needs {
+                        fatigue: 0,
+                        hunger: 0,
+                        thirst: 0,
+                        sleep_debt: 0,
+                    },
+                    ammunition: 0,
+                    inventory: Inventory {
+                        food: 0,
+                        water: 0,
+                        medical: 0,
+                    },
+                    living: LivingState {
+                        hunger: 0,
+                        thirst: 0,
+                        fatigue: 0,
+                        sleep_debt: 0,
+                        morale: 1000,
+                        health: 990,
+                        activity: Activity::Idle,
+                        life: LifeState::Alive,
+                        materialized_at: 0,
+                    },
+                },
+                Soldier {
+                    id: EntityId::from_parts(1, 0),
+                    faction: 0,
+                    position: Position {
+                        x_mm: 0,
+                        y_mm: 0,
+                        cell: 0,
+                    },
+                    squad: None,
+                    role: Role::Rifle,
+                    rank: 0,
+                    health: 1000,
+                    needs: Needs {
+                        fatigue: 0,
+                        hunger: 0,
+                        thirst: 0,
+                        sleep_debt: 0,
+                    },
+                    ammunition: 0,
+                    inventory: Inventory {
+                        food: 0,
+                        water: 0,
+                        medical: 3,
+                    },
+                    living: LivingState {
+                        hunger: 0,
+                        thirst: 0,
+                        fatigue: 0,
+                        sleep_debt: 0,
+                        morale: 1000,
+                        health: 1000,
+                        activity: Activity::Idle,
+                        life: LifeState::Alive,
+                        materialized_at: 0,
+                    },
+                },
+            ],
+            absent_soldiers: vec![
+                EntityId::from_parts(2, 0),
+                EntityId::from_parts(0, 1),
+                EntityId::from_raw(18446744073709551615),
+            ],
+            wounds: vec![Wound {
+                id: WoundId(0),
+                patient: EntityId::from_parts(0, 0),
+                created_at: 0,
+                spec: WoundSpec {
+                    trauma: 10,
+                    bleeding_per_second: 20,
+                    shock: 30,
+                },
+                controlled: false,
+                healed: false,
+            }],
+            wounds_of: vec![
+                (
+                    EntityId::from_parts(0, 0),
+                    vec![Wound {
+                        id: WoundId(0),
+                        patient: EntityId::from_parts(0, 0),
+                        created_at: 0,
+                        spec: WoundSpec {
+                            trauma: 10,
+                            bleeding_per_second: 20,
+                            shock: 30,
+                        },
+                        controlled: false,
+                        healed: false,
+                    }],
+                ),
+                (EntityId::from_parts(1, 0), vec![]),
+            ],
+            absent_wounds: vec![WoundId(1), WoundId(99), WoundId(18446744073709551615)],
+            casualties: vec![
+                (
+                    EntityId::from_parts(0, 0),
+                    Some(CasualtyState {
+                        blood: 5000,
+                        shock: 30,
+                        shock_remainder: 0,
+                        incapacitated: false,
+                        recovering: false,
+                        recovery_next_at: None,
+                        materialized_at: 0,
+                    }),
+                ),
+                (EntityId::from_parts(1, 0), None),
+            ],
+            treatments: vec![],
+            absent_treatments: vec![
+                TreatmentId(0),
+                TreatmentId(99),
+                TreatmentId(18446744073709551615),
+            ],
+            totals: ResourceTotals {
+                ammunition: 0,
+                stockpile_supplies: 0,
+                carried_food: 0,
+                carried_water: 0,
+                carried_medical: 3,
+                sourced_food: 0,
+                sourced_water: 0,
+                consumed_food: 0,
+                consumed_water: 0,
+                lost_food: 0,
+                lost_water: 0,
+                sourced_medical: 3,
+                consumed_medical: 0,
+                lost_medical: 0,
+            },
+            absent_stockpiles: vec![0, 7],
+            absent_squads: vec![0, 7],
+            absent_hot_cells: vec![0, 7],
+            hot_cell_count: 0,
+            digest: 0xb0de_7031_ddaa_ea6c,
+        }
+    }
+
+    fn f7a_dead_medic_fixture() -> PublicMedicalFixture {
+        PublicMedicalFixture {
+            name: "f7a_dead_medic_fixture",
+            clock: 0,
+            soldier_count: 2,
+            soldiers: vec![
+                Soldier {
+                    id: EntityId::from_parts(0, 0),
+                    faction: 0,
+                    position: Position {
+                        x_mm: 0,
+                        y_mm: 0,
+                        cell: 0,
+                    },
+                    squad: None,
+                    role: Role::Rifle,
+                    rank: 0,
+                    health: 990,
+                    needs: Needs {
+                        fatigue: 0,
+                        hunger: 0,
+                        thirst: 0,
+                        sleep_debt: 0,
+                    },
+                    ammunition: 0,
+                    inventory: Inventory {
+                        food: 0,
+                        water: 0,
+                        medical: 0,
+                    },
+                    living: LivingState {
+                        hunger: 0,
+                        thirst: 0,
+                        fatigue: 0,
+                        sleep_debt: 0,
+                        morale: 1000,
+                        health: 990,
+                        activity: Activity::Idle,
+                        life: LifeState::Alive,
+                        materialized_at: 0,
+                    },
+                },
+                Soldier {
+                    id: EntityId::from_parts(1, 0),
+                    faction: 0,
+                    position: Position {
+                        x_mm: 0,
+                        y_mm: 0,
+                        cell: 0,
+                    },
+                    squad: None,
+                    role: Role::Medic,
+                    rank: 0,
+                    health: 0,
+                    needs: Needs {
+                        fatigue: 0,
+                        hunger: 0,
+                        thirst: 0,
+                        sleep_debt: 0,
+                    },
+                    ammunition: 0,
+                    inventory: Inventory {
+                        food: 0,
+                        water: 0,
+                        medical: 3,
+                    },
+                    living: LivingState {
+                        hunger: 0,
+                        thirst: 0,
+                        fatigue: 0,
+                        sleep_debt: 0,
+                        morale: 1000,
+                        health: 0,
+                        activity: Activity::Idle,
+                        life: LifeState::Dead {
+                            at: 0,
+                            cause: DeathCause::ImmediateTrauma,
+                        },
+                        materialized_at: 0,
+                    },
+                },
+            ],
+            absent_soldiers: vec![
+                EntityId::from_parts(2, 0),
+                EntityId::from_parts(0, 1),
+                EntityId::from_raw(18446744073709551615),
+            ],
+            wounds: vec![
+                Wound {
+                    id: WoundId(0),
+                    patient: EntityId::from_parts(1, 0),
+                    created_at: 0,
+                    spec: WoundSpec {
+                        trauma: 1000,
+                        bleeding_per_second: 0,
+                        shock: 0,
+                    },
+                    controlled: false,
+                    healed: false,
+                },
+                Wound {
+                    id: WoundId(1),
+                    patient: EntityId::from_parts(0, 0),
+                    created_at: 0,
+                    spec: WoundSpec {
+                        trauma: 10,
+                        bleeding_per_second: 20,
+                        shock: 30,
+                    },
+                    controlled: false,
+                    healed: false,
+                },
+            ],
+            wounds_of: vec![
+                (
+                    EntityId::from_parts(0, 0),
+                    vec![Wound {
+                        id: WoundId(1),
+                        patient: EntityId::from_parts(0, 0),
+                        created_at: 0,
+                        spec: WoundSpec {
+                            trauma: 10,
+                            bleeding_per_second: 20,
+                            shock: 30,
+                        },
+                        controlled: false,
+                        healed: false,
+                    }],
+                ),
+                (
+                    EntityId::from_parts(1, 0),
+                    vec![Wound {
+                        id: WoundId(0),
+                        patient: EntityId::from_parts(1, 0),
+                        created_at: 0,
+                        spec: WoundSpec {
+                            trauma: 1000,
+                            bleeding_per_second: 0,
+                            shock: 0,
+                        },
+                        controlled: false,
+                        healed: false,
+                    }],
+                ),
+            ],
+            absent_wounds: vec![WoundId(2), WoundId(99), WoundId(18446744073709551615)],
+            casualties: vec![
+                (
+                    EntityId::from_parts(0, 0),
+                    Some(CasualtyState {
+                        blood: 5000,
+                        shock: 30,
+                        shock_remainder: 0,
+                        incapacitated: false,
+                        recovering: false,
+                        recovery_next_at: None,
+                        materialized_at: 0,
+                    }),
+                ),
+                (
+                    EntityId::from_parts(1, 0),
+                    Some(CasualtyState {
+                        blood: 5000,
+                        shock: 0,
+                        shock_remainder: 0,
+                        incapacitated: false,
+                        recovering: false,
+                        recovery_next_at: None,
+                        materialized_at: 0,
+                    }),
+                ),
+            ],
+            treatments: vec![],
+            absent_treatments: vec![
+                TreatmentId(0),
+                TreatmentId(99),
+                TreatmentId(18446744073709551615),
+            ],
+            totals: ResourceTotals {
+                ammunition: 0,
+                stockpile_supplies: 0,
+                carried_food: 0,
+                carried_water: 0,
+                carried_medical: 3,
+                sourced_food: 0,
+                sourced_water: 0,
+                consumed_food: 0,
+                consumed_water: 0,
+                lost_food: 0,
+                lost_water: 0,
+                sourced_medical: 3,
+                consumed_medical: 0,
+                lost_medical: 0,
+            },
+            absent_stockpiles: vec![0, 7],
+            absent_squads: vec![0, 7],
+            absent_hot_cells: vec![0, 7],
+            hot_cell_count: 0,
+            digest: 0xae18_d14a_b9dc_a352,
+        }
+    }
+
+    struct F7ARow {
+        name: &'static str,
+        source: fn() -> World,
+        fixture: fn() -> PublicMedicalFixture,
+        request: &'static str,
+        expected: &'static str,
+    }
+    const F7A_ROWS: [F7ARow; 5] = [
+        F7ARow {
+            name: "ordinary_absent_medic",
+            source: f7a_absent_max_source,
+            fixture: f7a_absent_max_fixture,
+            request: r#"{"version":1,"command":"start_treatment","medic":2,"patient":0,"wound":0,"kind":"hemostatic"}"#,
+            expected: r#"{"blocked":null,"clock":0,"digest":"0c088cb5ece4bb67","events":[],"terminal_error":"invalid_treatment","version":1}"#,
+        },
+        F7ARow {
+            name: "stale_generation_medic",
+            source: f7a_stale_generation_source,
+            fixture: f7a_stale_generation_fixture,
+            request: r#"{"version":1,"command":"start_treatment","medic":0,"patient":1,"wound":0,"kind":"hemostatic"}"#,
+            expected: r#"{"blocked":null,"clock":0,"digest":"647c8e2f07ed0a06","events":[],"terminal_error":"invalid_treatment","version":1}"#,
+        },
+        F7ARow {
+            name: "wire_valid_max_medic",
+            source: f7a_absent_max_source,
+            fixture: f7a_absent_max_fixture,
+            request: r#"{"version":1,"command":"start_treatment","medic":18446744073709551615,"patient":0,"wound":0,"kind":"hemostatic"}"#,
+            expected: r#"{"blocked":null,"clock":0,"digest":"0c088cb5ece4bb67","events":[],"terminal_error":"invalid_treatment","version":1}"#,
+        },
+        F7ARow {
+            name: "non_medic_role",
+            source: f7a_wrong_role_source,
+            fixture: f7a_wrong_role_fixture,
+            request: r#"{"version":1,"command":"start_treatment","medic":1,"patient":0,"wound":0,"kind":"hemostatic"}"#,
+            expected: r#"{"blocked":null,"clock":0,"digest":"b0de7031ddaaea6c","events":[],"terminal_error":"invalid_treatment","version":1}"#,
+        },
+        F7ARow {
+            name: "dead_medic",
+            source: f7a_dead_medic_source,
+            fixture: f7a_dead_medic_fixture,
+            request: r#"{"version":1,"command":"start_treatment","medic":1,"patient":0,"wound":1,"kind":"hemostatic"}"#,
+            expected: r#"{"blocked":null,"clock":0,"digest":"ae18d14ab9dca352","events":[],"terminal_error":"invalid_treatment","version":1}"#,
+        },
+    ];
+
+    #[test]
+    fn gate_c2_f7a_named_medic_identity_role_death_semantic_matrix() {
+        assert_eq!(F7A_ROWS.len(), 5);
+        let mut names = std::collections::BTreeSet::new();
+        for row in &F7A_ROWS {
+            assert!(names.insert(row.name));
+            let source = (row.source)();
+            let fixture = (row.fixture)();
+            fixture.assert_world(&source);
+            let pre = source.snapshot();
+            let restored = verified_restore(&source, &fixture);
+            let (response, rejected) = exchange(req(row.request), false, restored);
+            assert_eq!(status(&response), "HTTP/1.1 200 OK", "{}", row.name);
+            assert_eq!(raw_body(&response), row.expected.as_bytes(), "{}", row.name);
+            fixture.assert_world(&rejected);
+            assert_eq!(rejected.snapshot(), pre, "{}", row.name);
+            assert_eq!(rejected.state_digest(), fixture.digest, "{}", row.name);
+            let again = verified_restore(&rejected, &fixture);
+            fixture.assert_world(&again);
+            assert_eq!(again.snapshot(), pre, "{}", row.name);
+        }
+        assert_eq!(names.len(), 5);
+    }
+
     #[test]
     fn live_socket_framing_and_typed_outcomes() {
         let (response, world) = exchange(
